@@ -1,57 +1,145 @@
-// capture — SMS "task:" / "capacity:" / "sara:" / "done:" → parsed, written, one-line reply returned
+// capture v4 — everything the owner or team texts to Archie.
+// task: / <handle>: / capacity: / done: <text>   — as before
+// done 2  ·  done 1 3            — tick off today's numbered tasks
+// move 3 friday  ·  snooze 2     — push a task to another day (snooze = tomorrow)
+// send 1  ·  skip 1              — send or bin one of today's message drafts
+// 👍 / good [note]  ·  👎 / bad [note] — rate this morning's brief
+// quiet today · quiet till fri · quiet off
+// help
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 const SECRET = Deno.env.get("ARCHIE_SECRET")!;
-const GHL_KEY = Deno.env.get("GHL_AGENCY_API_KEY")!;
+const FALLBACK_TOKEN = Deno.env.get("GHL_AGENCY_API_KEY") ?? "";
+const BASE = "https://services.leadconnectorhq.com";
+
+const HELP = [
+  "task: [thing] [must/high/bonus]",
+  "done 2 · move 3 fri · snooze 2",
+  "send 1 · skip 1",
+  "capacity: 90 · capacity: tomorrow 0",
+  "👍 or 👎 [why] on the brief",
+  "quiet today · quiet till fri · quiet off",
+].join("\n");
 
 Deno.serve(async (req) => {
-  console.log("capture v3 start");
+  console.log("capture v4 start");
   try {
     if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     const raw = await req.json();
     const p = { ...raw, ...(raw.customData ?? {}) };
-    console.log("customData:", JSON.stringify(raw.customData ?? {}));
-    console.log("text type:", typeof p.text, JSON.stringify(p.text));
-    const tenant_id: string = str(p.tenant_id);
-    const text: string = str(p.text ?? p.message ?? p.body ?? raw.message?.body ?? "").trim();
-    const senderPhone: string = str(p.sender ?? p.phone ?? raw.phone ?? "").replace(/\s+/g, "");
-    const senderContact: string | null = str(p.contact_id ?? raw.contact_id ?? "") || null;
-    if (!tenant_id || !text) return j({ error: "tenant_id and text required" }, 400);
+    const tenant_id = str(p.tenant_id);
+    const text = str(p.text ?? p.message ?? p.body ?? raw.message?.body ?? "").trim();
+    const senderPhone = str(p.sender ?? p.phone ?? raw.phone ?? "").replace(/\s+/g, "");
+    const senderContact = str(p.contact_id ?? raw.contact_id ?? "") || null;
+    if (!tenant_id || !text) return j({ ok: true, reply: "" });
 
-    // Who sent it
+    const { data: cfg } = await supabase.from("tenant_config").select("timezone, ghl_token").eq("tenant_id", tenant_id).single();
+    const tz = cfg?.timezone || "Europe/London";
+    const today = localDate(Date.now(), tz);
+
     const { data: members } = await supabase.from("team_members").select("handle, name, phone, ghl_contact_id").eq("tenant_id", tenant_id);
-    const me = (members ?? []).find(m => (senderContact && m.ghl_contact_id === senderContact) || (m.phone && m.phone.replace(/\s+/g, "") === senderPhone));
+    const me = (members ?? []).find((m) => (senderContact && m.ghl_contact_id === senderContact) || (m.phone && m.phone.replace(/\s+/g, "") === senderPhone));
     if (!me) return j({ ok: true, reply: "", skipped: "sender not on team" });
 
-    const cmd = text.match(/^(task|sara|capacity|done)\s*:\s*(.+)$/is);
-    if (!cmd) return j({ ok: true, reply: "", skipped: "no command" });
-    const [, kind, restRaw] = cmd; let rest = restRaw.trim();
-    const today = new Date().toISOString().slice(0, 10);
+    const bump = (field: string, n = 1) => supabase.rpc("bump_activity", { p_tenant: tenant_id, p_day: today, p_field: field, p_n: n });
+    const lower = text.toLowerCase();
+    await bump("commands");
 
-    // ---- capacity: 90 | capacity: tomorrow 0 school trip | capacity: fri 120 ----
-    if (kind.toLowerCase() === "capacity") {
+    // ---------- help ----------
+    if (lower === "help" || lower === "?") return reply(HELP);
+
+    // ---------- feedback ----------
+    const fb = text.match(/^(👍[\u{1F3FB}-\u{1F3FF}]?|👎[\u{1F3FB}-\u{1F3FF}]?|good|bad|great|useful|not useful|meh)(?=$|[\s:,.!-])[\s:,.!-]*([\s\S]*)$/iu);
+    if (fb) {
+      const positive = /^(👍|good|great|useful)/iu.test(fb[1]);
+      const note = str(fb[2]) || null;
+      await supabase.from("brief_feedback").insert({ tenant_id, handle: me.handle, created_on: today, rating: positive ? 1 : -1, note });
+      await bump(positive ? "feedback_up" : "feedback_down");
+      return reply(positive ? "Noted — more like that." : note ? "Noted — I'll adjust." : "Noted. Reply with why and I'll adjust.");
+    }
+
+    // ---------- quiet ----------
+    const q = lower.match(/^quiet\s+(today|tomorrow|off|till\s+\S+|until\s+\S+)$/);
+    if (q) {
+      const arg = q[1];
+      if (arg === "off") { await supabase.from("team_members").update({ quiet_until: null }).eq("tenant_id", tenant_id).eq("handle", me.handle); return reply("Quiet mode off. Normal briefs from tomorrow."); }
+      const until = arg === "today" ? today : arg === "tomorrow" ? resolveDay("tomorrow", tz) : resolveDay(arg.split(/\s+/)[1], tz);
+      await supabase.from("team_members").update({ quiet_until: until }).eq("tenant_id", tenant_id).eq("handle", me.handle);
+      return reply(`Quiet until ${until}. You'll only hear from me if something's urgent.`);
+    }
+
+    // ---------- done 2 / done 1 3 ----------
+    const dn = lower.match(/^(?:done|did|✅)\s+([\d\s,&and]+)$/);
+    if (dn) {
+      const ranks = (dn[1].match(/\d+/g) ?? []).map(Number);
+      const { data: hits } = await supabase.from("tasks").select("id, title, today_rank").eq("tenant_id", tenant_id).eq("owner", me.handle).eq("today", true).in("today_rank", ranks);
+      if (!hits?.length) return reply(`No task numbered ${ranks.join(", ")} on today's list.`);
+      await supabase.from("tasks").update({ status: "done", completed_at: new Date().toISOString() }).in("id", hits.map((h) => h.id));
+      await bump("tasks_done", hits.length);
+      const left = await supabase.from("tasks").select("id", { count: "exact", head: true }).eq("tenant_id", tenant_id).eq("owner", me.handle).eq("today", true).in("status", ["open", "doing"]);
+      return reply(`Done: ${hits.map((h) => h.title).join(" · ")}. ${left.count ? `${left.count} left today.` : "Today's list is clear."}`);
+    }
+
+    // ---------- move 3 friday / snooze 2 ----------
+    const mv = lower.match(/^(move|snooze|push)\s+(\d+)(?:\s+(?:to\s+)?(\S+))?$/);
+    if (mv) {
+      const rank = Number(mv[2]);
+      const target = mv[1] === "snooze" || !mv[3] ? resolveDay("tomorrow", tz) : resolveDay(mv[3], tz);
+      const { data: hit } = await supabase.from("tasks").select("id, title").eq("tenant_id", tenant_id).eq("owner", me.handle).eq("today", true).eq("today_rank", rank).maybeSingle();
+      if (!hit) return reply(`No task numbered ${rank} on today's list.`);
+      await supabase.from("tasks").update({ due_date: target, today: false, today_rank: null }).eq("id", hit.id);
+      return reply(`Moved "${hit.title}" to ${target}.`);
+    }
+
+    // ---------- send 1 / skip 1 ----------
+    const sd = lower.match(/^(send|skip|bin)\s+(\d+)$/);
+    if (sd) {
+      const rank = Number(sd[2]);
+      const { data: d } = await supabase.from("message_drafts").select("*").eq("tenant_id", tenant_id).eq("status", "pending").eq("rank", rank).order("created_on", { ascending: false }).limit(1).maybeSingle();
+      if (!d) return reply(`No draft numbered ${rank} waiting.`);
+      if (sd[1] !== "send") {
+        await supabase.from("message_drafts").update({ status: "dismissed" }).eq("id", d.id);
+        return reply(`Binned draft ${rank} to ${d.name}.`);
+      }
+      const type = ({ WA: "WhatsApp", SMS: "SMS", IG: "IG", FB: "FB", Chat: "Live_Chat" } as Record<string, string>)[d.channel];
+      if (!type) return reply(`Draft ${rank} is for ${d.channel} — send that one from GHL. Text: ${d.body}`);
+      const token = cfg?.ghl_token || FALLBACK_TOKEN;
+      const r = await ghl(token, "/conversations/messages", "POST", { type, contactId: d.contact_id, message: d.body });
+      if (!r.ok) return reply(`Couldn't send draft ${rank} (${r.status}). Send it from GHL: ${d.body}`);
+      await supabase.from("message_drafts").update({ status: "sent", sent_at: new Date().toISOString() }).eq("id", d.id);
+      await bump("drafts_sent");
+      return reply(`Sent to ${d.name} on ${type}.`);
+    }
+
+    // ---------- prefixed commands ----------
+    const handles = (members ?? []).map((m) => m.handle.toLowerCase());
+    const cmd = text.match(/^([a-z]+)\s*:\s*([\s\S]+)$/i);
+    if (!cmd) return j({ ok: true, reply: "", skipped: "no command" });
+    const kind = cmd[1].toLowerCase(); let rest = cmd[2].trim();
+
+    if (kind === "capacity") {
       const m = rest.match(/^(today|tomorrow|mon|tue|wed|thu|fri|sat|sun|\d{4}-\d{2}-\d{2})?\s*(\d+)\s*(.*)$/i);
-      if (!m) return j({ ok: true, reply: "Say: capacity: 90  or  capacity: tomorrow 0 reason" });
-      const day = resolveDay(m[1] ?? "today");
+      if (!m) return reply("Say: capacity: 90  or  capacity: tomorrow 0 reason");
+      const day = resolveDay(m[1] ?? "today", tz);
       const minutes = parseInt(m[2], 10); const note = m[3]?.trim() || null;
       await supabase.from("capacity").upsert({ tenant_id, handle: me.handle, day, minutes, note }, { onConflict: "tenant_id,handle,day" });
-      return jlog({ ok: true, reply: `Capacity ${day}: ${minutes} min${note ? " — " + note : ""}` });
+      return reply(`Capacity ${day}: ${minutes} min${note ? " — " + note : ""}`);
     }
 
-    // ---- done: <title fragment> ----
-    if (kind.toLowerCase() === "done") {
+    if (kind === "done") {
       const { data: hits } = await supabase.from("tasks").select("id, title").eq("tenant_id", tenant_id).in("status", ["open", "doing", "waiting"]).ilike("title", `%${rest}%`).limit(2);
-      if (!hits?.length) return j({ ok: true, reply: `No open task matching "${rest}"` });
-      if (hits.length > 1) return j({ ok: true, reply: `Two matches: "${hits[0].title}" / "${hits[1].title}" — be more specific` });
+      if (!hits?.length) return reply(`No open task matching "${rest}"`);
+      if (hits.length > 1) return reply(`Two matches: "${hits[0].title}" / "${hits[1].title}" — be more specific`);
       await supabase.from("tasks").update({ status: "done", completed_at: new Date().toISOString() }).eq("id", hits[0].id);
-      return jlog({ ok: true, reply: `Done: ${hits[0].title}` });
+      await bump("tasks_done");
+      return reply(`Done: ${hits[0].title}`);
     }
 
-    // ---- task: / sara: ----
-    let owner = me.handle;
-    if (kind.toLowerCase() === "sara") owner = "sara";
+    if (kind !== "task" && !handles.includes(kind)) return j({ ok: true, reply: "", skipped: "unknown prefix" });
+
+    let owner = kind === "task" ? me.handle : kind;
     const forM = rest.match(/\s+for\s+([a-z]+)\s*$/i);
-    if (forM && (members ?? []).some(m => m.handle === forM[1].toLowerCase())) { owner = forM[1].toLowerCase(); rest = rest.replace(forM[0], "").trim(); }
+    if (forM && handles.includes(forM[1].toLowerCase())) { owner = forM[1].toLowerCase(); rest = rest.replace(forM[0], "").trim(); }
 
     let tier = "high";
     const tierM = rest.match(/\s+(must|high|bonus)\s*$/i);
@@ -60,40 +148,56 @@ Deno.serve(async (req) => {
     let kindCol = "shallow";
     if (/\s+deep\s*$/i.test(rest)) { kindCol = "deep"; rest = rest.replace(/\s+deep\s*$/i, "").trim(); }
 
+    let effort = 30;
+    const effM = rest.match(/\s+(\d+)\s*(m|min|mins|h|hr|hrs)\s*$/i);
+    if (effM) { const n = Number(effM[1]); effort = /^h/i.test(effM[2]) ? n * 60 : n; rest = rest.replace(effM[0], "").trim(); }
+
     let due: string | null = null;
     const dueM = rest.match(/\b(by|on|before)\s+(today|tomorrow|mon|tue|wed|thu|fri|sat|sun|\d{4}-\d{2}-\d{2})\b/i);
-    if (dueM) { due = resolveDay(dueM[2]); rest = rest.replace(dueM[0], "").trim(); }
+    if (dueM) { due = resolveDay(dueM[2], tz); rest = rest.replace(dueM[0], "").trim(); }
 
-    // client match by first-name-ish token
     let client_id: string | null = null, project_id: string | null = null;
     const { data: clients } = await supabase.from("clients").select("id, name").eq("tenant_id", tenant_id).eq("status", "active");
-    for (const c of clients ?? []) { const first = c.name.split(" ")[0]; if (first.length > 2 && new RegExp(`\\b${escape(first)}\\b`, "i").test(rest)) { client_id = c.id; break; } }
+    for (const c of clients ?? []) { const first = String(c.name).split(" ")[0]; if (first.length > 2 && new RegExp(`\\b${escape(first)}\\b`, "i").test(rest)) { client_id = c.id; break; } }
     if (client_id) { const { data: pr } = await supabase.from("projects").select("id").eq("client_id", client_id).eq("status", "active").maybeSingle(); project_id = pr?.id ?? null; }
 
     const title = rest.charAt(0).toUpperCase() + rest.slice(1);
-    const { error } = await supabase.from("tasks").insert({ tenant_id, title, detail: `${me.name} via SMS: ${text}`, tier, kind: kindCol, status: "open", owner, source: "capture", source_ref: p.message_id ?? `sms:${Date.now()}`, client_id, project_id, due_date: due });
+    const { error } = await supabase.from("tasks").insert({ tenant_id, title, detail: `${me.name} via text: ${text}`, tier, kind: kindCol, effort_minutes: effort, status: "open", owner, source: "capture", source_ref: str(p.message_id) || `sms:${Date.now()}`, client_id, project_id, due_date: due });
     if (error) return j({ error: error.message }, 500);
-    return jlog({ ok: true, reply: `Added: ${title} — ${tier}${owner !== me.handle ? ", for " + owner : ""}${due ? ", due " + due : ""}` });
+    return reply(`Added: ${title} — ${tier}, ${effort} min${owner !== me.handle ? ", for " + owner : ""}${due ? ", due " + due : ""}`);
   } catch (e) { return j({ error: String(e) }, 500); }
 });
 
-function resolveDay(s: string) {
-  const t = s.toLowerCase(); const d = new Date();
+function reply(text: string) { console.log("reply:", text); return j({ ok: true, reply: text, has_reply: text ? "yes" : "no" }); }
+function resolveDay(s: string, tz: string) {
+  const t = String(s ?? "").toLowerCase();
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
-  if (t === "tomorrow") d.setDate(d.getDate() + 1);
-  else if (t !== "today") { const idx = ["sun","mon","tue","wed","thu","fri","sat"].indexOf(t.slice(0,3)); if (idx >= 0) { let diff = (idx - d.getDay() + 7) % 7; if (diff === 0) diff = 7; d.setDate(d.getDate() + diff); } }
-  return d.toISOString().slice(0, 10);
+  const base = Date.now();
+  if (t === "today" || !t) return localDate(base, tz);
+  if (t === "tomorrow") return localDate(base + 86400000, tz);
+  const idx = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"].indexOf(t.slice(0, 3));
+  if (idx < 0) return localDate(base + 86400000, tz);
+  const now = new Intl.DateTimeFormat("en-GB", { timeZone: tz, weekday: "short" }).format(new Date(base));
+  const cur = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(now);
+  let diff = (idx - cur + 7) % 7; if (diff === 0) diff = 7;
+  return localDate(base + diff * 86400000, tz);
+}
+function localDate(ms: number, tz: string) { return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ms)); }
+async function ghl(token: string, path: string, method = "GET", body?: unknown) {
+  const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const r = await fetch(BASE + path, { method, signal: ctrl.signal, headers: { "Authorization": `Bearer ${token}`, "Version": "2021-04-15", "Accept": "application/json", "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+    const text = await r.text(); let json: any = null; try { json = JSON.parse(text); } catch { json = null; }
+    return { ok: r.ok, status: r.status, json, text };
+  } catch (e) { return { ok: false, status: 0, json: null, text: String(e) }; }
+  finally { clearTimeout(tm); }
 }
 function escape(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 function str(v: unknown): string {
   if (v === null || v === undefined) return "";
   if (typeof v === "string") return v;
   if (typeof v === "number" || typeof v === "boolean") return String(v);
-  if (typeof v === "object") {
-    const o = v as Record<string, unknown>;
-    for (const k of ["body", "text", "message", "value", "content"]) if (typeof o[k] === "string") return o[k] as string;
-  }
+  if (typeof v === "object") { const o = v as Record<string, unknown>; for (const k of ["body", "text", "message", "value", "content"]) if (typeof o[k] === "string") return o[k] as string; }
   return String(v);
 }
-function jlog(b: any, s = 200) { console.log("reply:", b.reply); return j(b, s); }
 function j(b: unknown, s = 200) { return new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json" } }); }

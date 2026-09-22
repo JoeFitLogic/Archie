@@ -2,11 +2,10 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 const SECRET = Deno.env.get("ARCHIE_SECRET")!;
-const GHL_KEY = Deno.env.get("GHL_AGENCY_API_KEY")!;
-const H = { "Authorization": `Bearer ${GHL_KEY}`, "Version": "2021-07-28", "Content-Type": "application/json" };
+const FALLBACK_TOKEN = Deno.env.get("GHL_AGENCY_API_KEY") ?? "";
 
 Deno.serve(async (req) => {
-  console.log("ghl-sync v7 start");
+  console.log("ghl-sync v8 start");
   const t0 = Date.now();
   try {
     if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
@@ -16,8 +15,11 @@ Deno.serve(async (req) => {
     console.log("tenant_id:", tenant_id);
     const { data: t } = await supabase.from("tenants").select("status").eq("id", tenant_id).single();
     if (t?.status !== "active") return j({ ok: true, skipped: "tenant not active" });
-    const { data: cfg } = await supabase.from("tenant_config").select("client_tag, ghl_location_id").eq("tenant_id", tenant_id).single();
+    const { data: cfg } = await supabase.from("tenant_config").select("client_tag, ghl_location_id, ghl_token").eq("tenant_id", tenant_id).single();
     if (!cfg?.client_tag || !cfg.ghl_location_id) return j({ error: "client_tag or ghl_location_id missing" }, 400);
+    const token = cfg.ghl_token || FALLBACK_TOKEN;
+    if (!token) return j({ error: "no GHL token for tenant" }, 400);
+    const H = { "Authorization": `Bearer ${token}`, "Version": "2021-07-28", "Content-Type": "application/json" };
 
     // 1. Fetch tagged contacts (paged, 20s timeout per page)
     const tagged: { id: string; name: string; email: string | null }[] = [];

@@ -1,15 +1,18 @@
-// agent-result v2 — GHL-only agents report here via the workflow.
-// Logs the run, upserts whitelisted metrics, inserts proposed tasks (deduped), updates client last contact.
+// agent-result v4 — agents report here via the workflow.
+// Logs the run, upserts whitelisted metrics, inserts proposed tasks (deduped), updates client last contact,
+// and carries out CRM actions (notes, tags) the agent cannot do itself when invoked from a workflow.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 const SECRET = Deno.env.get("ARCHIE_SECRET")!;
+const FALLBACK_TOKEN = Deno.env.get("GHL_AGENCY_API_KEY") ?? "";
+const BASE = "https://services.leadconnectorhq.com";
 
-const ALLOWED_METRICS = ["pipeline_value", "pipeline_open", "stale_count", "appointments", "unread", "unanswered_12h", "clients_at_risk"];
+const ALLOWED_METRICS = ["pipeline_value", "pipeline_open", "stale_count", "stale_value", "appointments", "unread", "unanswered_12h", "clients_at_risk"];
 const TIERS = ["must", "high", "bonus"];
 const KINDS = ["deep", "shallow"];
 
 Deno.serve(async (req) => {
-  console.log("agent-result v2 start");
+  console.log("agent-result v4 start");
   try {
     if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     const raw = await req.json();
@@ -37,7 +40,7 @@ Deno.serve(async (req) => {
       if (error) return j({ error: `metrics: ${error.message}` }, 500);
     }
 
-    // ---- client lookup (shared) ----
+    // ---- client lookup ----
     const { data: clients } = await supabase.from("clients").select("id, ghl_contact_id").eq("tenant_id", tenant_id).eq("status", "active");
     const clientByContact = new Map((clients ?? []).map((c) => [c.ghl_contact_id, c.id]));
 
@@ -46,10 +49,7 @@ Deno.serve(async (req) => {
     const contacts: string[] = parseJson(p.clients_touched, []);
     if (!isError && Array.isArray(contacts) && contacts.length) {
       const ids = contacts.map((c) => clientByContact.get(String(c))).filter(Boolean) as string[];
-      if (ids.length) {
-        await supabase.from("clients").update({ last_contact_at: now }).in("id", ids);
-        touched = ids.length;
-      }
+      if (ids.length) { await supabase.from("clients").update({ last_contact_at: now }).in("id", ids); touched = ids.length; }
     }
 
     // ---- proposed tasks ----
@@ -61,13 +61,11 @@ Deno.serve(async (req) => {
         ? await supabase.from("tasks").select("source_ref").eq("tenant_id", tenant_id).in("source_ref", refs)
         : { data: [] as any[] };
       const seen = new Set((existing ?? []).map((e) => e.source_ref));
-
       const clientIds = [...new Set(proposed.map((x) => clientByContact.get(String(x?.contact_id ?? ""))).filter(Boolean))] as string[];
       const { data: projects } = clientIds.length
         ? await supabase.from("projects").select("id, client_id").eq("tenant_id", tenant_id).eq("status", "active").in("client_id", clientIds)
         : { data: [] as any[] };
       const projectByClient = new Map((projects ?? []).map((pr) => [pr.client_id, pr.id]));
-
       const rows: any[] = [];
       for (const x of proposed) {
         const title = String(x?.title ?? "").trim();
@@ -83,14 +81,10 @@ Deno.serve(async (req) => {
           detail: String(x?.detail ?? "").slice(0, 2000),
           tier: TIERS.includes(x?.tier) ? x.tier : "high",
           kind: KINDS.includes(x?.kind) ? x.kind : "shallow",
-          effort_minutes: Number.isFinite(effort) && effort > 0 ? Math.round(effort / 15) * 15 || 15 : 30,
+          effort_minutes: Number.isFinite(effort) && effort > 0 ? Math.max(15, Math.round(effort / 15) * 15) : 30,
           due_date: /^\d{4}-\d{2}-\d{2}$/.test(String(x?.due_date ?? "")) ? x.due_date : null,
-          status: "proposed",
-          source: agent,
-          source_ref: ref,
-          client_id,
-          project_id: client_id ? projectByClient.get(client_id) ?? null : null,
-          owner: null,
+          status: "proposed", source: agent, source_ref: ref,
+          client_id, project_id: client_id ? projectByClient.get(client_id) ?? null : null, owner: null,
         });
       }
       if (rows.length) {
@@ -99,6 +93,54 @@ Deno.serve(async (req) => {
         inserted = rows.length;
       }
     }
+
+    // ---- CRM actions: notes and tags ----
+    let notesWritten = 0, notesSkipped = 0, tagsAdded = 0, actionErrors = 0, draftsCreated = 0;
+    const actions: any[] = parseJson(p.actions, []);
+    if (!isError && Array.isArray(actions) && actions.length) {
+      const { data: cfg } = await supabase.from("tenant_config").select("ghl_token").eq("tenant_id", tenant_id).single();
+      const token = cfg?.ghl_token || FALLBACK_TOKEN;
+      if (!token) actionErrors = actions.length;
+      else {
+        for (const a of actions.slice(0, 50)) {
+          const cid = String(a?.contact_id ?? "").trim();
+          if (!cid) { actionErrors++; continue; }
+          const note = String(a?.note ?? "").trim();
+          if (note) {
+            const existing = await ghl(token, `/contacts/${cid}/notes`, "GET");
+            const list: any[] = existing.ok ? (existing.json?.notes ?? []) : [];
+            const prefix = `[auto] ${today}`;
+            if (list.some((n) => String(n?.body ?? "").startsWith(prefix))) notesSkipped++;
+            else {
+              const w = await ghl(token, `/contacts/${cid}/notes`, "POST", { body: `${prefix} — ${note.slice(0, 900)}` });
+              if (w.ok) notesWritten++; else actionErrors++;
+            }
+          }
+          if (a?.reactivate === true || String(a?.reactivate) === "true" || String(a?.reactivate) === "yes") {
+            const tg = await ghl(token, `/contacts/${cid}/tags`, "POST", { tags: ["archie-reactivate"] });
+            if (tg.ok) tagsAdded++; else actionErrors++;
+          }
+        }
+      }
+
+      // message drafts — ranked per day, sent only when the owner replies SEND n
+      const drafts = actions.filter((a) => String(a?.draft ?? "").trim() && String(a?.contact_id ?? "").trim());
+      if (drafts.length) {
+        const { data: todays } = await supabase.from("message_drafts").select("rank, contact_id").eq("tenant_id", tenant_id).eq("created_on", today);
+        const already = new Set((todays ?? []).map((d) => d.contact_id));
+        let rank = (todays ?? []).reduce((m, d) => Math.max(m, d.rank ?? 0), 0);
+        const rows = drafts.filter((a) => !already.has(String(a.contact_id))).map((a) => ({
+          tenant_id, created_on: today, rank: ++rank, status: "pending", source: agent,
+          contact_id: String(a.contact_id), name: String(a?.name ?? "").slice(0, 120),
+          channel: String(a?.channel ?? "?").slice(0, 20), body: String(a.draft).slice(0, 1000),
+        }));
+        if (rows.length) { await supabase.from("message_drafts").insert(rows); draftsCreated = rows.length; }
+      }
+    }
+
+    // ---- activity counters (for the monthly receipt) ----
+    const bumps: [string, number][] = [["notes_written", notesWritten], ["tags_added", tagsAdded], ["tasks_proposed", inserted], ["drafts_created", draftsCreated]];
+    for (const [field, n] of bumps) if (n > 0) await supabase.rpc("bump_activity", { p_tenant: tenant_id, p_day: today, p_field: field, p_n: n });
 
     // ---- run log ----
     await supabase.from("agent_runs").insert({
@@ -109,10 +151,29 @@ Deno.serve(async (req) => {
       error: isError ? summary : null,
     });
 
-    return j({ ok: true, agent, status: isError ? "failed" : "done", metrics_written: Object.keys(cleanMetrics), tasks_inserted: inserted, tasks_skipped: skipped, tasks_invalid: invalid, clients_touched: touched });
+    return j({
+      ok: true, agent, status: isError ? "failed" : "done",
+      metrics_written: Object.keys(cleanMetrics),
+      tasks_inserted: inserted, tasks_skipped: skipped, tasks_invalid: invalid,
+      clients_touched: touched,
+      notes_written: notesWritten, notes_skipped: notesSkipped, tags_added: tagsAdded, drafts_created: draftsCreated, action_errors: actionErrors,
+    });
   } catch (e) { return j({ error: String(e) }, 500); }
 });
 
+async function ghl(token: string, path: string, method = "GET", body?: unknown) {
+  const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const r = await fetch(BASE + path, {
+      method, signal: ctrl.signal,
+      headers: { "Authorization": `Bearer ${token}`, "Version": "2021-07-28", "Accept": "application/json", "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await r.text(); let json: any = null; try { json = JSON.parse(text); } catch { json = null; }
+    return { ok: r.ok, status: r.status, json, text };
+  } catch (e) { return { ok: false, status: 0, json: null, text: String(e) }; }
+  finally { clearTimeout(tm); }
+}
 function parseJson(v: unknown, fallback: any) {
   if (v === null || v === undefined || v === "") return fallback;
   if (typeof v === "object") return v;
