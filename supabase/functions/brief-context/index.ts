@@ -1,4 +1,4 @@
-// brief-context v2 — does every deterministic part of the brief in code:
+// brief-context v3 — does every deterministic part of the brief in code:
 // rollover, capacity-bound lineup per team member, waiting-on, stuck, inbox, MRR trend/target/anomalies.
 // Returns one text block for the Brief agent, which only writes the words and the Focus line.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -7,7 +7,7 @@ const SECRET = Deno.env.get("ARCHIE_SECRET")!;
 const TIERS = ["must", "high", "bonus"];
 
 Deno.serve(async (req) => {
-  console.log("brief-context v2 start");
+  console.log("brief-context v3 start");
   try {
     if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     const raw = await req.json();
@@ -40,7 +40,7 @@ Deno.serve(async (req) => {
     const twoWeeksAgo = localDate(Date.now() - 14 * 86400000, tz);
     const [{ data: team }, { data: tasks }, { data: caps }, { data: hist }, { data: risk }, { count: briefCount }, { data: recov }, { data: doneY }, { data: fb }, { data: drafts }, { data: actY }] = await Promise.all([
       supabase.from("team_members").select("handle, name, gets_financials, quiet_days, quiet_until").eq("tenant_id", tenant_id),
-      supabase.from("tasks").select("id, title, tier, kind, status, owner, effort_minutes, rollover_count, sort_order, due_date, created_at, waiting_for, waiting_since").eq("tenant_id", tenant_id).in("status", ["open", "doing", "waiting", "proposed"]),
+      supabase.from("tasks").select("id, title, detail, tier, kind, status, owner, client_id, effort_minutes, rollover_count, sort_order, due_date, created_at, waiting_for, waiting_since").eq("tenant_id", tenant_id).in("status", ["open", "doing", "waiting", "proposed"]),
       supabase.from("capacity").select("handle, minutes, note").eq("tenant_id", tenant_id).eq("day", today),
       supabase.from("daily_metrics").select("metric_date, mrr, mrr_new, cash_24h").eq("tenant_id", tenant_id).order("metric_date", { ascending: false }).limit(40),
       supabase.from("client_analysis").select("client_id, summary, recommended_action, analysed_at").eq("tenant_id", tenant_id).eq("risk_level", "high").order("analysed_at", { ascending: false }).limit(10),
@@ -212,6 +212,16 @@ Deno.serve(async (req) => {
 
     const draftLines = (drafts ?? []).map((d) => `#${d.rank} ${d.name} (${d.channel}): "${String(d.body).slice(0, 220)}"`);
 
+    // ---------- PROPOSALS (P1, P2…) ----------
+    const proposed = all.filter((x) => x.status === "proposed").sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+    await supabase.from("tasks").update({ proposal_rank: null }).eq("tenant_id", tenant_id).not("proposal_rank", "is", null);
+    const shown = proposed.slice(0, 5);
+    for (let i = 0; i < shown.length; i++) await supabase.from("tasks").update({ proposal_rank: i + 1 }).eq("id", shown[i].id);
+    const clientIds = [...new Set(shown.map((x) => x.client_id).filter(Boolean))];
+    const { data: pc } = clientIds.length ? await supabase.from("clients").select("id, name").in("id", clientIds) : { data: [] as any[] };
+    const cName = new Map((pc ?? []).map((c) => [c.id, c.name]));
+    const proposalLines = shown.map((x, i) => `P${i + 1} ${x.title}${x.client_id && cName.get(x.client_id) ? ` (${cName.get(x.client_id)})` : ""} [${x.tier}] — ${String(x.detail ?? "").replace(/\s+/g, " ").slice(0, 140)}`);
+
     const riskLine = (risk ?? []).length ? (risk ?? []).map((r) => `${r.summary ?? "at risk"} → ${r.recommended_action ?? ""}`).join(" ; ") : "none";
 
     const context = [
@@ -221,7 +231,8 @@ Deno.serve(async (req) => {
       `GOALS: ${cfg?.goals_text ?? "not set"}`,
       fin,
       `AT_RISK: ${riskLine}`,
-      `INBOX: ${inbox} proposals waiting`,
+      `PROPOSALS_TOTAL: ${inbox}`,
+      `PROPOSALS: ${proposalLines.length ? proposalLines.join(" ; ") : "none"}`,
       `FIRST_BRIEF: ${firstBrief ? "yes" : "no"}`,
       deadLine,
       `WINS: ${wins.length ? wins.join(" ; ") : "none"}`,

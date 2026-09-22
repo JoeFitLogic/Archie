@@ -1,8 +1,9 @@
-// capture v4 — everything the owner or team texts to Archie.
+// capture v5 — everything the owner or team texts to Archie.
 // task: / <handle>: / capacity: / done: <text>   — as before
 // done 2  ·  done 1 3            — tick off today's numbered tasks
 // move 3 friday  ·  snooze 2     — push a task to another day (snooze = tomorrow)
 // send 1  ·  skip 1              — send or bin one of today's message drafts
+// add P1 · wait P1 · sara P1 · drop P1 · inbox — handle what Archie found in your messages
 // 👍 / good [note]  ·  👎 / bad [note] — rate this morning's brief
 // quiet today · quiet till fri · quiet off
 // help
@@ -16,13 +17,14 @@ const HELP = [
   "task: [thing] [must/high/bonus]",
   "done 2 · move 3 fri · snooze 2",
   "send 1 · skip 1",
+  "add P1 · wait P1 · sara P1 · drop P1 · inbox",
   "capacity: 90 · capacity: tomorrow 0",
   "👍 or 👎 [why] on the brief",
   "quiet today · quiet till fri · quiet off",
 ].join("\n");
 
 Deno.serve(async (req) => {
-  console.log("capture v4 start");
+  console.log("capture v5 start");
   try {
     if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     const raw = await req.json();
@@ -109,6 +111,44 @@ Deno.serve(async (req) => {
       await supabase.from("message_drafts").update({ status: "sent", sent_at: new Date().toISOString() }).eq("id", d.id);
       await bump("drafts_sent");
       return reply(`Sent to ${d.name} on ${type}.`);
+    }
+
+    // ---------- proposals: inbox / add P1 / wait P1 [name] / <handle> P1 / drop P1 ----------
+    const handleList = (members ?? []).map((m) => m.handle.toLowerCase());
+    if (lower === "inbox" || lower === "proposals") {
+      const { data: props } = await supabase.from("tasks").select("id, title, proposal_rank, created_at").eq("tenant_id", tenant_id).eq("status", "proposed").order("created_at", { ascending: false }).limit(10);
+      if (!props?.length) return reply("Nothing new from your messages.");
+      await supabase.from("tasks").update({ proposal_rank: null }).eq("tenant_id", tenant_id).not("proposal_rank", "is", null);
+      for (let i = 0; i < props.length; i++) await supabase.from("tasks").update({ proposal_rank: i + 1 }).eq("id", props[i].id);
+      return reply(props.map((x, i) => `P${i + 1} ${x.title}`).join("\n") + "\n\nadd P1 · wait P1 · drop P1");
+    }
+    const pm = lower.match(/^([a-z]+)\s+((?:p\d+[\s,]*)+)(.*)$/);
+    if (pm && (["add", "accept", "yes", "wait", "drop", "no", "bin"].includes(pm[1]) || handleList.includes(pm[1]))) {
+      const verb = pm[1];
+      const ranks = (pm[2].match(/\d+/g) ?? []).map(Number);
+      const extra = str(text.slice(text.toLowerCase().indexOf(pm[2].trim()) + pm[2].trim().length)).trim();
+      const { data: hits } = await supabase.from("tasks").select("id, title, client_id, proposal_rank").eq("tenant_id", tenant_id).eq("status", "proposed").in("proposal_rank", ranks);
+      if (!hits?.length) return reply(`No proposal ${ranks.map((r) => "P" + r).join(", ")} — reply "inbox" to see the current list.`);
+      const now = new Date().toISOString();
+      const titles = hits.map((h) => h.title).join(" · ");
+      if (verb === "drop" || verb === "no" || verb === "bin") {
+        await supabase.from("tasks").update({ status: "dismissed", dismissed_reason: "dropped by text", proposal_rank: null }).in("id", hits.map((h) => h.id));
+        return reply(`Dropped: ${titles}`);
+      }
+      if (verb === "wait") {
+        for (const h of hits) {
+          let who = extra;
+          if (!who && h.client_id) { const { data: c } = await supabase.from("clients").select("name").eq("id", h.client_id).maybeSingle(); who = c?.name ?? ""; }
+          await supabase.from("tasks").update({ status: "waiting", owner: me.handle, waiting_for: who || "them", waiting_since: today, accepted_by: me.handle, accepted_at: now, proposal_rank: null }).eq("id", h.id);
+        }
+        return reply(`Waiting on it: ${titles}. I'll nudge you after 5 days.`);
+      }
+      const owner = handleList.includes(verb) ? verb : me.handle;
+      const tierM = extra.match(/\b(must|high|bonus)\b/i);
+      const patch: Record<string, unknown> = { status: "open", owner, accepted_by: me.handle, accepted_at: now, proposal_rank: null };
+      if (tierM) patch.tier = tierM[1].toLowerCase();
+      await supabase.from("tasks").update(patch).in("id", hits.map((h) => h.id));
+      return reply(`Added${owner !== me.handle ? ` for ${owner}` : ""}: ${titles}`);
     }
 
     // ---------- prefixed commands ----------
