@@ -1,4 +1,4 @@
-// archie-setup v1 — the onboarding form lands here. Configures the whole tenant in one call:
+// archie-setup v2 — the onboarding form lands here. Configures the whole tenant in one call:
 // tenant_config, team members, and the GHL custom values every chain reads.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -18,7 +18,7 @@ const MODULES: [string, string][] = [
 ];
 
 Deno.serve(async (req) => {
-  console.log("archie-setup v1 start");
+  console.log("archie-setup v2 start");
   try {
     if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     const raw = await req.json();
@@ -31,10 +31,14 @@ Deno.serve(async (req) => {
     const { data: cfgNow } = await supabase.from("tenant_config").select("*").eq("tenant_id", tenant_id).single();
 
     // ---------- normalise form values ----------
+    // Unfilled custom values and merge fields that didn't resolve are treated as blank
+    for (const k of Object.keys(p)) { const v = String(p[k] ?? "").trim(); if (/^\[.*\]$/.test(v) || /^\{\{.*\}\}$/.test(v)) p[k] = ""; }
     const list = (v: unknown) => (Array.isArray(v) ? v : String(v ?? "").split(/[,\n;]/)).map((s) => String(s).trim()).filter(Boolean);
     const moduleKeys = new Set<string>();
+    const KEYS = new Set(["brief", "tasks", "team", "leads", "triage", "stripe", "chase", "renewals", "checkins", "health", "callnotes", "content", "drafts", "reviews", "reactivate", "weekly", "monthly"]);
     for (const label of list(p.modules)) {
-      const l = label.toLowerCase();
+      const l = label.toLowerCase().trim();
+      if (KEYS.has(l)) { moduleKeys.add(l); continue; }
       for (const [kw, key] of MODULES) if (l.includes(kw)) moduleKeys.add(key);
     }
     moduleKeys.add("brief");
