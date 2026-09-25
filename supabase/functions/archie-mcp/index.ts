@@ -1,9 +1,13 @@
-// archie-mcp v1 — Archie as an MCP server for GHL Managed Agents and Ask AI.
+// archie-mcp v1.1 — Archie as an MCP server for GHL Managed Agents and Ask AI.
 // URL: /functions/v1/archie-mcp/<tenant access_token>
 // The token picks the tenant. Nothing from any other tenant is ever returned.
+// v1.1: archie_notify — scheduled tasks and agents can message the owner (WhatsApp/SMS) and log to the Archie feed.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+const FALLBACK_TOKEN = Deno.env.get("GHL_AGENCY_API_KEY") ?? "";
+const BASE = "https://services.leadconnectorhq.com";
 const TIERS = ["must", "high", "bonus"];
+const NOTIFY_DAILY_CAP = 20;
 
 const TOOLS = [
   {
@@ -55,6 +59,19 @@ const TOOLS = [
     description: "Business numbers from Archie: MRR, new MRR, cash, pipeline, stale deals, failed payments, active clients, and MRR change over the period. Always use this for numbers, never guess.",
     inputSchema: { type: "object", properties: { days: { type: "number", description: "How many days back, default 7, max 60." } } },
   },
+  {
+    name: "archie_notify",
+    description: "Send the business owner a short message on their phone (WhatsApp or SMS, whichever they chose) and save it to the Archie feed. Use at the end of every scheduled task to report what you found, and whenever something needs the owner's attention. Keep it short: a title and 1–5 lines.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short title, e.g. 'Call notes — 2 calls' or 'Midday check'." },
+        message: { type: "string", description: "The summary, 1–5 short lines. Plain text." },
+        urgent: { type: "boolean", description: "True only if it can't wait — sends even when the owner is in quiet mode." },
+      },
+      required: ["title", "message"],
+    },
+  },
 ];
 
 Deno.serve(async (req) => {
@@ -84,7 +101,7 @@ async function handle(tenant: any, msg: any) {
     return ok(id, {
       protocolVersion: msg?.params?.protocolVersion ?? "2025-03-26",
       capabilities: { tools: {} },
-      serverInfo: { name: "archie", version: "1.0.0" },
+      serverInfo: { name: "archie", version: "1.1.0" },
     });
   }
   if (method === "ping") return ok(id, {});
@@ -104,11 +121,12 @@ async function handle(tenant: any, msg: any) {
 
 async function run(tenant: any, name: string, a: any): Promise<string> {
   const tid = tenant.id;
-  const { data: cfg } = await supabase.from("tenant_config").select("timezone, mrr_target").eq("tenant_id", tid).single();
+  const { data: cfg } = await supabase.from("tenant_config").select("timezone, mrr_target, brief_channel, ghl_token").eq("tenant_id", tid).single();
   const tz = cfg?.timezone || "Europe/London";
   const today = localDate(Date.now(), tz);
-  const { data: team } = await supabase.from("team_members").select("handle, name, gets_financials").eq("tenant_id", tid);
-  const owner = (team ?? []).find((m) => m.gets_financials)?.handle ?? "owner";
+  const { data: team } = await supabase.from("team_members").select("handle, name, gets_financials, ghl_contact_id, quiet_until").eq("tenant_id", tid);
+  const ownerRow = (team ?? []).find((m) => m.gets_financials);
+  const owner = ownerRow?.handle ?? "owner";
   const resolve = (h: unknown) => {
     const s = String(h ?? "").trim().toLowerCase();
     if (!s) return owner;
@@ -205,7 +223,45 @@ async function run(tenant: any, name: string, a: any): Promise<string> {
     return lines.join("\n");
   }
 
+  if (name === "archie_notify") {
+    const title = String(a.title ?? "").trim().slice(0, 120);
+    const message = String(a.message ?? "").trim().slice(0, 1200);
+    if (!title || !message) throw new Error("title and message required");
+    const urgent = a.urgent === true || String(a.urgent) === "true";
+
+    const { count: sentToday } = await supabase.from("notifications").select("id", { count: "exact", head: true })
+      .eq("tenant_id", tid).eq("sent", true).gte("created_at", `${today}T00:00:00`);
+    const quiet = !!ownerRow?.quiet_until && String(ownerRow.quiet_until) >= today;
+    const channel = String(cfg?.brief_channel ?? "sms").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS";
+
+    let sent = false, why = "";
+    if (quiet && !urgent) why = "owner in quiet mode — saved to the feed only";
+    else if ((sentToday ?? 0) >= NOTIFY_DAILY_CAP) why = "daily message limit reached — saved to the feed only";
+    else if (!ownerRow?.ghl_contact_id) why = "owner contact not set — saved to the feed only";
+    else {
+      const ghlToken = cfg?.ghl_token || FALLBACK_TOKEN;
+      const r = await ghl(ghlToken, "/conversations/messages", "POST", { type: channel, contactId: ownerRow.ghl_contact_id, message: `${title}\n\n${message}` });
+      sent = r.ok;
+      if (!r.ok) why = `couldn't send (${r.status}) — saved to the feed only`;
+    }
+
+    await supabase.from("notifications").insert({
+      tenant_id: tid, source: "mcp", title, body: message, channel: channel.toLowerCase(), urgent, sent, error: sent ? null : why,
+    });
+    return sent ? `Sent to the owner on ${channel} and saved to the Archie feed.` : `Not sent: ${why}.`;
+  }
+
   throw new Error(`Unknown tool: ${name}`);
+}
+
+async function ghl(token: string, path: string, method = "GET", body?: unknown) {
+  const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const r = await fetch(BASE + path, { method, signal: ctrl.signal, headers: { "Authorization": `Bearer ${token}`, "Version": "2021-04-15", "Accept": "application/json", "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+    const text = await r.text(); let j: any = null; try { j = JSON.parse(text); } catch { j = null; }
+    return { ok: r.ok, status: r.status, json: j, text };
+  } catch (e) { return { ok: false, status: 0, json: null, text: String(e) }; }
+  finally { clearTimeout(tm); }
 }
 
 const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*", "Access-Control-Allow-Methods": "POST, OPTIONS" };
