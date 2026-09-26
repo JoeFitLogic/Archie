@@ -1,4 +1,4 @@
-// archie-screens v1.7 — data and actions for the Archie AI Studio pages.
+// archie-screens v2.5 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -9,6 +9,15 @@
 //       junk output (empty, "null", a lone number) is marked failed instead of done.
 // v1.6: run_finish tidies agent output — escaped line breaks become real ones, a number glued to the end is removed.
 // v1.7: today's date in every skill's business context; pipeline/scraper outputs keep only the human-readable part.
+// v1.8: Collected this month reads Stripe's revenue_mtd; pipeline days count from the last message (matches the brief).
+// v1.9: money figures come from the latest day Stripe actually reported, not just the latest row.
+// v2.0: skill runs call the Managed Agent directly (Agent Studio public API) in the background — no tags or workflow.
+//       Per-tenant run_mode: 'api' (default) or 'workflow' (the old tag route, kept as a fallback). Pipeline and scraper stay on workflows for now.
+// v2.1: brief_run — the morning brief via the API with a fresh session each day: brief-context → Brief agent → date check → brief-save → send.
+// v2.2: brief_run gets the money summary straight from stripe-metrics (it isn't logged anywhere else).
+// v2.3: plan_run — the Saturday content plan via the API: content agent → save → message the owner. Once a week unless forced.
+// v2.4: Social Planner drafts go to the client's connected accounts with a GHL user attached (the API requires both); planner_accounts lists them.
+// v2.5: 7D — Pipeline and Scraper via the API (buttons and mornings), and morning_run: sync → Stripe → context → Pipeline → Scraper → brief, all in the backend.
 // The token picks the tenant. Nothing from any other tenant is ever returned or changed.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -18,6 +27,17 @@ const BASE = "https://services.leadconnectorhq.com";
 const TIERS = ["must", "high", "bonus"];
 const RUN_KINDS = ["pipeline", "scraper", "skill", "video"];
 const ZAPCAP = "https://api.zapcap.ai";
+declare const EdgeRuntime: any;
+// Agent names Archie looks for in each account (first match wins) — old names kept so nothing breaks while renaming
+const AGENT_NAMES: Record<string, string[]> = {
+  content: ["Archie Content", "Archie Content Writer"],
+  sales: ["Archie Sales", "Archie Sales Writer"],
+  ops: ["Archie Ops", "Operations Writer"],
+  brief: ["Archie Brief", "Brief"],
+  pipeline: ["Archie Pipeline", "Pipeline"],
+  scraper: ["Archie Scraper", "Scraper"],
+};
+const SUPA_URL = Deno.env.get("SUPABASE_URL")!;
 const ZAPCAP_KEY = Deno.env.get("ZAPCAP_API_KEY") ?? "";
 const ZAPCAP_TEMPLATE = Deno.env.get("ZAPCAP_TEMPLATE_ID") ?? "";
 
@@ -40,6 +60,19 @@ Deno.serve(async (req) => {
       if (action === "run_finish") return j(await runFinish(tenant_id, p));
       if (action === "plan_context") return j(await planContext(tenant_id));
       if (action === "plan_save") return j(await planSave(tenant_id, p));
+      if (action === "morning_run") {
+        startInBackground(morningRun(tenant_id, p));
+        return j({ ok: true, started: true, step: String(p.step ?? "start") });
+      }
+      if (action === "plan_run") {
+        startInBackground(planRun(tenant_id, p));
+        return j({ ok: true, started: true });
+      }
+      if (action === "brief_run") {
+        // Reply straight away (GHL webhooks don't wait long) and do the work in the background
+        startInBackground(briefRun(tenant_id, p));
+        return j({ ok: true, started: true });
+      }
       return j({ error: `unknown workflow action: ${action}` }, 400);
     }
 
@@ -70,6 +103,7 @@ Deno.serve(async (req) => {
       case "pillars_from_run": return j(await pillarsFromRun(c, p));
       case "plan": return j(await latestPlan(c));
       case "to_planner": return j(await toPlanner(c, p));
+      case "planner_accounts": return j(await plannerAccounts(c));
       case "media_videos": return j(await mediaVideos(c));
       case "polish": return j(await polish(c, p));
       case "polish_status": return j(await polishStatus(c, p));
@@ -114,7 +148,7 @@ async function overview(c: any, p: any) {
   const errors: string[] = [];
 
   const [{ data: latestRow }, { data: rows }, { data: cfg }, { data: tenantRow }, { data: activeClients }, { data: brief }, { count: newClients }, { count: churned }] = await Promise.all([
-    supabase.from("daily_metrics").select("*").eq("tenant_id", c.tid).order("metric_date", { ascending: false }).limit(1).maybeSingle(),
+    supabase.from("daily_metrics").select("*").eq("tenant_id", c.tid).not("mrr", "is", null).order("metric_date", { ascending: false }).limit(1).maybeSingle(),
     supabase.from("daily_metrics").select("metric_date, mrr, cash_24h").eq("tenant_id", c.tid).gte("metric_date", addDays(startDate < monthStart ? startDate : monthStart, -1)).order("metric_date", { ascending: true }),
     supabase.from("tenant_config").select("mrr_target, revenue_target, pipeline_id, pipeline_name, ghl_location_id").eq("tenant_id", c.tid).single(),
     supabase.from("tenants").select("location_id").eq("id", c.tid).single(),
@@ -131,8 +165,12 @@ async function overview(c: any, p: any) {
   const baseRow = (rows ?? []).find((r) => r.metric_date < startDate && r.mrr !== null) ?? (rows ?? []).find((r) => r.mrr !== null);
   const mrr = num(latest.mrr);
   const target = num(cfg?.mrr_target);
-  const revenue = inPeriod.reduce((a, r) => a + (Number(r.cash_24h) || 0), 0);
-  const revenueMtd = (rows ?? []).filter((r) => r.metric_date >= monthStart).reduce((a, r) => a + (Number(r.cash_24h) || 0), 0);
+  const summedPeriod = inPeriod.reduce((a, r) => a + (Number(r.cash_24h) || 0), 0);
+  const summedMtd = (rows ?? []).filter((r) => r.metric_date >= monthStart).reduce((a, r) => a + (Number(r.cash_24h) || 0), 0);
+  // Stripe's own month-to-date figure (written by stripe-metrics) is the source of truth; the sum is only a fallback
+  const stripeMtd = latest.metric_date && String(latest.metric_date) >= monthStart ? num(latest.revenue_mtd) : null;
+  const revenueMtd = stripeMtd ?? summedMtd;
+  const revenue = period === "month" ? revenueMtd : summedPeriod;
   const revTarget = num(cfg?.revenue_target);
   const staleDays = latest.metric_date ? Math.max(0, Math.round((Date.parse(c.today) - Date.parse(String(latest.metric_date))) / 86400000)) : null;
 
@@ -205,7 +243,7 @@ async function overview(c: any, p: any) {
       mrr_target: target, mrr_pct: mrr !== null && target ? Math.round((mrr / target) * 100) : null,
       new_mrr_month: num(latest.mrr_new),
       revenue: Math.round(revenue * 100) / 100,
-      revenue_note: "Cash collected, from the daily Stripe snapshots",
+      revenue_note: period === "month" ? "Collected this month, from Stripe" : "Cash collected in the period, from the daily Stripe snapshots",
       revenue_mtd: Math.round(revenueMtd * 100) / 100,
       revenue_target: revTarget,
       revenue_pct: revTarget ? Math.round((revenueMtd / revTarget) * 100) : null,
@@ -424,18 +462,29 @@ async function run(c: any, p: any) {
     .insert({ tenant_id: c.tid, kind, skill, input, status: "queued", requested_by: c.resolve(p.handle), contact_id: contactId, contact_name: String(p.contact_name ?? "").slice(0, 120) || null })
     .select("id, kind, skill, status, created_at").single();
   if (error) throw new Error(error.message);
+  if ((await runMode(c.tid)) === "api") {
+    if (kind === "skill") { startInBackground(executeRun(c.tid, row.id)); return { ok: true, run: row, route: "api" }; }
+    if (kind === "pipeline" || kind === "scraper") { startInBackground(executeJobRun(c.tid, row.id, kind)); return { ok: true, run: row, route: "api" }; }
+  }
   const tagged = await retag(c, kind);
   if (!tagged.ok) {
     await supabase.from("screen_runs").update({ status: "failed", error: tagged.error, finished_at: new Date().toISOString() }).eq("id", row.id);
     return { ok: false, run_id: row.id, error: tagged.error };
   }
-  return { ok: true, run: row };
+  return { ok: true, run: row, route: "workflow" };
 }
 
 async function nudge(c: any, p: any) {
   const id = String(p.run_id ?? "");
-  const { data: r } = await supabase.from("screen_runs").select("id, kind, status").eq("tenant_id", c.tid).eq("id", id).maybeSingle();
+  const { data: r } = await supabase.from("screen_runs").select("id, kind, status, started_at").eq("tenant_id", c.tid).eq("id", id).maybeSingle();
   if (!r) return { ok: false, error: "run not found" };
+  const stuckRunning = r.status === "running" && r.started_at && Date.now() - Date.parse(r.started_at) > 5 * 60000;
+  if ((await runMode(c.tid)) === "api" && (r.status === "queued" || stuckRunning)) {
+    await supabase.from("screen_runs").update({ status: "queued", started_at: null }).eq("id", r.id);
+    if (r.kind === "skill") startInBackground(executeRun(c.tid, r.id));
+    else startInBackground(executeJobRun(c.tid, r.id, r.kind));
+    return { ok: true, route: "api" };
+  }
   if (r.status !== "queued") return { ok: false, error: `run is ${r.status}` };
   const tagged = await retag(c, r.kind);
   return tagged.ok ? { ok: true } : { ok: false, error: tagged.error };
@@ -507,25 +556,61 @@ async function latestPlan(c: any) {
   return { ok: true, plan: data ?? null };
 }
 
+async function plannerAccounts(c: any) {
+  const { loc } = await locOf(c);
+  if (!loc || !c.ghlToken) return { ok: false, error: "no GHL location or token", accounts: [] };
+  const r = await ghl(c.ghlToken, `/social-media-posting/${loc}/accounts`, "GET", undefined, "2021-07-28");
+  if (!r.ok) return { ok: false, error: `accounts ${r.status}: ${r.text.slice(0, 150)}`, accounts: [] };
+  const list: any[] = r.json?.results?.accounts ?? r.json?.accounts ?? [];
+  const accounts = list
+    .filter((a) => !a.deleted && a.isExpired !== true)
+    .map((a) => ({ id: String(a.id ?? a._id ?? ""), platform: String(a.platform ?? a.type ?? "").toLowerCase(), name: String(a.name ?? a.meta?.name ?? a.platform ?? "") }))
+    .filter((a) => a.id);
+  return { ok: true, accounts };
+}
+
+// A GHL user to post as — remembered once found
+async function plannerUserId(c: any, loc: string): Promise<string | null> {
+  const { data: cfg } = await supabase.from("tenant_config").select("ghl_user_id").eq("tenant_id", c.tid).maybeSingle();
+  if (cfg?.ghl_user_id) return String(cfg.ghl_user_id);
+  const r = await ghl(c.ghlToken, `/users/?locationId=${loc}`, "GET", undefined, "2021-07-28");
+  const users: any[] = r.json?.users ?? [];
+  const pick = users.find((u) => String(u.roles?.role ?? u.role ?? "").toLowerCase() === "admin") ?? users[0];
+  const id = pick?.id ? String(pick.id) : null;
+  if (id) await supabase.from("tenant_config").update({ ghl_user_id: id }).eq("tenant_id", c.tid);
+  return id;
+}
+
 async function toPlanner(c: any, p: any) {
   const type = ["post", "story", "reel"].includes(String(p.type)) ? String(p.type) : "post";
   const text = String(p.text ?? "").trim();
   const mediaUrl = String(p.media_url ?? "").trim();
   if (!text && !mediaUrl) return { ok: false, error: "nothing to add" };
-  const { data: cfg } = await supabase.from("tenant_config").select("ghl_location_id").eq("tenant_id", c.tid).single();
-  const { data: t } = await supabase.from("tenants").select("location_id").eq("id", c.tid).single();
-  const loc = cfg?.ghl_location_id || t?.location_id;
+  const { loc } = await locOf(c);
   if (!loc || !c.ghlToken) return { ok: false, error: "no GHL location or token" };
-  const body: Record<string, unknown> = { type, status: "draft" };
-  // Stories can't carry a caption, so the text goes in as the follow-up note for the owner instead
+
+  // Which accounts: the ones asked for, otherwise every connected account that suits the type
+  const acc = await plannerAccounts(c);
+  if (!acc.ok) return { ok: false, error: acc.error };
+  let accounts = acc.accounts as any[];
+  if (Array.isArray(p.account_ids) && p.account_ids.length) accounts = accounts.filter((a) => p.account_ids.includes(a.id));
+  if (type === "story" || type === "reel") accounts = accounts.filter((a) => /instagram|facebook|tiktok|youtube/.test(a.platform));
+  if (!accounts.length) return { ok: false, error: type === "post" ? "no social accounts connected in Social Planner" : `no accounts that take ${type}s are connected in Social Planner` };
+
+  const userId = await plannerUserId(c, loc);
+  if (!userId) return { ok: false, error: "couldn't find a GHL user to post as — add the users scope to the token" };
+
+  const body: Record<string, unknown> = { type, status: "draft", accountIds: accounts.map((a) => a.id), userId };
+  // Stories can't carry a caption, so the text goes in as the follow-up comment instead
   if (type !== "story") body.summary = text.slice(0, 2200);
   if (mediaUrl) body.media = [{ url: mediaUrl, type: String(p.media_type ?? (type === "post" ? "image/jpeg" : "video/mp4")) }];
   if (type === "story" && text) body.followUpComment = text.slice(0, 500);
+
   const r = await ghl(c.ghlToken, `/social-media-posting/${loc}/posts`, "POST", body, "2021-07-28");
-  if (!r.ok) return { ok: false, error: `Social Planner said ${r.status}: ${r.text.slice(0, 200)}` };
-  const postId = r.json?.results?.post?._id ?? r.json?.post?._id ?? null;
+  if (!r.ok) return { ok: false, error: `Social Planner said ${r.status}: ${r.text.slice(0, 300)}` };
+  const postId = r.json?.results?.post?._id ?? r.json?.post?._id ?? r.json?.results?._id ?? null;
   if (p.run_id) await supabase.from("screen_runs").update({ saved: true }).eq("tenant_id", c.tid).eq("id", String(p.run_id));
-  return { ok: true, post_id: postId, note: "Saved as a draft in Social Planner — add media and pick accounts there, then schedule." };
+  return { ok: true, post_id: postId, accounts: accounts.map((a) => a.name), note: "Saved as a draft in Social Planner — add media, check the accounts, then schedule." };
 }
 
 async function mediaVideos(c: any) {
@@ -703,8 +788,23 @@ async function pipelineList(c: any) {
   if (!r.ok) return { ok: false, error: `opportunities ${r.status}`, items: [], open: null, need_action: null, urgent: null };
   const staleAfter = Number(cfg?.stale_threshold_days ?? 7) || 7;
   const now = Date.now();
-  const items = (r.json?.opportunities ?? []).map((o: any) => {
-    const last = toMs(o.lastStageChangeAt ?? o.lastStatusChangeAt ?? o.updatedAt ?? o.createdAt);
+  const opps: any[] = r.json?.opportunities ?? [];
+  // Days since the last message with that contact (same measure as the brief); falls back to the deal's last change
+  const lastMsg = new Map<string, number>();
+  const ids = [...new Set(opps.map((o) => o.contactId ?? o.contact?.id).filter(Boolean))].slice(0, 25) as string[];
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(6, ids.length) }, async () => {
+    while (i < ids.length) {
+      const cid = ids[i++];
+      const cs = await ghl(c.ghlToken, `/conversations/search?locationId=${loc}&contactId=${cid}&limit=1`, "GET", undefined, "2021-04-15");
+      const c0 = cs.ok ? (cs.json?.conversations ?? [])[0] : null;
+      const at = c0 ? toMs(c0.lastMessageDate ?? c0.dateUpdated) : 0;
+      if (at) lastMsg.set(cid, at);
+    }
+  }));
+  const items = opps.map((o: any) => {
+    const cidKey = o.contactId ?? o.contact?.id;
+    const last = lastMsg.get(cidKey) ?? toMs(o.lastStageChangeAt ?? o.lastStatusChangeAt ?? o.updatedAt ?? o.createdAt);
     const days = last ? Math.floor((now - last) / 86400000) : 0;
     const urgent = days >= staleAfter;
     const needsAction = urgent || days >= 2;
@@ -797,6 +897,446 @@ async function contactContext(tid: string, contactId: string): Promise<string> {
     for (const mm of msgs.slice(-15)) lines.push(`[${mm.at.slice(0, 10)} ${mm.dir}] ${mm.body}`);
   }
   return lines.join("\n").slice(0, 12000);
+}
+
+// ===================== v2.0: direct agent runs =====================
+async function runMode(tid: string): Promise<string> {
+  const { data } = await supabase.from("tenant_config").select("run_mode").eq("tenant_id", tid).maybeSingle();
+  return String(data?.run_mode ?? "api") === "workflow" ? "workflow" : "api";
+}
+
+function startInBackground(p: Promise<unknown>) {
+  try { if (typeof EdgeRuntime !== "undefined" && EdgeRuntime?.waitUntil) { EdgeRuntime.waitUntil(p); return; } } catch { /* fall through */ }
+  p.catch((e) => console.error("background run failed", e));
+}
+
+// Find (and remember) the ID of this account's agent for content / sales / ops
+async function agentIdFor(tid: string, agentKey: string, token: string, loc: string): Promise<string | null> {
+  const { data: cfg } = await supabase.from("tenant_config").select("agent_ids").eq("tenant_id", tid).maybeSingle();
+  const cache: Record<string, string> = (cfg?.agent_ids && typeof cfg.agent_ids === "object") ? cfg.agent_ids : {};
+  if (cache[agentKey]) return cache[agentKey];
+  const r = await ghl(token, `/agent-studio/managed-agents?locationId=${loc}&limit=100`, "GET", undefined, "v3");
+  if (!r.ok) return null;
+  const agents: any[] = r.json?.agents ?? [];
+  const wanted = (AGENT_NAMES[agentKey] ?? []).map((n) => n.toLowerCase());
+  let found: any = null;
+  for (const name of wanted) { found = agents.find((a) => String(a.name ?? "").trim().toLowerCase() === name); if (found) break; }
+  if (!found) return null;
+  cache[agentKey] = found.id;
+  await supabase.from("tenant_config").update({ agent_ids: cache }).eq("tenant_id", tid);
+  return found.id;
+}
+
+async function executeRun(tid: string, runId: string) {
+  const fail = async (error: string) => {
+    await supabase.from("screen_runs").update({ status: "failed", error, finished_at: new Date().toISOString() }).eq("id", runId);
+  };
+  try {
+    // Claim it (only if still queued), so a double nudge can't run it twice
+    const { data: r } = await supabase.from("screen_runs").update({ status: "running", started_at: new Date().toISOString() })
+      .eq("id", runId).eq("status", "queued").select("id, skill, input, contact_id").maybeSingle();
+    if (!r) return;
+
+    const [{ data: cfg }, { data: t }, { data: s }] = await Promise.all([
+      supabase.from("tenant_config").select("ghl_location_id, ghl_token").eq("tenant_id", tid).single(),
+      supabase.from("tenants").select("location_id").eq("id", tid).single(),
+      supabase.from("skills_catalog").select("*").eq("key", r.skill).maybeSingle(),
+    ]);
+    const loc = cfg?.ghl_location_id || t?.location_id;
+    const token = cfg?.ghl_token || FALLBACK_TOKEN;
+    if (!loc || !token) return fail("no GHL location or token");
+    const agentKey = String((s as any)?.agent ?? "content");
+    const agentId = await agentIdFor(tid, agentKey, token, loc);
+    if (!agentId) return fail(`couldn't find the ${agentKey} agent — check it's published and named ${(AGENT_NAMES[agentKey] ?? [])[0]}`);
+
+    // Build the message, keeping it under the API's 10,000-character limit
+    const biz = await businessContext(tid);
+    const who = r.contact_id ? await contactContext(tid, String(r.contact_id)) : "";
+    const head = `Use the ${r.skill} skill.\n\nInput:\n${String(r.input || "(no input given — make sensible assumptions from the business context)").slice(0, 3000)}\n\nBusiness context:\n${biz}`;
+    const tail = "\n\nReturn only the finished output, ready to copy. No preamble, no questions, no notes about what you did.";
+    const room = 9800 - head.length - tail.length;
+    const whoBlock = who && room > 300 ? `\n\nContact context (everything Archie can see about them):\n${who.slice(0, room - 80)}` : "";
+    const message = (head + whoBlock + tail).slice(0, 9900);
+
+    const body: Record<string, unknown> = { locationId: loc, message };
+    if (r.contact_id) body.contactId = String(r.contact_id);
+
+    let res = await agentExecute(token, agentId, body, runId);
+    if (res.status === 429 || res.status >= 500) {
+      const wait = Math.min(20, Number(res.retryAfter) || 8) * 1000;
+      await new Promise((ok) => setTimeout(ok, wait));
+      res = await agentExecute(token, agentId, body, runId);
+    }
+    if (res.status === 404) {
+      // The cached agent ID is stale (agent replaced or renamed) — forget it so the next run looks it up again
+      const { data: c2 } = await supabase.from("tenant_config").select("agent_ids").eq("tenant_id", tid).maybeSingle();
+      const cache = (c2?.agent_ids && typeof c2.agent_ids === "object") ? { ...c2.agent_ids } : {};
+      delete cache[agentKey];
+      await supabase.from("tenant_config").update({ agent_ids: cache }).eq("tenant_id", tid);
+      return fail("agent not found — it may have been renamed or unpublished; press Run again");
+    }
+    if (!res.ok || res.json?.success === false) return fail(`agent error ${res.status}: ${String(res.text).slice(0, 200)}`);
+
+    const text = tidy(clean(String(res.json?.finalText ?? "")));
+    if (!text || /^(null|undefined|\d{1,6})$/i.test(text)) return fail("the agent returned no text");
+    await supabase.from("screen_runs").update({ status: "done", output: text.slice(0, 50000), error: null, finished_at: new Date().toISOString() }).eq("id", runId);
+  } catch (e) {
+    await fail(`run failed: ${String(e).slice(0, 200)}`);
+  }
+}
+
+async function agentExecute(token: string, agentId: string, body: Record<string, unknown>, idem: string) {
+  const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 140000);
+  try {
+    const r = await fetch(`${BASE}/agent-studio/managed-agents/${agentId}/execute`, {
+      method: "POST", signal: ctrl.signal,
+      headers: { "Authorization": `Bearer ${token}`, "Version": "v3", "Accept": "application/json", "Content-Type": "application/json", "Idempotency-Key": idem },
+      body: JSON.stringify(body),
+    });
+    const text = await r.text(); let js: any = null; try { js = JSON.parse(text); } catch { js = null; }
+    return { ok: r.ok, status: r.status, json: js, text, retryAfter: r.headers.get("retry-after") };
+  } catch (e) { return { ok: false, status: 0, json: null, text: String(e), retryAfter: null }; }
+  finally { clearTimeout(tm); }
+}
+
+// ===================== v2.1: morning brief via the API =====================
+async function briefRun(tid: string, p: any) {
+  const SUPA = Deno.env.get("SUPABASE_URL")!;
+  const log = async (status: string, summary: string, error: string | null = null) => {
+    const now = new Date().toISOString();
+    await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "brief", trigger: "api", status, started_at: now, finished_at: now, summary, error });
+  };
+  try {
+    const [{ data: cfg }, { data: t }, { data: team }] = await Promise.all([
+      supabase.from("tenant_config").select("ghl_location_id, ghl_token, timezone, brief_channel").eq("tenant_id", tid).single(),
+      supabase.from("tenants").select("location_id, status").eq("id", tid).single(),
+      supabase.from("team_members").select("handle, name, gets_financials, ghl_contact_id").eq("tenant_id", tid),
+    ]);
+    if (t?.status !== "active") return;
+    const tz = cfg?.timezone || "Europe/London";
+    const today = localDate(Date.now(), tz);
+    const loc = cfg?.ghl_location_id || t?.location_id;
+    const token = cfg?.ghl_token || FALLBACK_TOKEN;
+    if (!loc || !token) return log("failed", "", "no GHL location or token");
+
+    // Already sent today? Don't send twice (unless forced)
+    if (String(p.force ?? "") !== "yes") {
+      const { count } = await supabase.from("briefs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("brief_date", today).eq("delivered", true);
+      if ((count ?? 0) > 0) return log("done", "Brief already sent today — skipped");
+    }
+
+    // 1. Today's context from brief-context (rollover, lineup, money, playbooks)
+    const bc = await fetch(`${SUPA}/functions/v1/brief-context`, {
+      method: "POST", headers: { "Content-Type": "application/json", "x-archie-secret": SECRET },
+      body: JSON.stringify({ tenant_id: tid, referral_link: String(p.referral_link ?? "") }),
+    });
+    const bcj: any = await bc.json().catch(() => null);
+    const ctx = String(bcj?.brief_context ?? "");
+    if (!bc.ok || !ctx.includes("DAY:")) return log("failed", "", `brief-context failed: ${bc.status}`);
+    const m = ctx.match(/DAY:\s*([A-Za-z]+)\s+(\d{1,2})\s+([A-Za-z]+)/);
+    const expected = m ? `${m[1].slice(0, 3)} ${m[2]} ${m[3].slice(0, 3)}` : "";
+
+    // 2. Today's pipeline, scraper and money summaries (saved earlier in the morning run)
+    const { data: runsToday } = await supabase.from("agent_runs").select("agent, summary, started_at")
+      .eq("tenant_id", tid).eq("status", "done").gte("started_at", `${today}T00:00:00`).order("started_at", { ascending: false }).limit(40);
+    const latestOf = (names: string[]) => {
+      const row = (runsToday ?? []).find((r: any) => names.includes(String(r.agent)) && r.summary);
+      if (!row) return "not available";
+      const txt = String(row.summary);
+      const cut = txt.indexOf("===OWNER===");
+      return (cut >= 0 ? txt.slice(0, cut) : txt).split("\n").filter((l) => !/^\s*(TASKS_JSON|ACTIONS_JSON|CLIENTS_TOUCHED|METRICS_JSON)\s*:/i.test(l)).join("\n").trim().slice(0, 2500) || "not available";
+    };
+    const pipelineTxt = latestOf(["pipeline"]);
+    const scraperTxt = latestOf(["scraper"]);
+    let moneyTxt = latestOf(["stripe", "stripe-metrics", "financials", "finance"]);
+    let moneyNote = "";
+    if (moneyTxt === "not available") {
+      // stripe-metrics returns the money summary (MRR, new, MTD, failed payments to chase) — ask it directly
+      try {
+        const sm = await fetch(`${SUPA}/functions/v1/stripe-metrics`, {
+          method: "POST", headers: { "Content-Type": "application/json", "x-archie-secret": SECRET },
+          body: JSON.stringify({ tenant_id: tid }),
+        });
+        const smj: any = await sm.json().catch(() => null);
+        const summary = String(smj?.summary ?? "").trim();
+        if (sm.ok && summary) moneyTxt = summary.slice(0, 2500);
+        else moneyNote = ` | stripe-metrics ${sm.status}${smj?.error ? `: ${String(smj.error).slice(0, 120)}` : ""}`;
+      } catch (e) { moneyNote = ` | stripe-metrics unreachable`; }
+    }
+
+    // 3. The Brief agent, fresh session every day
+    const agentId = await agentIdFor(tid, "brief", token, loc);
+    if (!agentId) return log("failed", "", "couldn't find the Brief agent — check it's published and named Archie Brief");
+    const message = [
+      "Execute your instructions now. Use ONLY the data below. It is today's data. Ignore anything from earlier runs or conversations.",
+      `The header date must be exactly: ${expected}.`,
+      "Capacity comes from the OWNER CAPACITY line. The Today list is exactly the LINEUP lines, with their numbers. Never add a task that is not listed there. At risk comes only from the AT_RISK line.",
+      "Return only the two briefs in the marker format.",
+      "", "BRIEF CONTEXT:", ctx.slice(0, 6000),
+      "", "FINANCIALS OUTPUT:", moneyTxt,
+      "", "PIPELINE OUTPUT:", pipelineTxt,
+      "", "SCRAPER OUTPUT:", scraperTxt,
+    ].join("\n").slice(0, 9900);
+    let res = await agentExecute(token, agentId, { locationId: loc, message }, `brief-${tid}-${today}-${Date.now()}`);
+    if (res.status === 429 || res.status >= 500) {
+      await new Promise((ok) => setTimeout(ok, Math.min(20, Number(res.retryAfter) || 8) * 1000));
+      res = await agentExecute(token, agentId, { locationId: loc, message }, `brief-${tid}-${today}-${Date.now()}`);
+    }
+    if (!res.ok || res.json?.success === false) return log("failed", "", `Brief agent error ${res.status}: ${String(res.text).slice(0, 200)}`);
+
+    // 4. Split and check the date
+    const text = tidy(clean(String(res.json?.finalText ?? "")));
+    const ownerRaw = text.includes("===OWNER===") ? text.split("===OWNER===")[1].split("===TEAM===")[0] : text;
+    const teamRaw = text.includes("===TEAM===") ? text.split("===TEAM===")[1] : "";
+    const tidyBrief = (x: string) => x.split(/\n---\n|\*\*Run complete|Run summary/i)[0].trim();
+    const ownerText = tidyBrief(ownerRaw);
+    const teamText = tidyBrief(teamRaw);
+    const dated = (x: string) => !x || x.toUpperCase() === "QUIET" || !expected || x.includes(expected);
+    if (!dated(ownerText) || !dated(teamText)) {
+      await notifyOwner(tid, "⚠️ Brief blocked", `This morning's brief didn't carry today's date (${expected}), so it wasn't sent. Archie will try again tomorrow — or run it again from the Morning workflow.`, cfg);
+      return log("failed", "", `stale brief blocked — expected ${expected}`);
+    }
+
+    // 5. Save (marks delivered, counts activity, referral date)
+    await fetch(`${SUPA}/functions/v1/brief-save`, {
+      method: "POST", headers: { "Content-Type": "application/json", "x-archie-secret": SECRET },
+      body: JSON.stringify({ tenant_id: tid, owner_text: ownerText, team_text: teamText, referral_offered: String(bcj?.referral ?? "no") }),
+    });
+
+    // 6. Send — owner, then the team member
+    const channel = String(cfg?.brief_channel ?? "sms").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS";
+    const owner = (team ?? []).find((x: any) => x.gets_financials);
+    const other = (team ?? []).find((x: any) => !x.gets_financials && x.ghl_contact_id);
+    const sent: string[] = [];
+    const send = async (contactId: string, body: string, who: string) => {
+      const r = await ghl(token, "/conversations/messages", "POST", { type: channel, contactId, message: body.slice(0, 3500) }, "2021-04-15");
+      sent.push(`${who} ${r.ok ? "sent" : `failed ${r.status}`}`);
+    };
+    if (owner?.ghl_contact_id && ownerText && ownerText.toUpperCase() !== "QUIET") await send(owner.ghl_contact_id, ownerText, owner.handle);
+    if (other?.ghl_contact_id && teamText && teamText.toUpperCase() !== "QUIET") await send(other.ghl_contact_id, teamText, other.handle);
+    await log("done", `Brief for ${expected} via API | ${sent.join(" | ") || "nothing to send"}${moneyNote}`);
+  } catch (e) {
+    await log("failed", "", `brief_run crashed: ${String(e).slice(0, 200)}`);
+  }
+}
+
+// ===================== v2.3: Saturday plan via the API =====================
+async function planRun(tid: string, p: any) {
+  const log = async (status: string, summary: string, error: string | null = null) => {
+    const now = new Date().toISOString();
+    await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "plan", trigger: "api", status, started_at: now, finished_at: now, summary, error });
+  };
+  try {
+    const [{ data: cfg }, { data: t }] = await Promise.all([
+      supabase.from("tenant_config").select("ghl_location_id, ghl_token, timezone, brief_channel, modules").eq("tenant_id", tid).single(),
+      supabase.from("tenants").select("location_id, status").eq("id", tid).single(),
+    ]);
+    if (t?.status !== "active") return;
+    const loc = cfg?.ghl_location_id || t?.location_id;
+    const token = cfg?.ghl_token || FALLBACK_TOKEN;
+    if (!loc || !token) return log("failed", "", "no GHL location or token");
+
+    // Once a week, unless forced
+    if (String(p.force ?? "") !== "yes") {
+      const since = new Date(Date.now() - 5 * 86400000).toISOString();
+      const { count } = await supabase.from("content_plans").select("id", { count: "exact", head: true }).eq("tenant_id", tid).gte("created_at", since);
+      if ((count ?? 0) > 0) return log("done", "Plan already made this week — skipped");
+    }
+
+    const agentId = await agentIdFor(tid, "content", token, loc);
+    if (!agentId) return log("failed", "", "couldn't find the content agent");
+
+    const ctx = await planContext(tid);
+    const message = [
+      ctx.message,
+      "",
+      "Output rules (these override anything else): return ONLY a JSON array of 5–7 objects, Monday first, each exactly:",
+      '{"day":"Mon","idea":"…","hook":"…","pillar":"…","angle":"story|belief shift|problem solving|objection|social proof","format":"post|reel|carousel|stories"}',
+      "No text, headings or code fences before or after the array.",
+    ].join("\n").slice(0, 9900);
+
+    let res = await agentExecute(token, agentId, { locationId: loc, message }, `plan-${tid}-${Date.now()}`);
+    if (res.status === 429 || res.status >= 500) {
+      await new Promise((ok) => setTimeout(ok, Math.min(20, Number(res.retryAfter) || 8) * 1000));
+      res = await agentExecute(token, agentId, { locationId: loc, message }, `plan-${tid}-${Date.now()}`);
+    }
+    if (!res.ok || res.json?.success === false) return log("failed", "", `content agent error ${res.status}: ${String(res.text).slice(0, 200)}`);
+
+    const saved: any = await planSave(tid, { output: String(res.json?.finalText ?? "") });
+    if (!saved?.ok) {
+      await notifyOwner(tid, "⚠️ Content plan didn't work", "Archie couldn't turn this week's ideas into a plan. It'll try again next Saturday — or run content-strategy / the plan again from Skills.", cfg);
+      return log("failed", "", String(saved?.error ?? "plan not saved"));
+    }
+    await log("done", `Plan for w/c ${saved.week_start}: ${saved.ideas} ideas | ${saved.notified ? "sent" : "not sent"}`);
+  } catch (e) {
+    await log("failed", "", `plan_run crashed: ${String(e).slice(0, 200)}`);
+  }
+}
+
+// ===================== v2.5 (7D): Pipeline, Scraper and the morning run via the API =====================
+async function internal(fn: string, body: Record<string, unknown>) {
+  try {
+    const r = await fetch(`${SUPA_URL}/functions/v1/${fn}`, { method: "POST", headers: { "Content-Type": "application/json", "x-archie-secret": SECRET }, body: JSON.stringify(body) });
+    const js: any = await r.json().catch(() => null);
+    return { ok: r.ok, status: r.status, json: js };
+  } catch (e) { return { ok: false, status: 0, json: { error: String(e) } }; }
+}
+
+function extractArray(text: string, label: string) {
+  const at = text.indexOf(label);
+  if (at < 0) return { json: "[]", start: -1, end: -1 };
+  const open = text.indexOf("[", at);
+  if (open < 0) return { json: "[]", start: at, end: at + label.length };
+  let depth = 0, inStr = false, esc = false;
+  for (let i = open; i < text.length; i++) {
+    const ch = text.charAt(i);
+    if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
+    if (ch === '"') inStr = true;
+    else if (ch === "[") depth++;
+    else if (ch === "]") { depth--; if (depth === 0) return { json: text.slice(open, i + 1), start: at, end: i + 1 }; }
+  }
+  return { json: "[]", start: at, end: text.length };
+}
+function safeArray(s: string): any[] { try { const v = JSON.parse(s); return Array.isArray(v) ? v : []; } catch { return []; } }
+
+// Parse the Pipeline agent's reply the same way the workflow code step did
+function parsePipeline(text: string) {
+  const isError = /^ERROR:/i.test(text);
+  const part = extractArray(text, "ACTIONS_JSON:");
+  const actions = safeArray(part.json);
+  let summary = text;
+  if (part.start >= 0) summary = summary.slice(0, part.start) + summary.slice(part.end);
+  summary = summary.replace(/\s+(?=STALE:)/, "\n").trim();
+  return { isError, summary: isError ? text : summary, actions };
+}
+
+// Parse the Scraper agent's reply the same way the workflow code step did
+function parseScraper(text: string) {
+  const isError = /^ERROR:/i.test(text);
+  const LABELS = "SCHEDULE|WAITING|COUNTS|PROPOSED|TASKS_JSON|CLIENTS_TOUCHED";
+  const metricsRe = new RegExp("METRICS:\\s*([\\s\\S]*?)(?=\\s*(?:" + LABELS + "):|$)");
+  const mm = text.match(metricsRe);
+  const metrics: Record<string, number> = {};
+  for (const pair of (mm ? mm[1] : "").split("|")) {
+    const [k0, v0] = pair.split("=");
+    const k = (k0 ?? "").trim(), v = (v0 ?? "").trim();
+    if (k && v !== "" && !isNaN(Number(v))) metrics[k] = Number(v);
+  }
+  const tasksPart = extractArray(text, "TASKS_JSON:");
+  const clientsPart = extractArray(text, "CLIENTS_TOUCHED:");
+  const tasks = safeArray(tasksPart.json);
+  const clients = safeArray(clientsPart.json);
+  let summary = text;
+  for (const part of [tasksPart, clientsPart].sort((a, b) => b.start - a.start)) {
+    if (part.start >= 0) summary = summary.slice(0, part.start) + summary.slice(part.end);
+  }
+  summary = summary.replace(metricsRe, "").replace(new RegExp("\\s+(?=(?:" + LABELS + "):)", "g"), "\n").trim();
+  return { isError, summary: isError ? text : summary, metrics, tasks, clients };
+}
+
+// Run the Pipeline or Scraper agent through the API and save what it finds (via agent-result, as before)
+async function runAgentJob(tid: string, job: "pipeline" | "scraper", contextText?: string): Promise<{ ok: boolean; summary: string; error?: string }> {
+  const [{ data: cfg }, { data: t }] = await Promise.all([
+    supabase.from("tenant_config").select("ghl_location_id, ghl_token, customer_word, sale_word").eq("tenant_id", tid).single(),
+    supabase.from("tenants").select("location_id").eq("id", tid).single(),
+  ]);
+  const loc = cfg?.ghl_location_id || t?.location_id;
+  const token = cfg?.ghl_token || FALLBACK_TOKEN;
+  if (!loc || !token) return { ok: false, summary: "", error: "no GHL location or token" };
+
+  let ctx = contextText;
+  if (!ctx) {
+    const gc = await internal("ghl-context", { tenant_id: tid });
+    ctx = String(job === "pipeline" ? gc.json?.pipeline_context ?? "" : gc.json?.scraper_context ?? "");
+    if (!gc.ok || !ctx) return { ok: false, summary: "", error: `ghl-context failed (${gc.status})` };
+  }
+  const agentId = await agentIdFor(tid, job, token, loc);
+  if (!agentId) return { ok: false, summary: "", error: `couldn't find the ${job} agent` };
+
+  const cw = String(cfg?.customer_word ?? "client"), sw = String(cfg?.sale_word ?? "proposal");
+  const head = job === "pipeline"
+    ? `Execute your instructions now. Return only the output format. Customer word: ${cw} Sale word: ${sw}\n\nPIPELINE CONTEXT:\n`
+    : `Execute your instructions now. Return only the output format. Customer word: ${cw}\n\nSCRAPER CONTEXT:\n`;
+  const room = 9900 - head.length;
+  const message = head + (ctx.length > room ? ctx.slice(0, room - 60) + "\n[trimmed — more activity than fits]" : ctx);
+
+  let res = await agentExecute(token, agentId, { locationId: loc, message }, `${job}-${tid}-${Date.now()}`);
+  if (res.status === 429 || res.status >= 500) {
+    await new Promise((ok) => setTimeout(ok, Math.min(20, Number(res.retryAfter) || 8) * 1000));
+    res = await agentExecute(token, agentId, { locationId: loc, message }, `${job}-${tid}-${Date.now()}`);
+  }
+  if (!res.ok || res.json?.success === false) return { ok: false, summary: "", error: `${job} agent error ${res.status}: ${String(res.text).slice(0, 160)}` };
+  const text = tidy(clean(String(res.json?.finalText ?? "")));
+  if (!text) return { ok: false, summary: "", error: `${job} agent returned no text` };
+
+  if (job === "pipeline") {
+    const pp = parsePipeline(text);
+    await internal("agent-result", { tenant_id: tid, agent: "pipeline", summary: pp.summary, status: pp.isError ? "failed" : "done", actions: JSON.stringify(pp.actions) });
+    return pp.isError ? { ok: false, summary: pp.summary, error: pp.summary.slice(0, 200) } : { ok: true, summary: pp.summary };
+  }
+  const sp = parseScraper(text);
+  await internal("agent-result", { tenant_id: tid, agent: "scraper", summary: sp.summary, status: sp.isError ? "failed" : "done", metrics: JSON.stringify(sp.metrics), tasks: JSON.stringify(sp.tasks), clients_touched: JSON.stringify(sp.clients) });
+  return sp.isError ? { ok: false, summary: sp.summary, error: sp.summary.slice(0, 200) } : { ok: true, summary: sp.summary };
+}
+
+// A Run Pipeline / Run Scraper button press
+async function executeJobRun(tid: string, runId: string, kind: string) {
+  const { data: r } = await supabase.from("screen_runs").update({ status: "running", started_at: new Date().toISOString() })
+    .eq("id", runId).eq("status", "queued").select("id").maybeSingle();
+  if (!r) return;
+  try {
+    const out = await runAgentJob(tid, kind === "scraper" ? "scraper" : "pipeline");
+    const shown = out.summary.split("\n").filter((l) => !/^\s*(TASKS_JSON|ACTIONS_JSON|CLIENTS_TOUCHED|METRICS_JSON)\s*:/i.test(l)).join("\n").trim();
+    await supabase.from("screen_runs").update(out.ok
+      ? { status: "done", output: shown.slice(0, 50000), error: null, finished_at: new Date().toISOString() }
+      : { status: "failed", error: out.error ?? "failed", finished_at: new Date().toISOString() }).eq("id", runId);
+  } catch (e) {
+    await supabase.from("screen_runs").update({ status: "failed", error: String(e).slice(0, 200), finished_at: new Date().toISOString() }).eq("id", runId);
+  }
+}
+
+// The whole morning, in steps so no single call runs too long:
+// start: sync → Stripe → context → Pipeline → hand the scraper context to step 2
+// scraper: Scraper → start the brief
+async function morningRun(tid: string, p: any) {
+  const step = String(p.step ?? "start");
+  const notes: string[] = [];
+  const log = async (status: string, summary: string, error: string | null = null) => {
+    const now = new Date().toISOString();
+    await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "morning", trigger: "api", status, started_at: now, finished_at: now, summary, error });
+  };
+  try {
+    const { data: t } = await supabase.from("tenants").select("status").eq("id", tid).single();
+    if (t?.status !== "active") return;
+
+    if (step === "start") {
+      const sync = await internal("ghl-sync", { tenant_id: tid });
+      notes.push(`sync ${sync.ok ? "ok" : sync.status}`);
+      const stripe = await internal("stripe-metrics", { tenant_id: tid });
+      notes.push(`stripe ${stripe.ok ? "ok" : stripe.status}`);
+      const gc = await internal("ghl-context", { tenant_id: tid });
+      notes.push(`context ${gc.ok ? "ok" : gc.status}`);
+      const pipe = gc.ok ? await runAgentJob(tid, "pipeline", String(gc.json?.pipeline_context ?? "")) : { ok: false, summary: "", error: "no context" };
+      notes.push(`pipeline ${pipe.ok ? "ok" : `failed: ${pipe.error}`}`);
+      await log(pipe.ok && gc.ok ? "done" : "failed", `Morning step 1 | ${notes.join(" | ")}`);
+      // Step 2 in its own call, carrying the scraper context
+      await internal("archie-screens", { action: "morning_run", tenant_id: tid, step: "scraper", scraper_context: String(gc.json?.scraper_context ?? ""), referral_link: String(p.referral_link ?? "") });
+      return;
+    }
+
+    if (step === "scraper") {
+      const ctx = String(p.scraper_context ?? "");
+      const scr = await runAgentJob(tid, "scraper", ctx || undefined);
+      await log(scr.ok ? "done" : "failed", `Morning step 2 | scraper ${scr.ok ? "ok" : `failed: ${scr.error}`}`);
+      // Step 3: the brief (it checks the date and won't send twice)
+      await internal("archie-screens", { action: "brief_run", tenant_id: tid, referral_link: String(p.referral_link ?? "") });
+      return;
+    }
+  } catch (e) {
+    await log("failed", `Morning ${step}`, `crashed: ${String(e).slice(0, 200)}`);
+    if (step === "start") await internal("archie-screens", { action: "morning_run", tenant_id: tid, step: "scraper", referral_link: String(p.referral_link ?? "") });
+    else if (step === "scraper") await internal("archie-screens", { action: "brief_run", tenant_id: tid, referral_link: String(p.referral_link ?? "") });
+  }
 }
 
 // ===================== workflow side =====================
