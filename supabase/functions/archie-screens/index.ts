@@ -1,4 +1,4 @@
-// archie-screens v2.5 — data and actions for the Archie AI Studio pages.
+// archie-screens v2.6 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -18,6 +18,7 @@
 // v2.3: plan_run — the Saturday content plan via the API: content agent → save → message the owner. Once a week unless forced.
 // v2.4: Social Planner drafts go to the client's connected accounts with a GHL user attached (the API requires both); planner_accounts lists them.
 // v2.5: 7D — Pipeline and Scraper via the API (buttons and mornings), and morning_run: sync → Stripe → context → Pipeline → Scraper → brief, all in the backend.
+// v2.6: 7D part 2 — dispatch: one Supabase schedule runs every client's morning, evening, Saturday plan, renewals and monthly receipt at their own local times. evening_run, monthly_run, renewals_run.
 // The token picks the tenant. Nothing from any other tenant is ever returned or changed.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -55,11 +56,15 @@ Deno.serve(async (req) => {
     if (secretHeader !== null) {
       if (secretHeader !== SECRET) return j({ error: "unauthorized" }, 401);
       const tenant_id = String(p.tenant_id ?? "").trim();
+      if (action === "dispatch") return j(await dispatch(p));
       if (!tenant_id) return j({ error: "tenant_id required" }, 400);
       if (action === "run_next") return j(await runNext(tenant_id, String(p.kind ?? "")));
       if (action === "run_finish") return j(await runFinish(tenant_id, p));
       if (action === "plan_context") return j(await planContext(tenant_id));
       if (action === "plan_save") return j(await planSave(tenant_id, p));
+      if (action === "evening_run") { startInBackground(eveningRun(tenant_id)); return j({ ok: true, started: true }); }
+      if (action === "monthly_run") { startInBackground(monthlyRun(tenant_id, p)); return j({ ok: true, started: true }); }
+      if (action === "renewals_run") { startInBackground(renewalsRun(tenant_id)); return j({ ok: true, started: true }); }
       if (action === "morning_run") {
         startInBackground(morningRun(tenant_id, p));
         return j({ ok: true, started: true, step: String(p.step ?? "start") });
@@ -1336,6 +1341,103 @@ async function morningRun(tid: string, p: any) {
     await log("failed", `Morning ${step}`, `crashed: ${String(e).slice(0, 200)}`);
     if (step === "start") await internal("archie-screens", { action: "morning_run", tenant_id: tid, step: "scraper", referral_link: String(p.referral_link ?? "") });
     else if (step === "scraper") await internal("archie-screens", { action: "brief_run", tenant_id: tid, referral_link: String(p.referral_link ?? "") });
+  }
+}
+
+// ===================== v2.6 (7D part 2): schedules in Supabase =====================
+function localNow(tz: string) {
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", weekday: "short", hour12: false }).formatToParts(new Date());
+  const g = (k: string) => parts.find((x) => x.type === k)?.value ?? "";
+  const date = `${g("year")}-${g("month")}-${g("day")}`;
+  const minutes = (Number(g("hour")) % 24) * 60 + Number(g("minute"));
+  const weekday = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(g("weekday"));
+  return { date, minutes, weekday, day: Number(g("day")) };
+}
+function hhmm(v: unknown, fallback: string) {
+  const m = String(v ?? fallback).match(/^(\d{1,2}):(\d{2})/);
+  const [h, mi] = m ? [Number(m[1]), Number(m[2])] : fallback.split(":").map(Number);
+  return h * 60 + mi;
+}
+function dueNow(nowMin: number, targetMin: number) { return nowMin >= targetMin && nowMin < targetMin + 90; }
+
+// Claim a job for a period — the unique key means it can only ever run once per period
+async function claim(tid: string, job: string, periodKey: string): Promise<boolean> {
+  const { error } = await supabase.from("schedule_log").insert({ tenant_id: tid, job, period_key: periodKey });
+  return !error;
+}
+
+async function dispatch(_p: any) {
+  const { data: tenants } = await supabase.from("tenants").select("id").eq("status", "active");
+  const started: string[] = [];
+  for (const t of tenants ?? []) {
+    const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", t.id).maybeSingle();
+    if (!cfg || cfg.schedules_on !== true) continue; // opt-in per client, so nothing double-runs alongside GHL workflows
+    const tz = cfg.timezone || "Europe/London";
+    const now = localNow(tz);
+    const days = (v: unknown, fb: string) => String(v ?? fb).split(",").map((x) => Number(x.trim())).filter((x) => !isNaN(x));
+    const jobs: { job: string; due: boolean; key: string; action: string; body?: Record<string, unknown> }[] = [
+      { job: "renewals", due: dueNow(now.minutes, hhmm(cfg.sched_renewals, "04:15")), key: now.date, action: "renewals_run" },
+      { job: "morning", due: days(cfg.sched_morning_days, "0,1,2,3,4,5,6").includes(now.weekday) && dueNow(now.minutes, hhmm(cfg.sched_morning, "04:30")), key: now.date, action: "morning_run", body: { referral_link: String(cfg.referral_link ?? "") } },
+      { job: "evening", due: days(cfg.sched_evening_days, "0,1,2,3,4").includes(now.weekday) && dueNow(now.minutes, hhmm(cfg.sched_evening, "20:00")), key: now.date, action: "evening_run" },
+      { job: "plan", due: now.weekday === Number(cfg.sched_plan_day ?? 6) && dueNow(now.minutes, hhmm(cfg.sched_plan, "08:00")), key: now.date, action: "plan_run" },
+      { job: "monthly", due: now.day === Number(cfg.sched_monthly_day ?? 1) && dueNow(now.minutes, hhmm(cfg.sched_monthly, "09:00")), key: now.date.slice(0, 7), action: "monthly_run", body: { referral_link: String(cfg.referral_link ?? "") } },
+    ];
+    for (const jb of jobs) {
+      if (!jb.due) continue;
+      if (!(await claim(t.id, jb.job, jb.key))) continue;
+      await internal("archie-screens", { action: jb.action, tenant_id: t.id, ...(jb.body ?? {}) });
+      started.push(`${t.id.slice(0, 8)}:${jb.job}`);
+    }
+  }
+  return { ok: true, started };
+}
+
+async function sendToTeam(tid: string, ownerText: string, teamText: string, label: string) {
+  const [{ data: cfg }, { data: team }] = await Promise.all([
+    supabase.from("tenant_config").select("ghl_token, brief_channel").eq("tenant_id", tid).single(),
+    supabase.from("team_members").select("handle, gets_financials, ghl_contact_id").eq("tenant_id", tid),
+  ]);
+  const token = cfg?.ghl_token || FALLBACK_TOKEN;
+  const channel = String(cfg?.brief_channel ?? "sms").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS";
+  const owner = (team ?? []).find((x: any) => x.gets_financials);
+  const other = (team ?? []).find((x: any) => !x.gets_financials && x.ghl_contact_id);
+  const sent: string[] = [];
+  const send = async (contactId: string, body: string, who: string) => {
+    const r = await ghl(token, "/conversations/messages", "POST", { type: channel, contactId, message: body.slice(0, 3500) }, "2021-04-15");
+    sent.push(`${who} ${r.ok ? "sent" : `failed ${r.status}`}`);
+  };
+  const usable = (x: string) => x && x.trim() && x.trim().toUpperCase() !== "QUIET";
+  if (owner?.ghl_contact_id && usable(ownerText)) await send(owner.ghl_contact_id, ownerText, owner.handle);
+  if (other?.ghl_contact_id && usable(teamText)) await send(other.ghl_contact_id, teamText, other.handle);
+  const now = new Date().toISOString();
+  await supabase.from("agent_runs").insert({ tenant_id: tid, agent: label, trigger: "api", status: "done", started_at: now, finished_at: now, summary: `${label} | ${sent.join(" | ") || "nothing to send"}` });
+}
+
+async function eveningRun(tid: string) {
+  const r = await internal("plan-tomorrow", { tenant_id: tid });
+  if (!r.ok) {
+    const now = new Date().toISOString();
+    await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "evening", trigger: "api", status: "failed", started_at: now, finished_at: now, error: `plan-tomorrow ${r.status}` });
+    return;
+  }
+  await sendToTeam(tid, String(r.json?.owner_text ?? ""), String(r.json?.team_text ?? ""), "evening");
+}
+
+async function monthlyRun(tid: string, p: any) {
+  const r = await internal("monthly-receipt", { tenant_id: tid, referral_link: String(p.referral_link ?? "") });
+  if (!r.ok) {
+    const now = new Date().toISOString();
+    await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "monthly", trigger: "api", status: "failed", started_at: now, finished_at: now, error: `monthly-receipt ${r.status}` });
+    return;
+  }
+  await sendToTeam(tid, String(r.json?.owner_text ?? ""), "", "monthly");
+}
+
+async function renewalsRun(tid: string) {
+  const r = await internal("stripe-renewals", { tenant_id: tid });
+  if (!r.ok) {
+    const now = new Date().toISOString();
+    await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "renewals", trigger: "api", status: "failed", started_at: now, finished_at: now, error: `stripe-renewals ${r.status}` });
   }
 }
 
