@@ -1,4 +1,4 @@
-// archie-screens v2.6 — data and actions for the Archie AI Studio pages.
+// archie-screens v2.7 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -19,6 +19,7 @@
 // v2.4: Social Planner drafts go to the client's connected accounts with a GHL user attached (the API requires both); planner_accounts lists them.
 // v2.5: 7D — Pipeline and Scraper via the API (buttons and mornings), and morning_run: sync → Stripe → context → Pipeline → Scraper → brief, all in the backend.
 // v2.6: 7D part 2 — dispatch: one Supabase schedule runs every client's morning, evening, Saturday plan, renewals and monthly receipt at their own local times. evening_run, monthly_run, renewals_run.
+// v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
 // The token picks the tenant. Nothing from any other tenant is ever returned or changed.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -834,7 +835,9 @@ async function health(c: any) {
   const hoursSince = (iso: unknown) => iso ? Math.round((now - Date.parse(String(iso))) / 3600000) : null;
   const ghlH = hoursSince(sync?.finished_at);
   const stripeDays = stripeRow?.metric_date ? Math.round((Date.parse(c.today) - Date.parse(String(stripeRow.metric_date))) / 86400000) : null;
+  const agents = await agentsHealth(c);
   return {
+    agents,
     ghl: { ok: ghlH !== null && ghlH <= 30, last: sync?.finished_at ?? null },
     stripe: { ok: stripeDays !== null && stripeDays <= 1, last: stripeRow?.metric_date ?? null },
     archie: { ok: brief?.brief_date === c.today, last: brief?.created_at ?? null },
@@ -1259,9 +1262,10 @@ async function runAgentJob(tid: string, job: "pipeline" | "scraper", contextText
   if (!agentId) return { ok: false, summary: "", error: `couldn't find the ${job} agent` };
 
   const cw = String(cfg?.customer_word ?? "client"), sw = String(cfg?.sale_word ?? "proposal");
+  const rules = job === "pipeline" ? PIPELINE_RULES : SCRAPER_RULES;
   const head = job === "pipeline"
-    ? `Execute your instructions now. Return only the output format. Customer word: ${cw} Sale word: ${sw}\n\nPIPELINE CONTEXT:\n`
-    : `Execute your instructions now. Return only the output format. Customer word: ${cw}\n\nSCRAPER CONTEXT:\n`;
+    ? `Execute your instructions now. Return only the output format. Customer word: ${cw} Sale word: ${sw}\n\n${rules}\n\nPIPELINE CONTEXT:\n`
+    : `Execute your instructions now. Return only the output format. Customer word: ${cw}\n\n${rules}\n\nSCRAPER CONTEXT:\n`;
   const room = 9900 - head.length;
   const message = head + (ctx.length > room ? ctx.slice(0, room - 60) + "\n[trimmed — more activity than fits]" : ctx);
 
@@ -1273,6 +1277,13 @@ async function runAgentJob(tid: string, job: "pipeline" | "scraper", contextText
   if (!res.ok || res.json?.success === false) return { ok: false, summary: "", error: `${job} agent error ${res.status}: ${String(res.text).slice(0, 160)}` };
   const text = tidy(clean(String(res.json?.finalText ?? "")));
   if (!text) return { ok: false, summary: "", error: `${job} agent returned no text` };
+
+  // Check the answer has the shape Archie needs before anything is saved
+  const problem = checkJobOutput(job, text);
+  if (problem) {
+    await flagOwnerOnce(tid, `${job}-format`, `⚠️ ${job === "pipeline" ? "Pipeline" : "Messages"} check skipped`, `Archie's ${job} agent didn't answer in the expected format this time (${problem}), so nothing was saved from it. If someone's edited that agent recently, its instructions may need resetting.`);
+    return { ok: false, summary: "", error: `unusable ${job} output: ${problem}` };
+  }
 
   if (job === "pipeline") {
     const pp = parsePipeline(text);
@@ -1439,6 +1450,60 @@ async function renewalsRun(tid: string) {
     const now = new Date().toISOString();
     await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "renewals", trigger: "api", status: "failed", started_at: now, finished_at: now, error: `stripe-renewals ${r.status}` });
   }
+}
+
+// ===================== v2.7 (7D part 3): format rules, checks, agents health =====================
+const PIPELINE_RULES = [
+  "Output rules (these override anything else):",
+  '- Line 1 exactly: "Pipeline £[total] / [n] open | Stale [n] | Reactivate [n]"',
+  '- Then one line per stale deal: "STALE: [name] £[value] [days]d — [the one next action]"',
+  '- Then, if there are actions: "ACTIONS_JSON: " followed by a JSON array of {"contact_id","opportunity_id","name","note","draft","channel","reactivate"}',
+  "- Notes describe what Archie found or drafted. Never say a message was sent — drafts are only sent when the owner approves them.",
+  "- Never invent names, values or dates that aren't in the context.",
+].join("\n");
+
+const SCRAPER_RULES = [
+  "Output rules (these override anything else):",
+  '- "METRICS: key=value | key=value" (numbers only)',
+  '- "SCHEDULE: …", "WAITING: …", "COUNTS: …", "PROPOSED: …" — one line each',
+  '- "TASKS_JSON: " followed by a JSON array of {"title","detail","tier","kind","effort_minutes","due_date","source_ref","contact_id"} — tier is must, high or bonus',
+  '- "CLIENTS_TOUCHED: " followed by a JSON array of contact IDs',
+  "- Only propose tasks for real requests, promises or problems in the messages. Never invent anything.",
+].join("\n");
+
+function checkJobOutput(job: string, text: string): string | null {
+  const t = text.trim();
+  if (!t || /^(null|undefined|\d{1,6})$/i.test(t)) return "empty reply";
+  if (/^ERROR:/i.test(t)) return null; // the agent's own error — parsed and logged as failed as before
+  if (job === "pipeline") {
+    if (!/Pipeline\s*£?[\d,.]+/i.test(t) && !/STALE:/i.test(t) && !/no open/i.test(t)) return "no pipeline summary line";
+    if (t.includes("ACTIONS_JSON:") && extractArray(t, "ACTIONS_JSON:").json === "[]" && !/ACTIONS_JSON:\s*\[\s*\]/.test(t)) return "ACTIONS_JSON isn't valid JSON";
+  } else {
+    if (!/(SCHEDULE|WAITING|COUNTS|PROPOSED):/i.test(t)) return "no SCHEDULE/WAITING/COUNTS lines";
+    if (t.includes("TASKS_JSON:") && extractArray(t, "TASKS_JSON:").json === "[]" && !/TASKS_JSON:\s*\[\s*\]/.test(t)) return "TASKS_JSON isn't valid JSON";
+  }
+  return null;
+}
+
+// Tell the owner about a problem at most once a day per kind of problem
+async function flagOwnerOnce(tid: string, key: string, title: string, body: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("timezone, ghl_token, brief_channel").eq("tenant_id", tid).maybeSingle();
+  const today = localDate(Date.now(), cfg?.timezone || "Europe/London");
+  if (!(await claim(tid, `flag:${key}`, today))) return;
+  await notifyOwner(tid, title, body, cfg);
+}
+
+// Are all of Archie's agents there and published?
+async function agentsHealth(c: any) {
+  const { loc } = await locOf(c);
+  if (!loc || !c.ghlToken) return { ok: false, missing: ["no GHL location or token"] };
+  const r = await ghl(c.ghlToken, `/agent-studio/managed-agents?locationId=${loc}&limit=100`, "GET", undefined, "v3");
+  if (!r.ok) return { ok: false, missing: [`can't list agents (${r.status}) — check the Managed Agents scopes`] };
+  const names = new Set((r.json?.agents ?? []).map((a: any) => String(a.name ?? "").trim().toLowerCase()));
+  const missing = Object.entries(AGENT_NAMES)
+    .filter(([, options]) => !options.some((n) => names.has(n.toLowerCase())))
+    .map(([key, options]) => `${key} (${options[0]})`);
+  return { ok: missing.length === 0, missing };
 }
 
 // ===================== workflow side =====================

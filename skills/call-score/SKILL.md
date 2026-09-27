@@ -21,6 +21,12 @@ Plain English, one line each, no sales jargon.
 ## Quote
 Only mark a quote as needed if they asked for one or the owner said they'd send one. Only put an `amount` if a price was actually said on the call — otherwise `0`. Never guess prices.
 
+## Coaching for the owner
+One thing that went well and one thing to do better next time — about how the **owner** ran the call, not the prospect.
+- Specific to this call: point to a moment ("when they mentioned their busy season, you asked what it costs them — that's what opened them up").
+- The improvement is one practical change for the next call ("ask for the decision date before talking price"), never a vague "build more rapport".
+- Kind and direct, one sentence each. No sales jargon.
+
 ## Output
 
 Return ONLY this JSON, nothing before or after:
@@ -39,6 +45,10 @@ Return ONLY this JSON, nothing before or after:
     "tip": "They're unsure about setup time — show the 2-week onboarding.",
     "watch": "They mentioned talking to one other option."
   },
+  "coaching": {
+    "went_well": "When they mentioned the busy season, you asked what it costs them — that's what opened them up.",
+    "improve": "Ask for their decision date before talking price, so the follow-up has a deadline."
+  },
   "quote": {
     "needed": true,
     "title": "Website rebuild — 5 pages",
@@ -48,6 +58,6 @@ Return ONLY this JSON, nothing before or after:
 }
 ```
 
-- If it wasn't a sales call, set `"is_sales_call": false`, leave out `score` and `quote`, and still fill `summary` and `promises`.
+- If it wasn't a sales call, set `"is_sales_call": false`, leave out `score` and `quote`, and still fill `summary`, `promises` and `coaching`.
 - `tier` is `must`, `high` or `bonus`. `minutes` is a whole number.
 - Never invent anything that wasn't said on the call.
