@@ -1,4 +1,4 @@
-// archie-sales v2.1 — after-call scoring, quotes and won → invoice. API-first: one webhook in, everything else here.
+// archie-sales v2.2 — after-call scoring, quotes and won → invoice. API-first: one webhook in, everything else here.
 // POST /functions/v1/archie-sales   header x-archie-secret   { action, tenant_id, ... }
 //   after_call { contact_id, hint?, any_date? }  → (background) open deal? → After Call agent via API → score, note, tasks, draft estimate
 //   won        { contact_id, opportunity_id? }   → (background) draft invoice, onboarding tasks, client tag, notify
@@ -226,7 +226,11 @@ async function won(c: any, p: any) {
 
   const done: string[] = [];
   let invoiceId: string | null = null;
-  if (!items.length) {
+  const { data: wcfg } = await supabase.from("tenant_config").select("won_creates_invoice").eq("tenant_id", c.tid).maybeSingle();
+  if (wcfg?.won_creates_invoice === false) {
+    // This business takes payment before marking a deal Won — no invoice needed
+    done.push("no invoice (paid before Won)");
+  } else if (!items.length) {
     await supabase.from("tasks").insert({ tenant_id: c.tid, title: `Invoice ${who.name} — no value on the deal`, detail: "Won, but Archie had no quote or deal value to invoice from.", tier: "must", kind: "shallow", effort_minutes: 15, status: "open", owner: c.owner?.handle ?? null, source: "won", source_ref: `won:${contactId}:${c.today}`, due_date: c.today });
     done.push("no value — task added");
   } else {
@@ -270,7 +274,9 @@ async function won(c: any, p: any) {
   const total = items.reduce((a: number, i: any) => a + (Number(i.amount) || 0), 0);
   await notifyOwner(c, `🎉 ${who.name} — won`, invoiceId
     ? `Invoice for ${c.currency} ${total} drafted. Check it in Payments → Invoices, then send.\nOnboarding tasks are on your list.`
-    : `No invoice drafted — see your list.\nOnboarding tasks are on your list.`);
+    : wcfg?.won_creates_invoice === false
+      ? `Onboarding tasks are on your list.`
+      : `No invoice drafted — see your list.\nOnboarding tasks are on your list.`);
 
   await supabase.from("agent_runs").insert({ tenant_id: c.tid, agent: "won", trigger: "workflow", status: "done", started_at: new Date().toISOString(), finished_at: new Date().toISOString(), summary: `${who.name}: ${done.join(" | ")}` });
   return { ok: true, invoice_id: invoiceId, done };
