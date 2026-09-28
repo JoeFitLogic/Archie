@@ -1,7 +1,8 @@
-// archie-mcp v1.1 — Archie as an MCP server for GHL Managed Agents and Ask AI.
+// archie-mcp v1.2 — Archie as an MCP server for GHL Managed Agents and Ask AI.
 // URL: /functions/v1/archie-mcp/<tenant access_token>
 // The token picks the tenant. Nothing from any other tenant is ever returned.
 // v1.1: archie_notify — scheduled tasks and agents can message the owner (WhatsApp/SMS) and log to the Archie feed.
+// v1.2: Talk to Archie toolbox — move tasks, capacity, quiet mode, day off (blocks the calendar), back on, calls on a day, run a skill, remember.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 const FALLBACK_TOKEN = Deno.env.get("GHL_AGENCY_API_KEY") ?? "";
@@ -72,6 +73,69 @@ const TOOLS = [
       required: ["title", "message"],
     },
   },
+  {
+    name: "archie_move_task",
+    description: "Move a task to another day (or back to 'not planned yet'). Find it by its number on today's list (rank) or part of its title. Just do it and say what you did.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        rank: { type: "number", description: "The task's number on today's list." },
+        title: { type: "string", description: "Part of the task title." },
+        date: { type: "string", description: "YYYY-MM-DD, or 'backlog' for not planned yet." },
+        handle: { type: "string", description: "Whose task. Leave out for the person talking." },
+      },
+      required: ["date"],
+    },
+  },
+  {
+    name: "archie_capacity",
+    description: "Set how many minutes someone can work on a day (e.g. 'I've only got 2 hours tomorrow' → 120). Use archie_day_off for a whole day off.",
+    inputSchema: {
+      type: "object",
+      properties: { date: { type: "string", description: "YYYY-MM-DD" }, minutes: { type: "number" }, handle: { type: "string" } },
+      required: ["date", "minutes"],
+    },
+  },
+  {
+    name: "archie_quiet",
+    description: "Quiet mode — Archie only messages if something is urgent. until = YYYY-MM-DD (quiet up to and including that day), or 'off'.",
+    inputSchema: { type: "object", properties: { until: { type: "string" }, handle: { type: "string" } }, required: ["until"] },
+  },
+  {
+    name: "archie_day_off",
+    description: "Take a day (or part of a day, or several days) off: blocks the person's GHL calendar so nobody can book them, sets their capacity to 0, moves that day's tasks to the next working day, and lists any calls already booked that day. Use for 'I'm off Friday', 'block Thursday 2 till 4', 'I'm away Monday to Wednesday'.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "First day off, YYYY-MM-DD" },
+        end_date: { type: "string", description: "Last day off, YYYY-MM-DD (leave out for one day)" },
+        from: { type: "string", description: "Start time HH:MM for part of a day (leave out for the whole day)" },
+        to: { type: "string", description: "End time HH:MM for part of a day" },
+        handle: { type: "string" },
+      },
+      required: ["date"],
+    },
+  },
+  {
+    name: "archie_back_on",
+    description: "Undo a day off: removes the calendar blocks Archie made for those days and restores normal capacity. Use for 'actually I'm working Friday'.",
+    inputSchema: { type: "object", properties: { date: { type: "string" }, end_date: { type: "string" }, handle: { type: "string" } }, required: ["date"] },
+  },
+  {
+    name: "archie_calls",
+    description: "Calls and appointments booked for someone on a day (default today).",
+    inputSchema: { type: "object", properties: { date: { type: "string" }, handle: { type: "string" } } },
+  },
+  {
+    name: "archie_run_skill",
+    description: "Run one of Archie's skills and return the result, e.g. write-post, create-reel-script, create-carousel, hook-generator, stories, repurpose, write-proposal, reply-to-objection, write-sop, delegate-brief. Takes up to a minute. Put everything the skill needs in input.",
+    inputSchema: { type: "object", properties: { skill: { type: "string" }, input: { type: "string" } }, required: ["skill", "input"] },
+  },
+  {
+    name: "archie_remember",
+    description: "Save a lasting fact about the business or how the owner likes things done ('remember that…'). Archie uses these in future conversations.",
+    inputSchema: { type: "object", properties: { fact: { type: "string" } }, required: ["fact"] },
+  },
 ];
 
 Deno.serve(async (req) => {
@@ -88,7 +152,7 @@ Deno.serve(async (req) => {
 
   const batch = Array.isArray(body) ? body : [body];
   const out: any[] = [];
-  for (const msg of batch) { const r = await handle(tenant, msg); if (r) out.push(r); }
+  for (const msg of batch) { const r = await handle({ ...tenant, token }, msg); if (r) out.push(r); }
   if (!out.length) return new Response(null, { status: 202, headers: CORS });
   return json(Array.isArray(body) ? out : out[0]);
 });
@@ -101,7 +165,7 @@ async function handle(tenant: any, msg: any) {
     return ok(id, {
       protocolVersion: msg?.params?.protocolVersion ?? "2025-03-26",
       capabilities: { tools: {} },
-      serverInfo: { name: "archie", version: "1.1.0" },
+      serverInfo: { name: "archie", version: "1.2.0" },
     });
   }
   if (method === "ping") return ok(id, {});
@@ -121,7 +185,7 @@ async function handle(tenant: any, msg: any) {
 
 async function run(tenant: any, name: string, a: any): Promise<string> {
   const tid = tenant.id;
-  const { data: cfg } = await supabase.from("tenant_config").select("timezone, mrr_target, brief_channel, ghl_token").eq("tenant_id", tid).single();
+  const { data: cfg } = await supabase.from("tenant_config").select("timezone, mrr_target, brief_channel, ghl_token, ghl_location_id, ghl_user_id").eq("tenant_id", tid).single();
   const tz = cfg?.timezone || "Europe/London";
   const today = localDate(Date.now(), tz);
   const { data: team } = await supabase.from("team_members").select("handle, name, gets_financials, ghl_contact_id, quiet_until").eq("tenant_id", tid);
@@ -251,7 +315,204 @@ async function run(tenant: any, name: string, a: any): Promise<string> {
     return sent ? `Sent to the owner on ${channel} and saved to the Archie feed.` : `Not sent: ${why}.`;
   }
 
+
+  const ghlToken = cfg?.ghl_token || FALLBACK_TOKEN;
+  const isDate = (v: unknown) => /^\d{4}-\d{2}-\d{2}$/.test(String(v ?? ""));
+  const addDays = (d: string, n: number) => { const x = new Date(`${d}T12:00:00Z`); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
+  const weekday = (d: string) => new Date(`${d}T12:00:00Z`).getUTCDay();
+  const findTask = async (h: string, rank: unknown, title: unknown) => {
+    if (rank !== undefined && rank !== null && rank !== "") {
+      const { data } = await supabase.from("tasks").select("id, title").eq("tenant_id", tid).eq("owner", h).eq("today", true).eq("today_rank", Number(rank)).in("status", ["open", "doing"]);
+      return data ?? [];
+    }
+    if (String(title ?? "").trim()) {
+      const { data } = await supabase.from("tasks").select("id, title").eq("tenant_id", tid).in("status", ["open", "doing", "waiting"]).ilike("title", `%${String(title).trim()}%`).limit(3);
+      return data ?? [];
+    }
+    throw new Error("rank or title required");
+  };
+
+  if (name === "archie_move_task") {
+    const h = resolve(a.handle);
+    const hits = await findTask(h, a.rank, a.title);
+    if (!hits.length) return "No matching open task.";
+    if (hits.length > 1) return `More than one match: ${hits.map((x) => `"${x.title}"`).join(" / ")}. Ask which one.`;
+    const date = String(a.date ?? "").toLowerCase();
+    if (date === "backlog") {
+      await supabase.from("tasks").update({ due_date: null, today: false, today_rank: null }).eq("id", hits[0].id);
+      return `Moved "${hits[0].title}" to not planned yet.`;
+    }
+    if (!isDate(date)) throw new Error("date must be YYYY-MM-DD or backlog");
+    await supabase.from("tasks").update({ due_date: date, today: date === today, today_rank: null, ...(date === today ? { today_set_on: today } : {}) }).eq("id", hits[0].id);
+    return `Moved "${hits[0].title}" to ${date}.`;
+  }
+
+  if (name === "archie_capacity") {
+    const h = resolve(a.handle);
+    if (!isDate(a.date)) throw new Error("date required (YYYY-MM-DD)");
+    const minutes = Math.max(0, Math.min(1440, Math.round(Number(a.minutes) || 0)));
+    const { error } = await supabase.from("capacity").upsert({ tenant_id: tid, handle: h, day: a.date, minutes, note: "set via Archie" }, { onConflict: "tenant_id,handle,day" });
+    if (error) throw new Error(error.message);
+    return `${h}'s capacity on ${a.date} set to ${minutes} min.`;
+  }
+
+  if (name === "archie_quiet") {
+    const h = resolve(a.handle);
+    const until = String(a.until ?? "").toLowerCase();
+    if (until === "off") { await supabase.from("team_members").update({ quiet_until: null }).eq("tenant_id", tid).eq("handle", h); return "Quiet mode off."; }
+    if (!isDate(until)) throw new Error("until must be YYYY-MM-DD or off");
+    await supabase.from("team_members").update({ quiet_until: until }).eq("tenant_id", tid).eq("handle", h);
+    return `Quiet until the end of ${until} — only urgent messages until then.`;
+  }
+
+  if (name === "archie_calls") {
+    const h = resolve(a.handle);
+    const date = isDate(a.date) ? String(a.date) : today;
+    const calls = await callsOn(tid, ghlToken, cfg, h, date, tz);
+    if (calls.error) return `Couldn't read the calendar: ${calls.error}`;
+    return calls.items.length ? `Calls on ${date}: ${calls.items.map((x) => `${x.time} ${x.title}`).join("; ")}` : `No calls booked on ${date}.`;
+  }
+
+  if (name === "archie_day_off") {
+    const h = resolve(a.handle);
+    if (!isDate(a.date)) throw new Error("date required (YYYY-MM-DD)");
+    const end = isDate(a.end_date) ? String(a.end_date) : String(a.date);
+    const partDay = /^\d{1,2}:\d{2}$/.test(String(a.from ?? "")) && /^\d{1,2}:\d{2}$/.test(String(a.to ?? ""));
+    const days: string[] = [];
+    for (let d = String(a.date); d <= end && days.length < 14; d = addDays(d, 1)) days.push(d);
+    const lines: string[] = [];
+
+    // 1. Block the calendar
+    const userId = await ghlUserId(tid, ghlToken, cfg, h);
+    let blocked = 0; const blockErrors: string[] = [];
+    for (const d of days) {
+      const start = partDay ? String(a.from) : "00:00";
+      const finish = partDay ? String(a.to) : "23:59";
+      if (!userId) { blockErrors.push(`no GHL user set for ${h} — add their ghl_user_id in team_members`); break; }
+      const r = await ghl(ghlToken, "/calendars/events/block-slots", "POST", {
+        locationId: cfg?.ghl_location_id, assignedUserId: userId, title: "Off — set by Archie",
+        startTime: isoAt(d, start, tz), endTime: isoAt(d, finish, tz),
+      });
+      const eventId = r.json?.id ?? r.json?.event?.id ?? r.json?._id ?? null;
+      if (r.ok && eventId) {
+        blocked++;
+        await supabase.from("archie_blocks").insert({ tenant_id: tid, handle: h, day: d, event_id: String(eventId) });
+      } else blockErrors.push(`${d}: ${r.status} ${r.text.slice(0, 120)}`);
+    }
+    lines.push(blocked ? `📅 Calendar blocked (${blocked} day${blocked > 1 ? "s" : ""}) — no new bookings` : `📅 Couldn't block the calendar (${blockErrors[0] ?? "unknown"})`);
+
+    // 2. Capacity and 3. tasks (whole days only)
+    if (!partDay) {
+      for (const d of days) await supabase.from("capacity").upsert({ tenant_id: tid, handle: h, day: d, minutes: 0, note: "Day off (Archie)" }, { onConflict: "tenant_id,handle,day" });
+      let next = addDays(end, 1);
+      for (let i = 0; i < 7 && (weekday(next) === 0 || weekday(next) === 6); i++) next = addDays(next, 1);
+      const { data: moving } = await supabase.from("tasks").select("id").eq("tenant_id", tid).eq("owner", h).in("status", ["open", "doing"]).gte("due_date", String(a.date)).lte("due_date", end);
+      if (moving?.length) await supabase.from("tasks").update({ due_date: next, today: next === today, today_rank: null }).in("id", moving.map((x) => x.id));
+      lines.push(`✅ ${moving?.length ?? 0} task${(moving?.length ?? 0) === 1 ? "" : "s"} moved to ${next}`);
+    } else {
+      lines.push(`⏱ ${a.from}–${a.to} blocked; the rest of the day stays as planned`);
+    }
+
+    // 4. Calls already booked
+    const booked: string[] = [];
+    for (const d of days) {
+      const calls = await callsOn(tid, ghlToken, cfg, h, d, tz);
+      for (const x of calls.items) {
+        if (partDay && (x.time < String(a.from) || x.time >= String(a.to))) continue;
+        booked.push(`${d} ${x.time} ${x.title}`);
+      }
+    }
+    if (booked.length) lines.push(`⚠️ Already booked: ${booked.join("; ")} — ask if they want rebook messages drafted`);
+    return lines.join("\n");
+  }
+
+  if (name === "archie_back_on") {
+    const h = resolve(a.handle);
+    if (!isDate(a.date)) throw new Error("date required (YYYY-MM-DD)");
+    const end = isDate(a.end_date) ? String(a.end_date) : String(a.date);
+    const { data: blocks } = await supabase.from("archie_blocks").select("id, event_id").eq("tenant_id", tid).eq("handle", h).gte("day", String(a.date)).lte("day", end);
+    let removed = 0;
+    for (const b of blocks ?? []) {
+      const r = await ghl(ghlToken, `/calendars/events/${b.event_id}`, "DELETE");
+      if (r.ok || r.status === 404) { removed++; await supabase.from("archie_blocks").delete().eq("id", b.id); }
+    }
+    await supabase.from("capacity").delete().eq("tenant_id", tid).eq("handle", h).gte("day", String(a.date)).lte("day", end).eq("note", "Day off (Archie)");
+    return `Back on: ${removed} calendar block${removed === 1 ? "" : "s"} removed and normal capacity restored for ${a.date}${end !== a.date ? `–${end}` : ""}. Moved tasks stay where they are — move any back if you want.`;
+  }
+
+  if (name === "archie_run_skill") {
+    const skill = String(a.skill ?? "").trim();
+    const input = String(a.input ?? "").trim();
+    if (!skill || !input) throw new Error("skill and input required");
+    const url = `${Deno.env.get("SUPABASE_URL")}/functions/v1/archie-screens/${tenant.token}`;
+    const call = async (body: unknown) => { const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); return r.json().catch(() => null); };
+    const started: any = await call({ action: "run", kind: "skill", skill, input });
+    const runId = started?.run?.id;
+    if (!runId) return `Couldn't start ${skill}: ${started?.error ?? "unknown error"}`;
+    for (let i = 0; i < 18; i++) {
+      await new Promise((ok) => setTimeout(ok, 5000));
+      const r: any = await call({ action: "runs", kind: "skill", limit: 5 });
+      const run = (r?.runs ?? []).find((x: any) => x.id === runId);
+      if (run?.status === "done") return String(run.output ?? "").slice(0, 6000);
+      if (run?.status === "failed") return `The ${skill} run failed: ${run.error ?? "no reason given"}`;
+    }
+    return `Still writing — it'll be on the Skills page under Recent outputs in a minute.`;
+  }
+
+  if (name === "archie_remember") {
+    const fact = String(a.fact ?? "").trim().slice(0, 500);
+    if (!fact) throw new Error("fact required");
+    const { error } = await supabase.from("memories").insert({ tenant_id: tid, fact });
+    if (error) throw new Error(error.message);
+    return `Remembered: ${fact}`;
+  }
+
   throw new Error(`Unknown tool: ${name}`);
+}
+
+// The GHL user to block time for — remembered once found
+async function ghlUserId(tid: string, token: string, cfg: any, handle?: string): Promise<string | null> {
+  // Each person's own GHL user first (team_members.ghl_user_id), then the owner's
+  if (handle) {
+    const { data: tm } = await supabase.from("team_members").select("ghl_user_id, gets_financials").eq("tenant_id", tid).eq("handle", handle).maybeSingle();
+    if (tm?.ghl_user_id) return String(tm.ghl_user_id);
+    if (tm && !tm.gets_financials) return null; // a team member without their own GHL user — never block the owner's calendar by mistake
+  }
+  if (cfg?.ghl_user_id) return String(cfg.ghl_user_id);
+  const r = await ghl(token, `/users/?locationId=${cfg?.ghl_location_id}`, "GET");
+  const users: any[] = r.json?.users ?? [];
+  const pick = users.find((u) => String(u.roles?.role ?? u.role ?? "").toLowerCase() === "admin") ?? users[0];
+  const id = pick?.id ? String(pick.id) : null;
+  if (id) await supabase.from("tenant_config").update({ ghl_user_id: id }).eq("tenant_id", tid);
+  return id;
+}
+
+// Calls booked for a user on one local day
+async function callsOn(tid: string, token: string, cfg: any, h: string, date: string, tz: string) {
+  const userId = await ghlUserId(tid, token, cfg, h);
+  if (!userId) return { items: [] as { time: string; title: string }[], error: "no GHL user found" };
+  const start = Date.parse(isoAt(date, "00:00", tz)), end = Date.parse(isoAt(date, "23:59", tz));
+  const r = await ghl(token, `/calendars/events?locationId=${cfg?.ghl_location_id}&userId=${userId}&startTime=${start}&endTime=${end}`, "GET");
+  if (!r.ok) return { items: [], error: `${r.status}` };
+  const events: any[] = r.json?.events ?? [];
+  const items = events
+    .filter((e) => String(e.appointmentStatus ?? e.status ?? "").toLowerCase() !== "cancelled" && !String(e.title ?? "").startsWith("Off — set by Archie") && !e.isBlockSlot && e.type !== "block")
+    .map((e) => ({ time: new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(e.startTime)), title: String(e.title ?? "Appointment") }))
+    .sort((x, y) => x.time.localeCompare(y.time));
+  return { items, error: null };
+}
+
+// "2026-10-02" + "14:00" in Europe/London → ISO with the right offset for that date
+function isoAt(date: string, hhmm: string, tz: string) {
+  const [h, m] = hhmm.split(":").map(Number);
+  const guess = new Date(`${date}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00Z`);
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(guess);
+  const g = (k: string) => Number(parts.find((p) => p.type === k)?.value);
+  const shown = Date.UTC(g("year"), g("month") - 1, g("day"), g("hour") % 24, g("minute"));
+  const offsetMin = Math.round((shown - guess.getTime()) / 60000);
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const oh = String(Math.floor(Math.abs(offsetMin) / 60)).padStart(2, "0"), om = String(Math.abs(offsetMin) % 60).padStart(2, "0");
+  return `${date}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00${sign}${oh}:${om}`;
 }
 
 async function ghl(token: string, path: string, method = "GET", body?: unknown) {

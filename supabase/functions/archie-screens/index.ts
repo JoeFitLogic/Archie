@@ -1,4 +1,4 @@
-// archie-screens v2.7 — data and actions for the Archie AI Studio pages.
+// archie-screens v3.1 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -20,6 +20,10 @@
 // v2.5: 7D — Pipeline and Scraper via the API (buttons and mornings), and morning_run: sync → Stripe → context → Pipeline → Scraper → brief, all in the backend.
 // v2.6: 7D part 2 — dispatch: one Supabase schedule runs every client's morning, evening, Saturday plan, renewals and monthly receipt at their own local times. evening_run, monthly_run, renewals_run.
 // v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
+// v2.8: media_videos looks through the whole library (all pages and folders), newest first, grouped by month.
+// v2.9: brain dump splits one line into several tasks at commas/semicolons when it's clearly a list ("A must 45m, B 15m, C").
+// v3.1: Fathom calls — fathom_calls lists recent recorded calls; a skill run can carry a call (its summary and transcript go to the agent).
+// v3.0: talk — Talk to Archie. A WhatsApp message goes to the Archie Assistant agent with today's context and a session per person per day; the reply goes back on WhatsApp.
 // The token picks the tenant. Nothing from any other tenant is ever returned or changed.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -38,6 +42,7 @@ const AGENT_NAMES: Record<string, string[]> = {
   brief: ["Archie Brief", "Brief"],
   pipeline: ["Archie Pipeline", "Pipeline"],
   scraper: ["Archie Scraper", "Scraper"],
+  assistant: ["Archie Assistant", "Archie"],
 };
 const SUPA_URL = Deno.env.get("SUPABASE_URL")!;
 const ZAPCAP_KEY = Deno.env.get("ZAPCAP_API_KEY") ?? "";
@@ -63,6 +68,7 @@ Deno.serve(async (req) => {
       if (action === "run_finish") return j(await runFinish(tenant_id, p));
       if (action === "plan_context") return j(await planContext(tenant_id));
       if (action === "plan_save") return j(await planSave(tenant_id, p));
+      if (action === "talk") { startInBackground(talk(tenant_id, p)); return j({ ok: true, started: true }); }
       if (action === "evening_run") { startInBackground(eveningRun(tenant_id)); return j({ ok: true, started: true }); }
       if (action === "monthly_run") { startInBackground(monthlyRun(tenant_id, p)); return j({ ok: true, started: true }); }
       if (action === "renewals_run") { startInBackground(renewalsRun(tenant_id)); return j({ ok: true, started: true }); }
@@ -110,6 +116,7 @@ Deno.serve(async (req) => {
       case "plan": return j(await latestPlan(c));
       case "to_planner": return j(await toPlanner(c, p));
       case "planner_accounts": return j(await plannerAccounts(c));
+      case "fathom_calls": return j(await fathomCalls(c));
       case "media_videos": return j(await mediaVideos(c));
       case "polish": return j(await polish(c, p));
       case "polish_status": return j(await polishStatus(c, p));
@@ -394,7 +401,23 @@ async function move(c: any, p: any) {
 
 async function dump(c: any, p: any) {
   const h = c.resolve(p.handle);
-  const lines = String(p.text ?? "").split(/\n+/).map((s) => s.trim().replace(/^[-*•]\s*/, "")).filter(Boolean).slice(0, 30);
+  // One task per line — and a line typed as a list ("A must 45m, B 15m; C") becomes several tasks.
+  // Only split at a comma/semicolon when the part before it ends like a task (a tier, a time or a day),
+  // so a single task with a comma in its title ("Call Jase, ask about dates") stays whole.
+  const ENDS_LIKE_TASK = /(\b(must|high|bonus)|\d+(?:\.\d+)?\s*(m|min|mins|minutes|h|hr|hrs|hours?)|\b(today|tomorrow|mon(day)?|tue(s|sday)?|wed(nesday)?|thu(r|rs|rsday)?|fri(day)?|sat(urday)?|sun(day)?))\s*$/i;
+  const splitList = (line: string): string[] => {
+    const parts = line.split(/\s*[;,]\s*/).map((x) => x.trim()).filter(Boolean);
+    if (parts.length < 2) return [line];
+    const out: string[] = [];
+    let buf = "";
+    for (let i = 0; i < parts.length; i++) {
+      buf = buf ? `${buf}, ${parts[i]}` : parts[i];
+      if (ENDS_LIKE_TASK.test(buf) || i === parts.length - 1) { out.push(buf); buf = ""; }
+    }
+    return out.length >= 2 ? out : [line];
+  };
+  const lines = String(p.text ?? "").split(/\n+/).map((s) => s.trim().replace(/^[-*•]\s*/, "")).filter(Boolean)
+    .flatMap(splitList).map((s) => s.replace(/^(and|&)\s+/i, "").trim()).filter(Boolean).slice(0, 30);
   if (!lines.length) return { ok: false, error: "nothing to add" };
   const DAY = "(today|tomorrow|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)";
   const rows: any[] = [];
@@ -439,7 +462,7 @@ async function capacity(c: any, p: any) {
 // ===================== skills and runs =====================
 async function skills(c: any) {
   const [{ data }, { data: cfg }] = await Promise.all([
-    supabase.from("skills_catalog").select("key, name, category, description, input_label, enabled, options, needs_contact, module").order("sort"),
+    supabase.from("skills_catalog").select("key, name, category, description, input_label, enabled, options, needs_contact, uses_call, module").order("sort"),
     supabase.from("tenant_config").select("modules").eq("tenant_id", c.tid).maybeSingle(),
   ]);
   const mods = new Set(String(cfg?.modules ?? "").split(",").map((x) => x.trim()).filter(Boolean));
@@ -465,7 +488,7 @@ async function run(c: any, p: any) {
     if (s2?.needs_contact && !contactId) return { ok: false, error: "pick a contact first" };
   }
   const { data: row, error } = await supabase.from("screen_runs")
-    .insert({ tenant_id: c.tid, kind, skill, input, status: "queued", requested_by: c.resolve(p.handle), contact_id: contactId, contact_name: String(p.contact_name ?? "").slice(0, 120) || null })
+    .insert({ tenant_id: c.tid, kind, skill, input, status: "queued", requested_by: c.resolve(p.handle), contact_id: contactId, contact_name: String(p.contact_name ?? "").slice(0, 120) || null, call_id: String(p.call_id ?? "").trim() || null, call_title: String(p.call_title ?? "").slice(0, 200) || null })
     .select("id, kind, skill, status, created_at").single();
   if (error) throw new Error(error.message);
   if ((await runMode(c.tid)) === "api") {
@@ -504,7 +527,7 @@ async function runGet(c: any, p: any) {
 
 async function runs(c: any, p: any) {
   const limit = Math.max(1, Math.min(50, Number(p.limit) || 20));
-  let q = supabase.from("screen_runs").select("id, kind, skill, input, status, output, error, saved, created_at, finished_at, contact_name").eq("tenant_id", c.tid);
+  let q = supabase.from("screen_runs").select("id, kind, skill, input, status, output, error, saved, created_at, finished_at, contact_name, call_title").eq("tenant_id", c.tid);
   if (RUN_KINDS.includes(String(p.kind ?? ""))) q = q.eq("kind", p.kind);
   if (p.kinds && Array.isArray(p.kinds)) q = q.in("kind", p.kinds.filter((k: string) => RUN_KINDS.includes(k)));
   const { data } = await q.order("created_at", { ascending: false }).limit(limit);
@@ -623,16 +646,54 @@ async function mediaVideos(c: any) {
   const { data: cfg } = await supabase.from("tenant_config").select("ghl_location_id").eq("tenant_id", c.tid).single();
   const { data: t } = await supabase.from("tenants").select("location_id").eq("id", c.tid).single();
   const loc = cfg?.ghl_location_id || t?.location_id;
-  if (!loc || !c.ghlToken) return { ok: false, error: "no GHL location or token", videos: [] };
-  const r = await ghl(c.ghlToken, `/medias/files?altId=${loc}&altType=location&type=file&sortBy=createdAt&sortOrder=desc&limit=40`, "GET", undefined, "2021-07-28");
-  if (!r.ok) return { ok: false, error: `media library ${r.status} — paste a video link instead`, videos: [] };
-  const files: any[] = r.json?.files ?? r.json?.data ?? [];
-  const videos = files
-    .filter((f) => /video|\.mp4|\.mov|\.webm/i.test(String(f.contentType ?? f.type ?? f.url ?? f.name ?? "")))
-    .slice(0, 20)
-    .map((f) => ({ name: String(f.name ?? "video"), url: String(f.url ?? f.fileUrl ?? ""), at: f.createdAt ?? null }))
-    .filter((f) => f.url);
-  return { ok: true, videos };
+  if (!loc || !c.ghlToken) return { ok: false, error: "no GHL location or token", videos: [], months: [] };
+
+  const isVideo = (f: any) => /video|\.mp4|\.mov|\.webm|\.m4v/i.test(String(f.contentType ?? f.type ?? "") + " " + String(f.name ?? "") + " " + String(f.url ?? ""));
+  const all: any[] = [];
+  let firstError = "";
+
+  // Files in one place (the top level, or one folder), several pages deep
+  const pull = async (parentId: string | null) => {
+    for (let page = 0; page < 5; page++) {
+      const qs = `altId=${loc}&altType=location&type=file&sortBy=createdAt&sortOrder=desc&limit=100&offset=${page * 100}${parentId ? `&parentId=${parentId}` : ""}`;
+      const r = await ghl(c.ghlToken, `/medias/files?${qs}`, "GET", undefined, "2021-07-28");
+      if (!r.ok) { if (!firstError) firstError = `media library ${r.status}`; return; }
+      const files: any[] = r.json?.files ?? r.json?.data ?? [];
+      all.push(...files);
+      if (files.length < 100) return;
+    }
+  };
+
+  await pull(null);
+  // Folders too — people often keep videos in them
+  const fr = await ghl(c.ghlToken, `/medias/files?altId=${loc}&altType=location&type=folder&limit=100`, "GET", undefined, "2021-07-28");
+  const folders: any[] = fr.ok ? (fr.json?.files ?? fr.json?.data ?? []) : [];
+  for (const f of folders.slice(0, 15)) {
+    const id = String(f._id ?? f.id ?? "");
+    if (id) await pull(id);
+  }
+  if (!all.length && firstError) return { ok: false, error: `${firstError} — paste a video link instead`, videos: [], months: [] };
+
+  const seen = new Set<string>();
+  const videos = all
+    .filter(isVideo)
+    .map((f) => ({ name: String(f.name ?? "video"), url: String(f.url ?? f.fileUrl ?? ""), at: f.createdAt ?? f.updatedAt ?? null }))
+    .filter((v) => v.url && !seen.has(v.url) && (seen.add(v.url), true))
+    .sort((x, y) => String(y.at ?? "").localeCompare(String(x.at ?? "")))
+    .slice(0, 150)
+    .map((v) => {
+      const d = v.at ? new Date(String(v.at)) : null;
+      const month = d && !isNaN(d.getTime()) ? `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}` : "unknown";
+      const month_label = d && !isNaN(d.getTime()) ? d.toLocaleDateString("en-GB", { month: "long", year: "numeric", timeZone: "UTC" }) : "Undated";
+      return { ...v, month, month_label };
+    });
+
+  const months: { month: string; label: string; count: number }[] = [];
+  for (const v of videos) {
+    const m = months.find((x) => x.month === v.month);
+    if (m) m.count++; else months.push({ month: v.month, label: v.month_label, count: 1 });
+  }
+  return { ok: true, videos, months };
 }
 
 async function polish(c: any, p: any) {
@@ -942,7 +1003,7 @@ async function executeRun(tid: string, runId: string) {
   try {
     // Claim it (only if still queued), so a double nudge can't run it twice
     const { data: r } = await supabase.from("screen_runs").update({ status: "running", started_at: new Date().toISOString() })
-      .eq("id", runId).eq("status", "queued").select("id, skill, input, contact_id").maybeSingle();
+      .eq("id", runId).eq("status", "queued").select("id, skill, input, contact_id, call_id, call_title").maybeSingle();
     if (!r) return;
 
     const [{ data: cfg }, { data: t }, { data: s }] = await Promise.all([
@@ -963,8 +1024,12 @@ async function executeRun(tid: string, runId: string) {
     const head = `Use the ${r.skill} skill.\n\nInput:\n${String(r.input || "(no input given — make sensible assumptions from the business context)").slice(0, 3000)}\n\nBusiness context:\n${biz}`;
     const tail = "\n\nReturn only the finished output, ready to copy. No preamble, no questions, no notes about what you did.";
     const room = 9800 - head.length - tail.length;
-    const whoBlock = who && room > 300 ? `\n\nContact context (everything Archie can see about them):\n${who.slice(0, room - 80)}` : "";
-    const message = (head + whoBlock + tail).slice(0, 9900);
+    // The picked Fathom call goes in first — it's what the skill is about
+    const call = r.call_id ? await fathomCallText(tid, String(r.call_id)) : "";
+    const callBlock = call ? `\n\nThe call (${r.call_title ?? "Fathom"}):\n${call.slice(0, Math.max(0, room - 400))}` : "";
+    const room2 = room - callBlock.length;
+    const whoBlock = who && room2 > 300 ? `\n\nContact context (everything Archie can see about them):\n${who.slice(0, room2 - 80)}` : "";
+    const message = (head + callBlock + whoBlock + tail).slice(0, 9900);
 
     const body: Record<string, unknown> = { locationId: loc, message };
     if (r.contact_id) body.contactId = String(r.contact_id);
@@ -1504,6 +1569,149 @@ async function agentsHealth(c: any) {
     .filter(([, options]) => !options.some((n) => names.has(n.toLowerCase())))
     .map(([key, options]) => `${key} (${options[0]})`);
   return { ok: missing.length === 0, missing };
+}
+
+// ===================== v3.0: Talk to Archie =====================
+const TALK_RULES = [
+  "You are Archie, talking to a member of this business on WhatsApp. Reply like a sharp, friendly colleague: short, plain, UK English, no markdown headings, no bullet walls.",
+  "Use the Archie tools to actually do things. Always pass handle for the person you're talking to when a tool takes one.",
+  "Internal actions — ticking tasks off, moving tasks, adding tasks, capacity, quiet mode, days off — just do them, then say in one line what you did. Don't ask 'are you sure?' for these.",
+  "Anything that goes to a customer or involves money (sending a message to a client, a quote, an invoice) — draft it and ask 'Send it?' before anything is sent. You cannot send client messages yourself.",
+  "'I'm off Friday' / 'block Thursday 2 till 4' / 'I'm away Mon–Wed' → use archie_day_off with real dates worked out from today's date. If calls are already booked, list them and offer to draft rebook messages.",
+  "For numbers use archie_numbers — never guess a figure.",
+  "For content or sales writing use archie_run_skill with the right skill and a clear input, then give the result.",
+  "'Remember that…' → archie_remember.",
+  "Numbers on today's list and P numbers refer to the lists in the context below.",
+  "If something is unclear, ask one short question. Never invent tasks, names, numbers or results.",
+  "Keep replies under about 8 lines unless you're returning written content.",
+].join("\n");
+
+async function talk(tid: string, p: any) {
+  const contactId = String(p.contact_id ?? "").trim();
+  const text = String(p.text ?? p.message ?? "").trim().slice(0, 4000);
+  const log = async (status: string, summary: string, error: string | null = null) => {
+    const now = new Date().toISOString();
+    await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "talk", trigger: "api", status, started_at: now, finished_at: now, summary, error });
+  };
+  try {
+    if (!contactId || !text) return log("failed", "", "contact_id and text required");
+    const [{ data: cfg }, { data: t }, { data: team }] = await Promise.all([
+      supabase.from("tenant_config").select("ghl_location_id, ghl_token, timezone, brief_channel").eq("tenant_id", tid).single(),
+      supabase.from("tenants").select("location_id, status, business_name").eq("id", tid).single(),
+      supabase.from("team_members").select("handle, name, gets_financials, ghl_contact_id").eq("tenant_id", tid),
+    ]);
+    if (t?.status !== "active") return;
+    const member = (team ?? []).find((m: any) => m.ghl_contact_id === contactId);
+    if (!member) return log("failed", "", `message from a contact who isn't on the team (${contactId})`);
+    const loc = cfg?.ghl_location_id || t?.location_id;
+    const token = cfg?.ghl_token || FALLBACK_TOKEN;
+    const tz = cfg?.timezone || "Europe/London";
+    const today = localDate(Date.now(), tz);
+    const dayName = new Intl.DateTimeFormat("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: tz }).format(new Date());
+    const timeNow = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: tz }).format(new Date());
+
+    const agentId = await agentIdFor(tid, "assistant", token, loc);
+    if (!agentId) return log("failed", "", "couldn't find the Archie Assistant agent — check it's published");
+
+    // What's in front of them
+    const [{ data: list }, { data: proposals }, { data: memories }] = await Promise.all([
+      supabase.from("tasks").select("title, tier, effort_minutes, today_rank").eq("tenant_id", tid).eq("owner", member.handle).eq("today", true).in("status", ["open", "doing"]).order("today_rank", { ascending: true }),
+      member.gets_financials
+        ? supabase.from("tasks").select("title, owner, proposal_rank").eq("tenant_id", tid).eq("status", "proposed").not("proposal_rank", "is", null).order("proposal_rank", { ascending: true }).limit(10)
+        : Promise.resolve({ data: [] as any[] }),
+      supabase.from("memories").select("fact").eq("tenant_id", tid).order("created_at", { ascending: false }).limit(20),
+    ]);
+    const ctx = [
+      `Today: ${dayName}, ${timeNow} (${today}). Business: ${t?.business_name ?? ""}.`,
+      `You're talking to ${member.name ?? member.handle} (handle: ${member.handle}${member.gets_financials ? ", the owner" : ", a team member — no money figures"}).`,
+      `Their list today: ${(list ?? []).length ? (list ?? []).map((x: any) => `#${x.today_rank ?? "-"} ${x.title} [${x.tier}, ${x.effort_minutes ?? 30}m]`).join("; ") : "empty"}.`,
+      (proposals ?? []).length ? `Proposals waiting (as numbered in the brief/inbox): ${(proposals ?? []).map((x: any) => `P${x.proposal_rank} ${x.title}`).join("; ")}. To add/wait/drop one, tell them to text e.g. "add P1" — or do it for them by adding the task with archie_add_task.` : "",
+      (memories ?? []).length ? `Things to remember: ${(memories ?? []).map((m: any) => m.fact).join(" | ")}` : "",
+    ].filter(Boolean).join("\n");
+
+    // One conversation per person per day
+    const { data: sess } = await supabase.from("talk_sessions").select("session_id").eq("tenant_id", tid).eq("handle", member.handle).eq("day", today).maybeSingle();
+    const message = `${TALK_RULES}\n\nCONTEXT\n${ctx}\n\nTHEIR MESSAGE\n${text}`.slice(0, 9900);
+    const body: Record<string, unknown> = { locationId: loc, message, contactId };
+    if (sess?.session_id) body.sessionId = sess.session_id;
+
+    let res = await agentExecute(token, agentId, body, `talk-${tid}-${Date.now()}`);
+    if (res.status === 429 || res.status >= 500) {
+      await new Promise((ok) => setTimeout(ok, Math.min(20, Number(res.retryAfter) || 8) * 1000));
+      res = await agentExecute(token, agentId, body, `talk-${tid}-${Date.now()}`);
+    }
+    const channel = String(cfg?.brief_channel ?? "sms").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS";
+    const reply = async (msg: string) => ghl(token, "/conversations/messages", "POST", { type: channel, contactId, message: msg.slice(0, 3500) }, "2021-04-15");
+    if (!res.ok || res.json?.success === false) {
+      await reply("Sorry — I couldn't process that just now. Try again in a minute, or use a quick command like done 1.");
+      return log("failed", "", `Archie Assistant error ${res.status}: ${String(res.text).slice(0, 200)}`);
+    }
+    const newSession = String(res.json?.sessionId ?? "");
+    if (newSession && newSession !== sess?.session_id) {
+      await supabase.from("talk_sessions").upsert({ tenant_id: tid, handle: member.handle, day: today, session_id: newSession }, { onConflict: "tenant_id,handle,day" });
+    }
+    const answer = tidy(clean(String(res.json?.finalText ?? ""))).replace(/^#+\s*/gm, "").trim() || "Done.";
+    const sent = await reply(answer);
+    await log(sent.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${answer.slice(0, 80)}`, sent.ok ? null : `reply not sent (${sent.status})`);
+  } catch (e) {
+    await log("failed", "", `talk crashed: ${String(e).slice(0, 200)}`);
+  }
+}
+
+// ===================== v3.1: Fathom calls =====================
+const FATHOM = "https://api.fathom.ai/external/v1";
+async function fathomKey(tid: string): Promise<string | null> {
+  const { data } = await supabase.from("tenant_config").select("fathom_api_key").eq("tenant_id", tid).maybeSingle();
+  return data?.fathom_api_key ? String(data.fathom_api_key) : null;
+}
+async function fathomGet(key: string, path: string) {
+  try {
+    const r = await fetch(`${FATHOM}${path}`, { headers: { "X-Api-Key": key, "Accept": "application/json" } });
+    const text = await r.text(); let json: any = null; try { json = JSON.parse(text); } catch { json = null; }
+    return { ok: r.ok, status: r.status, json, text };
+  } catch (e) { return { ok: false, status: 0, json: null, text: String(e) }; }
+}
+
+// Recent recorded calls for the picker
+async function fathomCalls(c: any) {
+  const key = await fathomKey(c.tid);
+  if (!key) return { ok: false, error: "Fathom isn't connected — add your Fathom API key", calls: [] };
+  const calls: any[] = [];
+  let cursor = "";
+  for (let page = 0; page < 3 && calls.length < 30; page++) {
+    const r = await fathomGet(key, `/meetings${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`);
+    if (!r.ok) return { ok: false, error: `Fathom ${r.status}`, calls };
+    for (const m of r.json?.items ?? []) {
+      const invitees: any[] = m.calendar_invitees ?? m.invitees ?? [];
+      const others = invitees.filter((x) => x.is_external !== false).map((x) => x.name || x.email).filter(Boolean);
+      calls.push({
+        id: String(m.recording_id ?? m.id ?? ""),
+        title: String(m.title ?? m.meeting_title ?? "Call"),
+        at: m.recording_start_time ?? m.scheduled_start_time ?? m.created_at ?? null,
+        with: others.slice(0, 4).join(", "),
+        url: m.share_url ?? m.url ?? null,
+      });
+    }
+    cursor = String(r.json?.next_cursor ?? "");
+    if (!cursor) break;
+  }
+  return { ok: true, calls: calls.filter((x) => x.id).slice(0, 30) };
+}
+
+// A call's summary (and as much transcript as fits) as plain text for a skill run
+async function fathomCallText(tid: string, recordingId: string): Promise<string> {
+  const key = await fathomKey(tid);
+  if (!key) return "";
+  const [sum, tr] = await Promise.all([
+    fathomGet(key, `/recordings/${encodeURIComponent(recordingId)}/summary`),
+    fathomGet(key, `/recordings/${encodeURIComponent(recordingId)}/transcript`),
+  ]);
+  const summary = String(sum.json?.summary?.markdown_formatted ?? sum.json?.summary?.markdown ?? sum.json?.summary ?? sum.json?.markdown_formatted ?? "").trim();
+  const lines: any[] = tr.json?.transcript ?? tr.json?.items ?? [];
+  const transcript = (Array.isArray(lines) ? lines : [])
+    .map((l) => `${l.speaker?.display_name ?? l.speaker_name ?? l.speaker ?? "?"}: ${l.text ?? ""}`)
+    .join("\n");
+  return [summary ? `SUMMARY\n${summary}` : "", transcript ? `TRANSCRIPT\n${transcript}` : ""].filter(Boolean).join("\n\n");
 }
 
 // ===================== workflow side =====================

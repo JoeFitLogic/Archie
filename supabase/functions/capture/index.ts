@@ -1,5 +1,6 @@
-// capture v5 — everything the owner or team texts to Archie.
-// task: / <handle>: / capacity: / done: <text>   — as before
+// capture v6.1 — everything the owner or team texts to Archie.
+// Quick commands (instant, free) — as v5:
+// task: / <handle>: / capacity: / done: <text>
 // done 2  ·  done 1 3            — tick off today's numbered tasks
 // move 3 friday  ·  snooze 2     — push a task to another day (snooze = tomorrow)
 // send 1  ·  skip 1              — send or bin one of today's message drafts
@@ -7,13 +8,20 @@
 // 👍 / good [note]  ·  👎 / bad [note] — rate this morning's brief
 // quiet today · quiet till fri · quiet off
 // help
+// v6: anything that isn't a quick command goes to Talk to Archie (archie-screens "talk"), which replies itself.
+// v6.1: talk_mode per person — 'all' (every non-command goes to Archie), 'wake' (only messages starting "Archie…"), 'off'.
+//       Default: owner 'all', team 'wake' — so normal chat between the owner and the team is left alone.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 const SECRET = Deno.env.get("ARCHIE_SECRET")!;
 const FALLBACK_TOKEN = Deno.env.get("GHL_AGENCY_API_KEY") ?? "";
 const BASE = "https://services.leadconnectorhq.com";
+const SUPA_URL = Deno.env.get("SUPABASE_URL")!;
 
 const HELP = [
+  "Just talk to me — e.g. \"done the Lhea one\", \"I'm off Friday\", \"write a post about systems\".",
+  "",
+  "Quick commands:",
   "task: [thing] [must/high/bonus]",
   "done 2 · move 3 fri · snooze 2",
   "send 1 · skip 1",
@@ -24,7 +32,7 @@ const HELP = [
 ].join("\n");
 
 Deno.serve(async (req) => {
-  console.log("capture v5 start");
+  console.log("capture v6.1 start");
   try {
     if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     const raw = await req.json();
@@ -39,7 +47,7 @@ Deno.serve(async (req) => {
     const tz = cfg?.timezone || "Europe/London";
     const today = localDate(Date.now(), tz);
 
-    const { data: members } = await supabase.from("team_members").select("handle, name, phone, ghl_contact_id").eq("tenant_id", tenant_id);
+    const { data: members } = await supabase.from("team_members").select("handle, name, phone, ghl_contact_id, gets_financials, talk_mode").eq("tenant_id", tenant_id);
     const me = (members ?? []).find((m) => (senderContact && m.ghl_contact_id === senderContact) || (m.phone && m.phone.replace(/\s+/g, "") === senderPhone));
     if (!me) return j({ ok: true, reply: "", skipped: "sender not on team" });
 
@@ -47,12 +55,40 @@ Deno.serve(async (req) => {
     const lower = text.toLowerCase();
     await bump("commands");
 
+    // Anything that isn't a quick command → Talk to Archie (it replies on WhatsApp itself).
+    // Team members must start with "Archie" so their normal chat with the owner is left alone.
+    const mode = String(me.talk_mode ?? (me.gets_financials ? "all" : "wake")).toLowerCase();
+    const WAKE = /^(?:hey\s+|hi\s+|ok\s+)?@?archie\b[\s,:!.-]*/i;
+    const toTalk = async () => {
+      if (mode === "off") return j({ ok: true, reply: "", skipped: "talk off for this person" });
+      let said = text;
+      if (mode === "wake") {
+        if (!WAKE.test(text)) return j({ ok: true, reply: "", skipped: "no wake word" });
+        said = text.replace(WAKE, "").trim();
+        if (!said) return reply("Yes? Ask me anything — e.g. \"Archie, what's on my list?\"");
+      }
+      const contactId = me.ghl_contact_id || senderContact;
+      if (!contactId) return j({ ok: true, reply: "", skipped: "no contact id for talk" });
+      try {
+        await fetch(`${SUPA_URL}/functions/v1/archie-screens`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-archie-secret": SECRET },
+          body: JSON.stringify({ action: "talk", tenant_id, contact_id: contactId, text: said }),
+        });
+      } catch (e) { console.log("talk hand-off failed", String(e)); }
+      await bump("talk");
+      return j({ ok: true, reply: "", has_reply: "no", handed_to: "talk" });
+    };
+
     // ---------- help ----------
     if (lower === "help" || lower === "?") return reply(HELP);
 
     // ---------- feedback ----------
     const fb = text.match(/^(👍[\u{1F3FB}-\u{1F3FF}]?|👎[\u{1F3FB}-\u{1F3FF}]?|good|bad|great|useful|not useful|meh)(?=$|[\s:,.!-])[\s:,.!-]*([\s\S]*)$/iu);
-    if (fb) {
+    // Emoji feedback always counts; word feedback only when it's clearly feedback ("good", "bad: too long")
+    // so "good morning, what's on today?" goes to Talk to Archie instead.
+    const wordFeedback = /^(good|bad|great|useful|not useful|meh)\s*(?:$|[:\-–—])/i.test(text);
+    if (fb && (fb[1].startsWith("👍") || fb[1].startsWith("👎") || wordFeedback)) {
       const positive = /^(👍|good|great|useful)/iu.test(fb[1]);
       const note = str(fb[2]) || null;
       await supabase.from("brief_feedback").insert({ tenant_id, handle: me.handle, created_on: today, rating: positive ? 1 : -1, note });
@@ -154,7 +190,7 @@ Deno.serve(async (req) => {
     // ---------- prefixed commands ----------
     const handles = (members ?? []).map((m) => m.handle.toLowerCase());
     const cmd = text.match(/^([a-z]+)\s*:\s*([\s\S]+)$/i);
-    if (!cmd) return j({ ok: true, reply: "", skipped: "no command" });
+    if (!cmd) return await toTalk();
     const kind = cmd[1].toLowerCase(); let rest = cmd[2].trim();
 
     if (kind === "capacity") {
@@ -175,7 +211,7 @@ Deno.serve(async (req) => {
       return reply(`Done: ${hits[0].title}`);
     }
 
-    if (kind !== "task" && !handles.includes(kind)) return j({ ok: true, reply: "", skipped: "unknown prefix" });
+    if (kind !== "task" && !handles.includes(kind)) return await toTalk();
 
     let owner = kind === "task" ? me.handle : kind;
     const forM = rest.match(/\s+for\s+([a-z]+)\s*$/i);
