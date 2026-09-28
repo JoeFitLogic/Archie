@@ -1,4 +1,4 @@
-// capture v6.1 — everything the owner or team texts to Archie.
+// capture v6.2 — everything the owner or team texts (or voice-notes) to Archie.
 // Quick commands (instant, free) — as v5:
 // task: / <handle>: / capacity: / done: <text>
 // done 2  ·  done 1 3            — tick off today's numbered tasks
@@ -11,12 +11,16 @@
 // v6: anything that isn't a quick command goes to Talk to Archie (archie-screens "talk"), which replies itself.
 // v6.1: talk_mode per person — 'all' (every non-command goes to Archie), 'wake' (only messages starting "Archie…"), 'off'.
 //       Default: owner 'all', team 'wake' — so normal chat between the owner and the team is left alone.
+// v6.2: voice notes — if the message has no text, Archie finds the latest voice note from that person in GHL,
+//       transcribes it (OpenAI), and handles the words exactly like a typed message.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 const SECRET = Deno.env.get("ARCHIE_SECRET")!;
 const FALLBACK_TOKEN = Deno.env.get("GHL_AGENCY_API_KEY") ?? "";
 const BASE = "https://services.leadconnectorhq.com";
 const SUPA_URL = Deno.env.get("SUPABASE_URL")!;
+const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
+const TRANSCRIBE_MODEL = Deno.env.get("TRANSCRIBE_MODEL") ?? "gpt-4o-mini-transcribe";
 
 const HELP = [
   "Just talk to me — e.g. \"done the Lhea one\", \"I'm off Friday\", \"write a post about systems\".",
@@ -32,18 +36,29 @@ const HELP = [
 ].join("\n");
 
 Deno.serve(async (req) => {
-  console.log("capture v6.1 start");
+  console.log("capture v6.2 start");
   try {
     if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     const raw = await req.json();
     const p = { ...raw, ...(raw.customData ?? {}) };
     const tenant_id = str(p.tenant_id);
-    const text = str(p.text ?? p.message ?? p.body ?? raw.message?.body ?? "").trim();
+    let text = str(p.text ?? p.message ?? p.body ?? raw.message?.body ?? "").trim();
     const senderPhone = str(p.sender ?? p.phone ?? raw.phone ?? "").replace(/\s+/g, "");
     const senderContact = str(p.contact_id ?? raw.contact_id ?? "") || null;
-    if (!tenant_id || !text) return j({ ok: true, reply: "" });
+    if (!tenant_id) return j({ ok: true, reply: "" });
 
-    const { data: cfg } = await supabase.from("tenant_config").select("timezone, ghl_token").eq("tenant_id", tenant_id).single();
+    const { data: cfg } = await supabase.from("tenant_config").select("timezone, ghl_token, ghl_location_id").eq("tenant_id", tenant_id).single();
+
+    // Voice note: no text (or a placeholder) → find the audio in GHL and transcribe it
+    let heard = "";
+    if ((!text || /^\[?(audio|voice|attachment|media)\]?$/i.test(text)) && senderContact) {
+      const audioUrl = await latestAudio(cfg?.ghl_token || FALLBACK_TOKEN, cfg?.ghl_location_id, senderContact, str(p.message_id));
+      if (audioUrl) {
+        heard = await transcribe(audioUrl);
+        if (heard) text = heard;
+      }
+    }
+    if (!text) return j({ ok: true, reply: "" });
     const tz = cfg?.timezone || "Europe/London";
     const today = localDate(Date.now(), tz);
 
@@ -73,7 +88,7 @@ Deno.serve(async (req) => {
         await fetch(`${SUPA_URL}/functions/v1/archie-screens`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "x-archie-secret": SECRET },
-          body: JSON.stringify({ action: "talk", tenant_id, contact_id: contactId, text: said }),
+          body: JSON.stringify({ action: "talk", tenant_id, contact_id: contactId, text: heard ? `(voice note) ${said}` : said }),
         });
       } catch (e) { console.log("talk hand-off failed", String(e)); }
       await bump("talk");
@@ -244,7 +259,54 @@ Deno.serve(async (req) => {
   } catch (e) { return j({ error: String(e) }, 500); }
 });
 
-function reply(text: string) { console.log("reply:", text); return j({ ok: true, reply: text, has_reply: text ? "yes" : "no" }); }
+let HEARD_PREFIX = "";
+function reply(text: string) { const out = text ? HEARD_PREFIX + text : text; console.log("reply:", out); return j({ ok: true, reply: out, has_reply: out ? "yes" : "no" }); }
+// The newest voice note/audio this contact sent (optionally the exact message), from GHL
+async function latestAudio(token: string, loc: string | undefined, contactId: string, messageId: string): Promise<string | null> {
+  const isAudio = (u: string) => /\.(ogg|oga|opus|mp3|m4a|aac|wav|webm|amr)(\?|$)/i.test(u) || /audio/i.test(u);
+  if (messageId) {
+    const m = await ghl(token, `/conversations/messages/${messageId}`, "GET");
+    const atts: any[] = m.json?.message?.attachments ?? m.json?.attachments ?? [];
+    const hit = atts.map((a) => (typeof a === "string" ? a : a?.url ?? "")).find((u) => u && isAudio(u));
+    if (hit) return hit;
+  }
+  if (!loc) return null;
+  const cs = await ghl(token, `/conversations/search?locationId=${loc}&contactId=${contactId}&limit=1`, "GET");
+  const conv = (cs.json?.conversations ?? [])[0];
+  if (!conv?.id) return null;
+  const ms = await ghl(token, `/conversations/${conv.id}/messages?limit=5`, "GET");
+  const list: any[] = ms.json?.messages?.messages ?? ms.json?.messages ?? [];
+  const since = Date.now() - 10 * 60 * 1000;
+  for (const m of Array.isArray(list) ? list : []) {
+    if (String(m.direction ?? "").toLowerCase() !== "inbound") continue;
+    if (m.dateAdded && Date.parse(m.dateAdded) < since) continue;
+    const atts: any[] = m.attachments ?? [];
+    const hit = atts.map((a) => (typeof a === "string" ? a : a?.url ?? "")).find((u) => u && isAudio(u));
+    if (hit) return hit;
+    if (atts.length && /audio|voice/i.test(String(m.contentType ?? m.messageType ?? ""))) return typeof atts[0] === "string" ? atts[0] : atts[0]?.url ?? null;
+  }
+  return null;
+}
+
+// Speech to text (OpenAI). Returns "" if it can't.
+async function transcribe(url: string): Promise<string> {
+  if (!OPENAI_KEY) { console.log("no OPENAI_API_KEY — can't transcribe"); return ""; }
+  try {
+    const a = await fetch(url);
+    if (!a.ok) return "";
+    const blob = await a.blob();
+    if (blob.size > 24 * 1024 * 1024) return "";
+    const ext = (url.match(/\.(ogg|oga|opus|mp3|m4a|aac|wav|webm)(\?|$)/i)?.[1] ?? "ogg").toLowerCase().replace("opus", "ogg").replace("oga", "ogg");
+    const form = new FormData();
+    form.append("file", new File([blob], `voice.${ext}`, { type: blob.type || `audio/${ext}` }));
+    form.append("model", TRANSCRIBE_MODEL);
+    form.append("language", "en");
+    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", { method: "POST", headers: { Authorization: `Bearer ${OPENAI_KEY}` }, body: form });
+    const js: any = await r.json().catch(() => null);
+    return String(js?.text ?? "").trim();
+  } catch (e) { console.log("transcribe failed", String(e)); return ""; }
+}
+
 function resolveDay(s: string, tz: string) {
   const t = String(s ?? "").toLowerCase();
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
