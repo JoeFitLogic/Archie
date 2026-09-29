@@ -1,4 +1,4 @@
-// capture v6.6 — everything the owner or team texts (or voice-notes) to Archie.
+// capture v6.7 — everything the owner or team texts (or voice-notes) to Archie.
 // Quick commands (instant, free) — as v5:
 // task: / <handle>: / capacity: / done: <text>
 // done 2  ·  done 1 3            — tick off today's numbered tasks
@@ -16,6 +16,8 @@
 // v6.3: voice notes found more ways (audio link in the text, attachments in the payload, the latest inbound message),
 //       clear logging of each step, and plain-English help.
 // v6.4: a message that's just the placeholder (e.g. "🔈 Voice Note") counts as a voice note.
+// v6.7: conversation window for wake-word people (e.g. Sara) — say "Archie" once and the next messages go to Archie
+//       for 10 minutes (each message resets it); "that's all" / "thanks Archie" / "Archie off" closes it.
 // v6.6: forgiving shortcuts ("1 done", "done with 2", "tick 3", "finished 2") and a voice-first help.
 // v6.5: the audio's real format is read from the file itself (WhatsApp voice notes are often Ogg/Opus even when the link says .mp3).
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -40,7 +42,7 @@ const HELP = [
 ].join("\n");
 
 Deno.serve(async (req) => {
-  console.log("capture v6.6 start");
+  console.log("capture v6.7 start");
   try {
     if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     const raw = await req.json();
@@ -86,7 +88,7 @@ Deno.serve(async (req) => {
     const tz = cfg?.timezone || "Europe/London";
     const today = localDate(Date.now(), tz);
 
-    const { data: members } = await supabase.from("team_members").select("handle, name, phone, ghl_contact_id, gets_financials, talk_mode").eq("tenant_id", tenant_id);
+    const { data: members } = await supabase.from("team_members").select("handle, name, phone, ghl_contact_id, gets_financials, talk_mode, talk_until, talk_window_minutes").eq("tenant_id", tenant_id);
     const me = (members ?? []).find((m) => (senderContact && m.ghl_contact_id === senderContact) || (m.phone && m.phone.replace(/\s+/g, "") === senderPhone));
     if (!me) return j({ ok: true, reply: "", skipped: "sender not on team" });
 
@@ -98,13 +100,28 @@ Deno.serve(async (req) => {
     // Team members must start with "Archie" so their normal chat with the owner is left alone.
     const mode = String(me.talk_mode ?? (me.gets_financials ? "all" : "wake")).toLowerCase();
     const WAKE = /^(?:hey\s+|hi\s+|ok\s+)?@?archie\b[\s,:!.-]*/i;
+    // Conversation window (wake-word people only): open after "Archie…", reset by every message, closed by exit words or 10 quiet minutes
+    const windowMins = Math.max(1, Number(me.talk_window_minutes ?? 10) || 10);
+    const windowOpen = mode === "wake" && me.talk_until && Date.parse(String(me.talk_until)) > Date.now();
+    const setWindow = async (open: boolean) => {
+      await supabase.from("team_members").update({ talk_until: open ? new Date(Date.now() + windowMins * 60000).toISOString() : null })
+        .eq("tenant_id", tenant_id).eq("handle", me.handle);
+    };
     const toTalk = async () => {
       if (mode === "off") return j({ ok: true, reply: "", skipped: "talk off for this person" });
       let said = text;
+      let opening = false;
       if (mode === "wake") {
-        if (!WAKE.test(text)) return j({ ok: true, reply: "", skipped: "no wake word" });
-        said = text.replace(WAKE, "").trim();
-        if (!said) return reply("Yes? Ask me anything — e.g. \"Archie, what's on my list?\"");
+        if (WAKE.test(text)) {
+          said = text.replace(WAKE, "").trim();
+          opening = !windowOpen;
+          await setWindow(true);
+          if (!said) return reply(`🟢 I'm listening — go ahead. Say "that's all" when you're done.`);
+        } else if (windowOpen) {
+          await setWindow(true); // each message keeps the window open
+        } else {
+          return j({ ok: true, reply: "", skipped: "no wake word" });
+        }
       }
       const contactId = me.ghl_contact_id || senderContact;
       if (!contactId) return j({ ok: true, reply: "", skipped: "no contact id for talk" });
@@ -116,8 +133,16 @@ Deno.serve(async (req) => {
         });
       } catch (e) { console.log("talk hand-off failed", String(e)); }
       await bump("talk");
+      if (opening) return j({ ok: true, reply: `🟢 I'm listening for the next ${windowMins} minutes — say "that's all" when you're done.`, has_reply: "yes", handed_to: "talk" });
       return j({ ok: true, reply: "", has_reply: "no", handed_to: "talk" });
     };
+
+    // ---------- closing a conversation window ----------
+    const EXIT = /^(?:that'?s all|that is all|thats it|that's it|thanks archie|thank you archie|cheers archie|archie off|bye archie|done archie|ok thanks archie)[\s!.]*$/i;
+    if (mode === "wake" && EXIT.test(text)) {
+      if (windowOpen) { await setWindow(false); return reply("👋 Back to normal — start with \"Archie\" when you need me."); }
+      return j({ ok: true, reply: "", skipped: "exit word with no window open" });
+    }
 
     // ---------- help ----------
     if (lower === "help" || lower === "?") return reply(HELP);
