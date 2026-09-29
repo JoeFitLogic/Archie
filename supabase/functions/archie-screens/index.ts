@@ -1,4 +1,4 @@
-// archie-screens v4.3 — data and actions for the Archie AI Studio pages.
+// archie-screens v4.4.1 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -22,6 +22,10 @@
 // v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
 // v2.8: media_videos looks through the whole library (all pages and folders), newest first, grouped by month.
 // v2.9: brain dump splits one line into several tasks at commas/semicolons when it's clearly a list ("A must 45m, B 15m, C").
+// v4.4.1: 'do 1/2/3' runs exactly that focus item (no guessing), and follow-up drafts know each person's pipeline stage
+//         (only mention a proposal if they're at a proposal stage).
+// v4.4: where to focus this week — Archie finds the weakest link against pace and picks 3 actions with real names;
+//       'do 1' drafts the messages (archie_draft_followups) or starts the skill/task. In Monday's WhatsApp, talk and the pages.
 // v4.3: goals you can change — by voice ('set my MRR goal to £30k by June') and from the pages (goals / set_goals).
 // v4.2: 'how's this week looking?' in Talk to Archie (week report, owner only) and a week-so-far pace line in the owner's brief.
 // v4.1: weekly report on the schedule — nightly save (23:30) and Monday 07:00 WhatsApp review of last week.
@@ -139,6 +143,7 @@ Deno.serve(async (req) => {
       case "fathom_calls": return j(await fathomCalls(c));
       case "report": return j(await weeklyReport(c.tid, p));
       case "goals": return j(await getGoals(c.tid));
+      case "focus": return j(await getFocus(c.tid, String(p.refresh ?? "") === "yes"));
       case "set_goals": return j(await setGoals(c.tid, p));
       case "talk_page": {
         const text = String(p.text ?? "").trim();
@@ -1647,6 +1652,7 @@ const TALK_RULES = [
   "- General rule for messages to customers: only ever offer to send something that exists as a waiting draft. If they ask you to send something that isn't a draft yet, create it through the right tool first (e.g. archie_rebook_drafts), never freehand.",
   "- 'How's this week looking?' / 'how did last week go?' / 'am I on pace?' → archie_week with args {\"week\":\"this\"} or {\"week\":\"last\"} — messages sent, calls booked/held, sales, income, revenue and MRR vs goals, and pace. Give it back tidy and short, with one line on what stands out.",
   "- Goals: 'set my MRR goal to £30k by June' / 'my average sale is £397' / 'my close rate is about 50%' → archie_set_goals with any of {mrr_goal, revenue_goal, goal_date (YYYY-MM-DD, end of the month they name), avg_sale_value, show_rate, close_rate (as percentages)}. Just do it and read back the new goals and the new weekly pace.",
+  "- Where to focus: 'what should I focus on?' → read the FOCUS list in the CONTEXT. 'Do 1' / 'do the first one' → carry out that focus item: if it says draft → archie_draft_followups with its names and purpose (then show the drafts and ask 'Send them?'); if it says skill → archie_run_skill; if it says task → archie_add_task.",
   "- Numbers or money → archie_numbers (never guess). Calls on a day → archie_calls. Writing (posts, reels, carousels, stories, proposals, objection replies, SOPs, briefs) → archie_run_skill.",
   "- 'Remember that…' → archie_remember.",
   "- Pipeline: 'add Ross McKenley to follow up' / 'move Martin to proposal sent' → archie_move_deal with name + stage (moves and adds just happen). 'Move Jase to abandoned' / 'Jase is lost' / 'mark Martin won' → archie_move_deal with status — ask 'Mark Jase as abandoned? Yes?' first (won also starts onboarding), and only run it after they say yes. Include the reason if they gave one.",
@@ -1732,6 +1738,12 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
         drafts = dr ?? [];
       }
     }
+    let focusLine = "";
+    if (member.gets_financials) {
+      const { data: fc } = await supabase.from("weekly_focus").select("items").eq("tenant_id", tid).order("created_at", { ascending: false }).limit(1).maybeSingle();
+      const items: any[] = Array.isArray(fc?.items) ? fc!.items : [];
+      if (items.length) focusLine = `FOCUS this week: ${items.map((x: any, i: number) => `${i + 1}. ${x.title} [${x.do}${x.names?.length ? ` · names: ${x.names.join(", ")}` : ""}${x.purpose ? ` · purpose: ${x.purpose}` : ""}${x.skill ? ` · skill: ${x.skill}` : ""}]`).join("; ")}.`;
+    }
     const [{ data: list }, { data: proposals }, { data: memories }] = await Promise.all([
       supabase.from("tasks").select("title, tier, effort_minutes, today_rank").eq("tenant_id", tid).eq("owner", member.handle).eq("today", true).in("status", ["open", "doing"]).order("today_rank", { ascending: true }),
       member.gets_financials
@@ -1744,6 +1756,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
       `You're talking to ${member.name ?? member.handle} (handle: ${member.handle}${member.gets_financials ? ", the owner" : ", a team member — no money figures"}).`,
       `Their list today: ${(list ?? []).length ? (list ?? []).map((x: any) => `#${x.today_rank ?? "-"} ${x.title} [${x.tier}, ${x.effort_minutes ?? 30}m]`).join("; ") : "empty"}.`,
       (proposals ?? []).length ? `Proposals waiting (as numbered in the brief/inbox): ${(proposals ?? []).map((x: any) => `P${x.proposal_rank} ${x.title}`).join("; ")}. To add/wait/drop one, tell them to text e.g. "add P1" — or do it for them by adding the task with archie_add_task.` : "",
+      focusLine,
       drafts.length ? `Drafts waiting to send: ${drafts.map((d: any) => `${d.rank}. ${d.name} (${d.channel}): "${String(d.body ?? "").slice(0, 80)}…"`).join("; ")}.` : "",
       (memories ?? []).length ? `Things to remember: ${(memories ?? []).map((m: any) => m.fact).join(" | ")}` : "",
     ].filter(Boolean).join("\n");
@@ -1777,6 +1790,28 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
       return res;
     };
 
+    // "do 1" / "do 2" / "do 3" → run exactly that focus item, no guessing
+    const doN = text.trim().match(/^(?:do|start|go with|run)\s+(?:number\s+|no\.?\s*|#)?([1-3])\b/i);
+    if (doN && member.gets_financials) {
+      const { data: fc } = await supabase.from("weekly_focus").select("items").eq("tenant_id", tid).order("created_at", { ascending: false }).limit(1).maybeSingle();
+      const item: any = (Array.isArray(fc?.items) ? fc!.items : [])[Number(doN[1]) - 1];
+      if (item) {
+        let answer = "";
+        if (item.do === "draft") {
+          const d: any = await draftFollowups(tid, { names: item.names, purpose: item.purpose });
+          answer = d.ok ? `${d.text.replace(/\nAsk if they want them sent.*$/s, "")}\n\nSend them? (or "bin 2", "send 1")` : d.text;
+        } else if (item.do === "skill" && item.skill) {
+          const r = await runArchieTool(accessToken, "archie_run_skill", { skill: item.skill, input: item.input || item.title });
+          answer = r.text;
+        } else {
+          const r = await runArchieTool(accessToken, "archie_add_task", { title: item.title, tier: "high", handle: member.handle });
+          answer = r.ok ? `Added to your list: ${item.title}` : r.text;
+        }
+        const sent = await reply(answer);
+        return log(sent.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${answer.slice(0, 80)} | actions: focus ${doN[1]} (${item.do})`, sent.ok ? null : `reply not sent (${sent.status})`);
+      }
+    }
+
     // Round 1: what do they want?
     const first = await ask(`${TALK_RULES}\n\nCONTEXT\n${ctx}\n\nTHEIR MESSAGE\n${text}`);
     if (!first.ok || first.json?.success === false) {
@@ -1798,12 +1833,14 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
-      const OWNER_ONLY = ["archie_numbers", "archie_week", "archie_set_goals", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
+      const OWNER_ONLY = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_set_goals"
+      const r = act.tool === "archie_draft_followups"
+        ? await (async () => { const d: any = await draftFollowups(tid, args); return { ok: !!d.ok, text: d.text }; })()
+        : act.tool === "archie_set_goals"
         ? await (async () => { const g: any = await setGoals(tid, args); return { ok: !!g.ok, text: g.ok ? `Goals now: ${g.summary}` : String(g.error) }; })()
         : act.tool === "archie_week"
         ? await (async () => {
@@ -2034,6 +2071,7 @@ async function weekNumbers(tid: string, cfg: any, weekStart: string, current: bo
         out.calls_booked = ev.filter((e) => inWeek(e.dateAdded) && st(e) !== "cancelled").length;
         const thisWeek = ev.filter((e) => inWeek(e.startTime) && Date.parse(e.startTime) <= nowMs);
         out.calls_noshow = thisWeek.filter((e) => st(e) === "noshow" || st(e) === "no_show").length;
+        out.noshow_names = thisWeek.filter((e) => st(e) === "noshow" || st(e) === "no_show").map((e) => String(e.title ?? "")).slice(0, 10);
         out.calls_held = thisWeek.filter((e) => !["cancelled", "noshow", "no_show", "invalid"].includes(st(e))).length;
         const scheduled = out.calls_held + out.calls_noshow;
         out.show_rate = scheduled ? Math.round((out.calls_held / scheduled) * 100) : null;
@@ -2126,7 +2164,12 @@ async function reportWeeklyRun(tid: string) {
   const now = new Date().toISOString();
   try {
     const r: any = await weeklyReport(tid, { week: "last", refresh: "yes" });
-    await sendToTeam(tid, reportMessage(r), "", "report");
+    let msg = reportMessage(r);
+    try {
+      const f: any = await getFocus(tid, true);
+      if (f.items?.length) msg += `\n\n🧭 *Where to focus this week*\n${f.items.map((x: any, i: number) => `${i + 1}. ${x.title} — ${x.why}`).join("\n")}\n\nReply "do 1" (or 2, 3) and I'll get it started.`;
+    } catch { /* focus is a bonus — the report still goes */ }
+    await sendToTeam(tid, msg, "", "report");
   } catch (e) {
     await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "report", trigger: "api", status: "failed", started_at: now, finished_at: now, error: String(e).slice(0, 200) });
   }
@@ -2169,6 +2212,130 @@ async function setGoals(tid: string, p: any) {
   const wr: any = await weeklyReport(tid, { week: "this" });
   const summary = `MRR £${(g.mrr_goal ?? 0).toLocaleString("en-GB")} · revenue £${(g.revenue_goal ?? 0).toLocaleString("en-GB")}/month · by ${g.goal_date ?? "—"} · average sale £${g.avg_sale_value ?? "—"} · show ${g.show_rate}% · close ${g.close_rate}%. ${wr.pace?.line ?? ""}`.trim();
   return { ok: true, goals: g, pace: wr.pace, summary };
+}
+
+// ===================== v4.4: where to focus this week =====================
+async function getFocus(tid: string, refresh: boolean) {
+  const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).single();
+  const tz = cfg?.timezone || "Europe/London";
+  const today = localDate(Date.now(), tz);
+  const weekStart = mondayOf(today);
+  if (!refresh) {
+    const { data: fc } = await supabase.from("weekly_focus").select("items, created_at").eq("tenant_id", tid).eq("week_start", weekStart).maybeSingle();
+    if (fc?.items) return { ok: true, week_start: weekStart, items: fc.items, created_at: fc.created_at };
+  }
+  // The facts: this week and last week against pace, the pipeline, no-shows
+  const thisW: any = await weeklyReport(tid, { week: "this" });
+  const lastW: any = await weeklyReport(tid, { week: "last" });
+  const token = cfg?.ghl_token || FALLBACK_TOKEN;
+  const pl: any = await pipelineList({ tid, ghlToken: token });
+  const items: any[] = pl?.items ?? [];
+  const stale = items.filter((x) => x.urgent || x.needs_action).slice(0, 8).map((x) => `${x.name} (${x.stage}, ${x.days}d${x.value ? `, £${x.value}` : ""})`);
+  const proposals = items.filter((x) => /proposal|quote/i.test(String(x.stage)) && x.days >= 3).map((x) => x.name).slice(0, 6);
+  const early = items.filter((x) => /conversation|lead|follow/i.test(String(x.stage)) && x.days >= 5).map((x) => x.name).slice(0, 8);
+  const noShows = [...(thisW.numbers?.noshow_names ?? []), ...(lastW.numbers?.noshow_names ?? [])].slice(0, 6);
+  const { data: memories } = await supabase.from("memories").select("fact").eq("tenant_id", tid).order("created_at", { ascending: false }).limit(10);
+
+  const facts = [
+    `Goals: £${cfg?.mrr_target ?? "?"} MRR, £${cfg?.revenue_target ?? "?"} revenue a month, by ${cfg?.goal_date ?? "?"}. Average sale £${cfg?.avg_sale_value ?? "?"}.`,
+    `Pace needed a week: ${thisW.pace?.line ?? ""}`,
+    `Last week: ${JSON.stringify({ messages_sent: lastW.numbers?.messages_sent, calls_booked: lastW.numbers?.calls_booked, calls_held: lastW.numbers?.calls_held, show_rate: lastW.numbers?.show_rate, sales: lastW.numbers?.sales_count, new_mrr: lastW.numbers?.new_mrr })}`,
+    `This week so far (day ${thisW.day_of_week}): ${JSON.stringify({ messages_sent: thisW.numbers?.messages_sent, calls_booked: thisW.numbers?.calls_booked, calls_held: thisW.numbers?.calls_held, sales: thisW.numbers?.sales_count })}`,
+    `Deals needing action: ${stale.join("; ") || "none"}`,
+    `Proposals waiting 3+ days: ${proposals.join(", ") || "none"}`,
+    `Early-stage leads quiet 5+ days: ${early.join(", ") || "none"}`,
+    `No-shows (this week and last): ${noShows.join(", ") || "none"}`,
+    (memories ?? []).length ? `Things to remember: ${(memories ?? []).map((m: any) => m.fact).join(" | ")}` : "",
+  ].filter(Boolean).join("\n");
+
+  const rules = [
+    "You are a sales coach for this business. From the FACTS, find the weakest link against the weekly pace (not enough leads / not enough calls booked / people not showing / calls not closing / sales but low new MRR) and pick exactly 3 actions for this week that would move it most.",
+    "Use real names from the FACTS. Never invent people, numbers or results. Prefer actions Archie can start:",
+    "- do: \"draft\" — Archie drafts a short message to each named person (names from the FACTS; purpose: follow up on proposal / re-open quiet lead / rebook no-show / ask for referral / check in).",
+    "- do: \"skill\" — Archie runs one of: write-post, create-reel-script, create-carousel, stories, reply-to-objection, email-sequence (skill + input).",
+    "- do: \"task\" — something only the owner can do (title).",
+    "Return ONLY a JSON array of 3 objects, no other text:",
+    '[{"title":"short action, under 60 chars","why":"one line tied to the numbers","do":"draft|skill|task","names":["…"],"purpose":"…","skill":"…","input":"…"}]',
+  ].join("\n");
+
+  let focus: any[] = [];
+  try {
+    const loc = cfg?.ghl_location_id;
+    const agentId = await agentIdFor(tid, "sales", token, loc);
+    if (agentId) {
+      const res = await agentExecute(token, agentId, { locationId: loc, message: `${rules}\n\nFACTS\n${facts}`.slice(0, 9900) }, `focus-${tid}-${Date.now()}`);
+      const txt = tidy(clean(String(res.json?.finalText ?? "")));
+      const arr = safeArray(extractArray(`X: ${txt}`, "X:").json);
+      focus = arr.filter((x: any) => x && x.title && ["draft", "skill", "task"].includes(String(x.do))).slice(0, 3)
+        .map((x: any) => ({ title: String(x.title).slice(0, 80), why: String(x.why ?? "").slice(0, 160), do: String(x.do), names: Array.isArray(x.names) ? x.names.map(String).slice(0, 8) : [], purpose: String(x.purpose ?? "").slice(0, 80), skill: String(x.skill ?? ""), input: String(x.input ?? "").slice(0, 400) }));
+    }
+  } catch { /* fall back below */ }
+  // Fallback if the agent didn't answer usefully — simple rules on the same facts
+  if (!focus.length) {
+    if (proposals.length) focus.push({ title: `Chase ${proposals.length} open proposal${proposals.length > 1 ? "s" : ""}`, why: "Proposals waiting 3+ days are the quickest sales this week.", do: "draft", names: proposals, purpose: "follow up on proposal", skill: "", input: "" });
+    if (early.length) focus.push({ title: `Re-open ${early.length} quiet lead${early.length > 1 ? "s" : ""}`, why: "More conversations → more calls booked.", do: "draft", names: early, purpose: "re-open quiet lead", skill: "", input: "" });
+    if (noShows.length) focus.push({ title: `Rebook ${noShows.length} no-show${noShows.length > 1 ? "s" : ""}`, why: "They already wanted a call.", do: "draft", names: noShows, purpose: "rebook no-show", skill: "", input: "" });
+    if (focus.length < 3) focus.push({ title: "Post one piece that invites a call", why: "Top up leads for next week.", do: "skill", names: [], purpose: "", skill: "write-post", input: "Purpose: Sell. A post that invites people to book a call." });
+    focus = focus.slice(0, 3);
+  }
+  await supabase.from("weekly_focus").upsert({ tenant_id: tid, week_start: weekStart, items: focus, created_at: new Date().toISOString() }, { onConflict: "tenant_id,week_start" });
+  return { ok: true, week_start: weekStart, items: focus };
+}
+
+// Draft a short message to each named person for a purpose, saved as waiting drafts (sent only on a yes)
+async function draftFollowups(tid: string, p: any) {
+  const names: string[] = (Array.isArray(p.names) ? p.names : String(p.names ?? "").split(",")).map((x: any) => String(x).trim()).filter(Boolean).slice(0, 8);
+  const purpose = String(p.purpose ?? "follow up").slice(0, 80);
+  if (!names.length) return { ok: false, text: "No names to draft for." };
+  const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).single();
+  const tz = cfg?.timezone || "Europe/London";
+  const today = localDate(Date.now(), tz);
+  const token = cfg?.ghl_token || FALLBACK_TOKEN;
+  const loc = cfg?.ghl_location_id;
+  // Find each contact
+  const found: { name: string; id: string; first: string }[] = [];
+  const missing: string[] = [];
+  for (const n of names) {
+    const r = await ghl(token, `/contacts/?locationId=${loc}&query=${encodeURIComponent(n.replace(/\s*\|.*$/, "").slice(0, 60))}&limit=3`, "GET", undefined, "2021-07-28");
+    const c = (r.json?.contacts ?? [])[0];
+    if (c?.id) found.push({ name: [c.firstName, c.lastName].filter(Boolean).join(" ") || n, id: c.id, first: String(c.firstName ?? n.split(" ")[0]) });
+    else missing.push(n);
+  }
+  if (!found.length) return { ok: false, text: `Couldn't find ${missing.join(", ")} in your contacts.` };
+  // Where each person is in the pipeline, so the message fits (no "proposal" unless they have one)
+  const pl: any = await pipelineList({ tid, ghlToken: token });
+  const stageOf = (f: { name: string; id: string }) => {
+    const hit = (pl?.items ?? []).find((x: any) => x.contact_id === f.id) ?? (pl?.items ?? []).find((x: any) => String(x.name).toLowerCase().includes(f.name.toLowerCase().split(" ")[0]));
+    return hit ? `${hit.stage}, quiet ${hit.days} days` : "not in the pipeline";
+  };
+  // One agent call writes them all, in the owner's voice
+  const agentId = await agentIdFor(tid, "sales", token, loc);
+  let written: any[] = [];
+  if (agentId) {
+    const msg = [
+      `Write a short WhatsApp message (2–4 sentences) from the owner to each person below. Purpose: ${purpose}.`,
+      "Friendly, plain, in the owner's voice (Archie Voice). One easy thing to reply to. No discounts, no pressure. Never invent details.",
+      "Fit each message to where the person is (shown in brackets): only mention a proposal or quote if their stage is a proposal/quote stage; for early-stage leads, re-open the conversation and invite a quick call instead.",
+      `Booking link if useful: ${cfg?.booking_link_lead || cfg?.booking_link || "none"}.`,
+      'Return ONLY a JSON array: [{"name":"…","message":"…"}]',
+      "",
+      found.map((f) => `- ${f.name} (first name ${f.first}; ${stageOf(f)})`).join("\n"),
+    ].join("\n");
+    const res = await agentExecute(token, agentId, { locationId: loc, message: msg }, `followups-${tid}-${Date.now()}`);
+    written = safeArray(extractArray(`X: ${tidy(clean(String(res.json?.finalText ?? "")))}`, "X:").json);
+  }
+  const { data: existing } = await supabase.from("message_drafts").select("rank").eq("tenant_id", tid).eq("status", "pending").eq("created_on", today);
+  let rank = Math.max(0, ...(existing ?? []).map((r: any) => Number(r.rank) || 0));
+  const channel = String(cfg?.brief_channel ?? "").toLowerCase().includes("whatsapp") ? "WA" : "SMS";
+  const made: string[] = [];
+  for (const f of found) {
+    const w = written.find((x: any) => String(x?.name ?? "").toLowerCase().includes(f.first.toLowerCase()));
+    const body = String(w?.message ?? `Hi ${f.first}, just checking in — are you still keen to move things forward? Happy to jump on a quick call if that helps.`).slice(0, 1000);
+    rank++;
+    const { error } = await supabase.from("message_drafts").insert({ tenant_id: tid, created_on: today, rank, status: "pending", source: "focus", contact_id: f.id, name: f.name, channel, body });
+    if (error) rank--; else made.push(`${rank}. ${f.name}: ${body.slice(0, 90)}…`);
+  }
+  return { ok: true, text: `Drafted ${made.length} message${made.length === 1 ? "" : "s"} (${purpose}):\n${made.join("\n")}${missing.length ? `\nCouldn't find: ${missing.join(", ")}` : ""}\nAsk if they want them sent (archie_send_draft for each number).` };
 }
 
 // ===================== workflow side =====================
