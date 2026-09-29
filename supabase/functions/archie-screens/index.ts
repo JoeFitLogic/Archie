@@ -1,4 +1,4 @@
-// archie-screens v4.2 — data and actions for the Archie AI Studio pages.
+// archie-screens v4.3 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -22,6 +22,7 @@
 // v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
 // v2.8: media_videos looks through the whole library (all pages and folders), newest first, grouped by month.
 // v2.9: brain dump splits one line into several tasks at commas/semicolons when it's clearly a list ("A must 45m, B 15m, C").
+// v4.3: goals you can change — by voice ('set my MRR goal to £30k by June') and from the pages (goals / set_goals).
 // v4.2: 'how's this week looking?' in Talk to Archie (week report, owner only) and a week-so-far pace line in the owner's brief.
 // v4.1: weekly report on the schedule — nightly save (23:30) and Monday 07:00 WhatsApp review of last week.
 // v4.0.1: messages count shows its working (fetched / outbound / automated / to the team) so any gap is visible.
@@ -137,6 +138,8 @@ Deno.serve(async (req) => {
       case "planner_accounts": return j(await plannerAccounts(c));
       case "fathom_calls": return j(await fathomCalls(c));
       case "report": return j(await weeklyReport(c.tid, p));
+      case "goals": return j(await getGoals(c.tid));
+      case "set_goals": return j(await setGoals(c.tid, p));
       case "talk_page": {
         const text = String(p.text ?? "").trim();
         if (!text) return j({ ok: false, error: "nothing to say" });
@@ -1643,6 +1646,7 @@ const TALK_RULES = [
   "- After archie_rebook_drafts has run, show the drafts it made (with their numbers) and ask 'Send them?'. On yes → archie_send_draft for each of those numbers.",
   "- General rule for messages to customers: only ever offer to send something that exists as a waiting draft. If they ask you to send something that isn't a draft yet, create it through the right tool first (e.g. archie_rebook_drafts), never freehand.",
   "- 'How's this week looking?' / 'how did last week go?' / 'am I on pace?' → archie_week with args {\"week\":\"this\"} or {\"week\":\"last\"} — messages sent, calls booked/held, sales, income, revenue and MRR vs goals, and pace. Give it back tidy and short, with one line on what stands out.",
+  "- Goals: 'set my MRR goal to £30k by June' / 'my average sale is £397' / 'my close rate is about 50%' → archie_set_goals with any of {mrr_goal, revenue_goal, goal_date (YYYY-MM-DD, end of the month they name), avg_sale_value, show_rate, close_rate (as percentages)}. Just do it and read back the new goals and the new weekly pace.",
   "- Numbers or money → archie_numbers (never guess). Calls on a day → archie_calls. Writing (posts, reels, carousels, stories, proposals, objection replies, SOPs, briefs) → archie_run_skill.",
   "- 'Remember that…' → archie_remember.",
   "- Pipeline: 'add Ross McKenley to follow up' / 'move Martin to proposal sent' → archie_move_deal with name + stage (moves and adds just happen). 'Move Jase to abandoned' / 'Jase is lost' / 'mark Martin won' → archie_move_deal with status — ask 'Mark Jase as abandoned? Yes?' first (won also starts onboarding), and only run it after they say yes. Include the reason if they gave one.",
@@ -1794,12 +1798,14 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
-      const OWNER_ONLY = ["archie_numbers", "archie_week", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
+      const OWNER_ONLY = ["archie_numbers", "archie_week", "archie_set_goals", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_week"
+      const r = act.tool === "archie_set_goals"
+        ? await (async () => { const g: any = await setGoals(tid, args); return { ok: !!g.ok, text: g.ok ? `Goals now: ${g.summary}` : String(g.error) }; })()
+        : act.tool === "archie_week"
         ? await (async () => {
             try { const wr: any = await weeklyReport(tid, { week: String(args.week ?? "this") === "last" ? "last" : "this" }); return { ok: true, text: reportMessage(wr) }; }
             catch (e) { return { ok: false, text: String(e).slice(0, 120) }; }
@@ -2124,6 +2130,45 @@ async function reportWeeklyRun(tid: string) {
   } catch (e) {
     await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "report", trigger: "api", status: "failed", started_at: now, finished_at: now, error: String(e).slice(0, 200) });
   }
+}
+
+// ===================== v4.3: goals =====================
+async function getGoals(tid: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("mrr_target, revenue_target, goal_date, avg_sale_value, show_rate, close_rate").eq("tenant_id", tid).maybeSingle();
+  return {
+    ok: true,
+    goals: {
+      mrr_goal: Number(cfg?.mrr_target ?? 0) || null, revenue_goal: Number(cfg?.revenue_target ?? 0) || null,
+      goal_date: cfg?.goal_date ?? null, avg_sale_value: Number(cfg?.avg_sale_value ?? 0) || null,
+      show_rate: cfg?.show_rate !== null && cfg?.show_rate !== undefined ? Math.round(Number(cfg.show_rate) * 100) : 70,
+      close_rate: cfg?.close_rate !== null && cfg?.close_rate !== undefined ? Math.round(Number(cfg.close_rate) * 100) : 45,
+    },
+  };
+}
+
+async function setGoals(tid: string, p: any) {
+  const patch: Record<string, unknown> = {};
+  const money = (v: unknown) => { const n = Number(String(v ?? "").replace(/[£,\s]/g, "").replace(/k$/i, "000")); return Number.isFinite(n) && n > 0 ? Math.round(n) : null; };
+  const rate = (v: unknown) => { let n = Number(String(v ?? "").replace(/[%\s]/g, "")); if (!Number.isFinite(n) || n <= 0) return null; if (n > 1) n = n / 100; return Math.min(1, Math.round(n * 100) / 100); };
+  if (p.mrr_goal !== undefined) { const v = money(p.mrr_goal); if (!v) return { ok: false, error: "MRR goal must be a number, e.g. 20000" }; patch.mrr_target = v; }
+  if (p.revenue_goal !== undefined) { const v = money(p.revenue_goal); if (!v) return { ok: false, error: "revenue goal must be a number" }; patch.revenue_target = v; }
+  if (p.avg_sale_value !== undefined) { const v = money(p.avg_sale_value); if (!v) return { ok: false, error: "average sale must be a number" }; patch.avg_sale_value = v; }
+  if (p.show_rate !== undefined) { const v = rate(p.show_rate); if (!v) return { ok: false, error: "show rate must be a percentage" }; patch.show_rate = v; }
+  if (p.close_rate !== undefined) { const v = rate(p.close_rate); if (!v) return { ok: false, error: "close rate must be a percentage" }; patch.close_rate = v; }
+  if (p.goal_date !== undefined) {
+    const d = String(p.goal_date ?? "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || Date.parse(d) < Date.now()) return { ok: false, error: "goal date must be a future date (YYYY-MM-DD)" };
+    patch.goal_date = d;
+  }
+  if (!Object.keys(patch).length) return { ok: false, error: "nothing to change" };
+  const { error } = await supabase.from("tenant_config").update(patch).eq("tenant_id", tid);
+  if (error) return { ok: false, error: error.message };
+  // This week's cached numbers use the old pace — refresh them next time
+  await supabase.from("weekly_reports").delete().eq("tenant_id", tid).eq("is_final", false);
+  const g = (await getGoals(tid)).goals;
+  const wr: any = await weeklyReport(tid, { week: "this" });
+  const summary = `MRR £${(g.mrr_goal ?? 0).toLocaleString("en-GB")} · revenue £${(g.revenue_goal ?? 0).toLocaleString("en-GB")}/month · by ${g.goal_date ?? "—"} · average sale £${g.avg_sale_value ?? "—"} · show ${g.show_rate}% · close ${g.close_rate}%. ${wr.pace?.line ?? ""}`.trim();
+  return { ok: true, goals: g, pace: wr.pace, summary };
 }
 
 // ===================== workflow side =====================
