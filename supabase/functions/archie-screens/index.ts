@@ -1,4 +1,4 @@
-// archie-screens v3.5 — data and actions for the Archie AI Studio pages.
+// archie-screens v3.9 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -22,6 +22,12 @@
 // v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
 // v2.8: media_videos looks through the whole library (all pages and folders), newest first, grouped by month.
 // v2.9: brain dump splits one line into several tasks at commas/semicolons when it's clearly a list ("A must 45m, B 15m, C").
+// v3.9: pipeline by voice — 'add Ross to follow up', 'move Jase to abandoned', 'mark Martin won' (won/lost/abandoned confirmed first).
+// v3.8: Sara's routing — the Scraper assigns an owner to each task using the business's routing; failed payments become
+//       tasks for the payments person each morning; the owner can ask what a team member has on.
+// v3.7.1: rebook messages must come from archie_rebook_drafts (never written freehand), and any 'Send it?' only after they're saved as drafts.
+// v3.7: rebook flow — day off clashes → 'draft rebook messages?' → archie_rebook_drafts → 'send them?' → archie_send_draft each.
+// v3.6: the orb on Home is the same chat — talk_page (reply on screen) and talk_history (today's thread, WhatsApp and page together).
 // v3.5: voice-first brief — the command lines at the bottom are replaced by one "just reply or send a voice note" line.
 // v3.4: talk knows today's drafts and proposals — "send the Jase message", "bin the second one", "give P2 to Sara". Team members can't send drafts.
 // v3.3: talk — the backend does the actions. The agent answers with REPLY + ACTIONS_JSON; Archie runs each action
@@ -123,6 +129,19 @@ Deno.serve(async (req) => {
       case "to_planner": return j(await toPlanner(c, p));
       case "planner_accounts": return j(await plannerAccounts(c));
       case "fathom_calls": return j(await fathomCalls(c));
+      case "talk_page": {
+        const text = String(p.text ?? "").trim();
+        if (!text) return j({ ok: false, error: "nothing to say" });
+        let answer = "";
+        await talk(c.tid, { text }, { handle: c.resolve(p.handle), onReply: (m: string) => { answer = m; } });
+        return j({ ok: !!answer, reply: answer || "Sorry — I couldn't process that just now." });
+      }
+      case "talk_history": {
+        const h = c.resolve(p.handle);
+        const since = new Date(Date.now() - 24 * 3600000).toISOString();
+        const { data } = await supabase.from("talk_messages").select("role, text, channel, created_at").eq("tenant_id", c.tid).eq("handle", h).gte("created_at", since).order("created_at", { ascending: true }).limit(60);
+        return j({ ok: true, messages: data ?? [] });
+      }
       case "media_videos": return j(await mediaVideos(c));
       case "polish": return j(await polish(c, p));
       case "polish_status": return j(await polishStatus(c, p));
@@ -1334,7 +1353,16 @@ async function runAgentJob(tid: string, job: "pipeline" | "scraper", contextText
   if (!agentId) return { ok: false, summary: "", error: `couldn't find the ${job} agent` };
 
   const cw = String(cfg?.customer_word ?? "client"), sw = String(cfg?.sale_word ?? "proposal");
-  const rules = job === "pipeline" ? PIPELINE_RULES : SCRAPER_RULES;
+  let rules = job === "pipeline" ? PIPELINE_RULES : SCRAPER_RULES;
+  if (job === "scraper") {
+    const [{ data: tm }, { data: rc }] = await Promise.all([
+      supabase.from("team_members").select("handle, name, gets_financials").eq("tenant_id", tid),
+      supabase.from("tenant_config").select("routing_text").eq("tenant_id", tid).maybeSingle(),
+    ]);
+    const ownerH = (tm ?? []).find((m: any) => m.gets_financials)?.handle ?? "owner";
+    const people = (tm ?? []).map((m: any) => `${m.handle}${m.gets_financials ? " (owner)" : ""}`).join(", ");
+    rules += `\n\nWHO DOES WHAT (set "owner" on every task):\nTeam: ${people}.\n${String(rc?.routing_text ?? "").trim() || `Everything goes to ${ownerH}.`}\nIf unsure, use ${ownerH}.`;
+  }
   const head = job === "pipeline"
     ? `Execute your instructions now. Return only the output format. Customer word: ${cw} Sale word: ${sw}\n\n${rules}\n\nPIPELINE CONTEXT:\n`
     : `Execute your instructions now. Return only the output format. Customer word: ${cw}\n\n${rules}\n\nSCRAPER CONTEXT:\n`;
@@ -1402,6 +1430,7 @@ async function morningRun(tid: string, p: any) {
       notes.push(`sync ${sync.ok ? "ok" : sync.status}`);
       const stripe = await internal("stripe-metrics", { tenant_id: tid });
       notes.push(`stripe ${stripe.ok ? "ok" : stripe.status}`);
+      if (stripe.ok) notes.push(`payment tasks ${await paymentTasks(tid, String(stripe.json?.summary ?? ""))}`);
       const gc = await internal("ghl-context", { tenant_id: tid });
       notes.push(`context ${gc.ok ? "ok" : gc.status}`);
       const pipe = gc.ok ? await runAgentJob(tid, "pipeline", String(gc.json?.pipeline_context ?? "")) : { ok: false, summary: "", error: "no context" };
@@ -1538,7 +1567,7 @@ const SCRAPER_RULES = [
   "Output rules (these override anything else):",
   '- "METRICS: key=value | key=value" (numbers only)',
   '- "SCHEDULE: …", "WAITING: …", "COUNTS: …", "PROPOSED: …" — one line each',
-  '- "TASKS_JSON: " followed by a JSON array of {"title","detail","tier","kind","effort_minutes","due_date","source_ref","contact_id"} — tier is must, high or bonus',
+  '- "TASKS_JSON: " followed by a JSON array of {"title","detail","tier","kind","effort_minutes","due_date","source_ref","contact_id","owner"} — tier is must, high or bonus; owner is the handle of who should do it (see WHO DOES WHAT)',
   '- "CLIENTS_TOUCHED: " followed by a JSON array of contact IDs',
   "- Only propose tasks for real requests, promises or problems in the messages. Never invent anything.",
 ].join("\n");
@@ -1590,8 +1619,13 @@ const TALK_RULES = [
   "- Internal actions (add/complete/move tasks, capacity, quiet mode, day off, back on) — just do them, no 'are you sure?'.",
   "- Tasks: the title is just the job; set tier (must/high/bonus), effort_minutes and due_date from what they said; 'today' = today's date from the CONTEXT. Never put the tier or time in the title.",
   "- 'I'm off Friday' / 'block Thursday 2 till 4' / 'away Mon–Wed' → archie_day_off with real dates. 'Actually I'm working Friday' → archie_back_on.",
+  "- If a day off shows calls already booked, ask 'Want me to draft messages to rebook them?'. On yes → put archie_rebook_drafts in ACTIONS_JSON with the same dates/times (add a reason if they gave one). NEVER write a rebook message yourself in REPLY — it must come from archie_rebook_drafts so it has the right booking link and is saved so it can be sent.",
+  "- After archie_rebook_drafts has run, show the drafts it made (with their numbers) and ask 'Send them?'. On yes → archie_send_draft for each of those numbers.",
+  "- General rule for messages to customers: only ever offer to send something that exists as a waiting draft. If they ask you to send something that isn't a draft yet, create it through the right tool first (e.g. archie_rebook_drafts), never freehand.",
   "- Numbers or money → archie_numbers (never guess). Calls on a day → archie_calls. Writing (posts, reels, carousels, stories, proposals, objection replies, SOPs, briefs) → archie_run_skill.",
   "- 'Remember that…' → archie_remember.",
+  "- Pipeline: 'add Ross McKenley to follow up' / 'move Martin to proposal sent' → archie_move_deal with name + stage (moves and adds just happen). 'Move Jase to abandoned' / 'Jase is lost' / 'mark Martin won' → archie_move_deal with status — ask 'Mark Jase as abandoned? Yes?' first (won also starts onboarding), and only run it after they say yes. Include the reason if they gave one.",
+  "- The owner can ask about a team member: 'what's Sara got on?' → archie_today with handle sara; 'give this to Sara' → add the task with handle sara. Team members can only see their own list.",
   "- Drafts waiting (the 'Ready to send' list): 'send the Jase message' / 'send 1' → archie_send_draft (rank or name). 'Bin that' / 'skip 2' → archie_skip_draft. 'What drafts are waiting?' → archie_drafts. Sending a waiting draft IS allowed when the owner clearly says send — that's their yes.",
   "- Proposals (P1, P2… things spotted in messages): 'add P1' / 'add the Niamh one' → archie_proposal action add. 'Give P2 to Sara' → action give, to_handle sara. 'I'm waiting on Seve for that' → action wait, waiting_for. 'Drop P3' / 'bin that one' → action drop. 'What did you spot?' → archie_proposals.",
   "- Anything new that goes to a customer (not an existing draft): never send it. Draft it in REPLY and ask 'Send it?'.",
@@ -1631,23 +1665,28 @@ function parseTalk(text: string) {
   return { reply, actions };
 }
 
-async function talk(tid: string, p: any) {
-  const contactId = String(p.contact_id ?? "").trim();
+async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: string) => void } = {}) {
+  let contactId = String(p.contact_id ?? "").trim();
   const text = String(p.text ?? p.message ?? "").trim().slice(0, 4000);
   const log = async (status: string, summary: string, error: string | null = null) => {
     const now = new Date().toISOString();
     await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "talk", trigger: "api", status, started_at: now, finished_at: now, summary, error });
   };
   try {
-    if (!contactId || !text) return log("failed", "", "contact_id and text required");
+    if ((!contactId && !opts.handle) || !text) return log("failed", "", "contact_id (or handle) and text required");
     const [{ data: cfg }, { data: t }, { data: team }] = await Promise.all([
       supabase.from("tenant_config").select("ghl_location_id, ghl_token, timezone, brief_channel").eq("tenant_id", tid).single(),
       supabase.from("tenants").select("location_id, status, business_name").eq("id", tid).single(),
       supabase.from("team_members").select("handle, name, gets_financials, ghl_contact_id").eq("tenant_id", tid),
     ]);
     if (t?.status !== "active") return;
-    const member = (team ?? []).find((m: any) => m.ghl_contact_id === contactId);
-    if (!member) return log("failed", "", `message from a contact who isn't on the team (${contactId})`);
+    const member = opts.handle
+      ? (team ?? []).find((m: any) => m.handle === opts.handle)
+      : (team ?? []).find((m: any) => m.ghl_contact_id === contactId);
+    if (!member) return log("failed", "", `message from someone who isn't on the team (${contactId || opts.handle})`);
+    if (!contactId) contactId = String(member.ghl_contact_id ?? "");
+    const via = opts.onReply ? "page" : "whatsapp";
+    await supabase.from("talk_messages").insert({ tenant_id: tid, handle: member.handle, role: "user", text: text.slice(0, 4000), channel: via });
     const loc = cfg?.ghl_location_id || t?.location_id;
     const token = cfg?.ghl_token || FALLBACK_TOKEN;
     const tz = cfg?.timezone || "Europe/London";
@@ -1689,11 +1728,16 @@ async function talk(tid: string, p: any) {
     const { data: tok } = await supabase.from("tenants").select("access_token").eq("id", tid).single();
     const accessToken = String(tok?.access_token ?? "");
     const channel = String(cfg?.brief_channel ?? "sms").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS";
-    const reply = async (msg: string) => ghl(token, "/conversations/messages", "POST", { type: channel, contactId, message: msg.slice(0, 3500) }, "2021-04-15");
+    const reply = async (msg: string) => {
+      await supabase.from("talk_messages").insert({ tenant_id: tid, handle: member.handle, role: "archie", text: msg.slice(0, 8000), channel: via });
+      if (opts.onReply) { opts.onReply(msg); return { ok: true, status: 200 }; }
+      return ghl(token, "/conversations/messages", "POST", { type: channel, contactId, message: msg.slice(0, 3500) }, "2021-04-15");
+    };
 
     let sessionId = sess?.session_id ?? "";
     const ask = async (message: string) => {
-      const body: Record<string, unknown> = { locationId: loc, message: message.slice(0, 9900), contactId };
+      const body: Record<string, unknown> = { locationId: loc, message: message.slice(0, 9900) };
+      if (contactId) body.contactId = contactId;
       if (sessionId) body.sessionId = sessionId;
       let res = await agentExecute(token, agentId, body, `talk-${tid}-${Date.now()}`);
       if (res.status === 429 || res.status >= 500) {
@@ -1729,8 +1773,9 @@ async function talk(tid: string, p: any) {
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals"];
+      const NO_HANDLE = ["archie_numbers", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
+      if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
       const OWNER_ONLY = ["archie_numbers", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
       const r = await runArchieTool(accessToken, act.tool, args);
@@ -1805,6 +1850,39 @@ async function fathomCallText(tid: string, recordingId: string): Promise<string>
     .map((l) => `${l.speaker?.display_name ?? l.speaker_name ?? l.speaker ?? "?"}: ${l.text ?? ""}`)
     .join("\n");
   return [summary ? `SUMMARY\n${summary}` : "", transcript ? `TRANSCRIPT\n${transcript}` : ""].filter(Boolean).join("\n\n");
+}
+
+// ===================== v3.8: failed payments → tasks for the payments person =====================
+async function paymentTasks(tid: string, summary: string): Promise<string> {
+  const { data: cfg } = await supabase.from("tenant_config").select("payments_owner, timezone").eq("tenant_id", tid).maybeSingle();
+  const { data: tm } = await supabase.from("team_members").select("handle, gets_financials").eq("tenant_id", tid);
+  const owner = String(cfg?.payments_owner || (tm ?? []).find((m: any) => m.gets_financials)?.handle || "");
+  if (!owner) return "no owner";
+  const today = localDate(Date.now(), cfg?.timezone || "Europe/London");
+  const line = (label: string) => (summary.split("\n").find((l) => l.trim().toUpperCase().startsWith(label)) ?? "").replace(/^[^:]*:/, "").trim();
+  const pairs = (txt: string) => [...txt.matchAll(/([\w.+'-]+@[\w.-]+\.\w+)\s*£\s*([\d,]+(?:\.\d+)?)/g)].map((m) => ({ email: m[1], amount: m[2] }));
+  const chase = /^none$/i.test(line("CHASE")) ? [] : pairs(line("CHASE"));
+  const unmatched = /^none$/i.test(line("UNMATCHED")) ? [] : pairs(line("UNMATCHED"));
+  const rows: any[] = [];
+  for (const c of chase) rows.push({
+    title: `Chase ${c.email} — failed payment £${c.amount}, send card update link`, tier: "must",
+    detail: `Stripe shows a failed payment of £${c.amount} for ${c.email}. Send them the card update link, then check it's gone through.`,
+    ref: `stripe-chase:${c.email}:${today}`,
+  });
+  for (const u of unmatched) rows.push({
+    title: `Check who ${u.email} is — £${u.amount} payment not matched to a client`, tier: "high",
+    detail: `A £${u.amount} payment from ${u.email} isn't linked to a client in Archie. Find the contact and link them.`,
+    ref: `stripe-unmatched:${u.email}:${today.slice(0, 7)}`,
+  });
+  if (!rows.length) return "0";
+  const { data: existing } = await supabase.from("tasks").select("source_ref").eq("tenant_id", tid).in("source_ref", rows.map((r) => r.ref));
+  const seen = new Set((existing ?? []).map((e: any) => e.source_ref));
+  const fresh = rows.filter((r) => !seen.has(r.ref)).map((r) => ({
+    tenant_id: tid, title: r.title.slice(0, 200), detail: r.detail, tier: r.tier, kind: "shallow", effort_minutes: 15,
+    status: "open", owner, source: "stripe", source_ref: r.ref, due_date: today, accepted_by: "routing", accepted_at: new Date().toISOString(),
+  }));
+  if (fresh.length) await supabase.from("tasks").insert(fresh);
+  return String(fresh.length);
 }
 
 // ===================== workflow side =====================

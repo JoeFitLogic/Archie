@@ -1,10 +1,13 @@
-// archie-mcp v1.4 — Archie as an MCP server for GHL Managed Agents and Ask AI.
+// archie-mcp v1.6 — Archie as an MCP server for GHL Managed Agents and Ask AI.
 // URL: /functions/v1/archie-mcp/<tenant access_token>
 // The token picks the tenant. Nothing from any other tenant is ever returned.
 // v1.1: archie_notify — scheduled tasks and agents can message the owner (WhatsApp/SMS) and log to the Archie feed.
 // v1.2: Talk to Archie toolbox — move tasks, capacity, quiet mode, day off (blocks the calendar), back on, calls on a day, run a skill, remember.
 // v1.3: add/complete just act (no confirm step) — Talk to Archie's rules decide; tasks due today go straight onto today's list.
 // v1.4: drafts and proposals by voice — list/send/skip drafts, list proposals, add/give/wait/drop a proposal.
+// v1.6: pipeline by voice — archie_move_deal adds someone to a stage, moves a deal between stages, or marks it won / lost / abandoned.
+// v1.5.1: rebook messages use the client link for clients and the lead link for everyone else.
+// v1.5: rebook messages — archie_rebook_drafts drafts a 'can we move our call?' message for each call booked on days off.
 // v1.4.1: only the latest batch of drafts counts (older unsent ones are ignored), so numbers match today's brief.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -157,6 +160,37 @@ const TOOLS = [
     },
   },
   {
+    name: "archie_rebook_drafts",
+    description: "When a day off clashes with calls already booked: draft a friendly 'can we move our call?' message for each person, saved as drafts to send. Use the same dates (and times for part days) as the day off. Then ask 'Send them?' and use archie_send_draft for each.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "YYYY-MM-DD" },
+        end_date: { type: "string" },
+        from: { type: "string", description: "HH:MM for part of a day" },
+        to: { type: "string" },
+        reason: { type: "string", description: "Optional short reason to mention, e.g. 'something's come up'." },
+        handle: { type: "string" },
+      },
+      required: ["date"],
+    },
+  },
+  {
+    name: "archie_move_deal",
+    description: "Pipeline by voice. Find a person's deal and: move it to a stage ('move Martin to proposal sent'), add them to a stage if they have no open deal ('add Ross McKenley to follow up'), or change its status — won, lost, abandoned or open ('move Jase to abandoned', 'mark Martin won'). For won/lost/abandoned, confirm with the owner first because won starts onboarding.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The person's name." },
+        stage: { type: "string", description: "Stage name, e.g. 'follow up', 'proposal sent'." },
+        status: { type: "string", enum: ["won", "lost", "abandoned", "open"] },
+        reason: { type: "string", description: "Why (for lost/abandoned) — saved as a note." },
+        value: { type: "number", description: "Deal value, if they said one (for a new deal)." },
+      },
+      required: ["name"],
+    },
+  },
+  {
     name: "archie_back_on",
     description: "Undo a day off: removes the calendar blocks Archie made for those days and restores normal capacity. Use for 'actually I'm working Friday'.",
     inputSchema: { type: "object", properties: { date: { type: "string" }, end_date: { type: "string" }, handle: { type: "string" } }, required: ["date"] },
@@ -205,7 +239,7 @@ async function handle(tenant: any, msg: any) {
     return ok(id, {
       protocolVersion: msg?.params?.protocolVersion ?? "2025-03-26",
       capabilities: { tools: {} },
-      serverInfo: { name: "archie", version: "1.4.0" },
+      serverInfo: { name: "archie", version: "1.6.0" },
     });
   }
   if (method === "ping") return ok(id, {});
@@ -550,6 +584,105 @@ async function run(tenant: any, name: string, a: any): Promise<string> {
     return lines.join("\n");
   }
 
+  if (name === "archie_rebook_drafts") {
+    const h = resolve(a.handle);
+    if (!isDate(a.date)) throw new Error("date required (YYYY-MM-DD)");
+    const end = isDate(a.end_date) ? String(a.end_date) : String(a.date);
+    const partDay = /^\d{1,2}:\d{2}$/.test(String(a.from ?? "")) && /^\d{1,2}:\d{2}$/.test(String(a.to ?? ""));
+    const { data: link } = await supabase.from("tenant_config").select("booking_link, booking_link_client, booking_link_lead, brief_channel").eq("tenant_id", tid).maybeSingle();
+    const { data: activeClients } = await supabase.from("clients").select("ghl_contact_id").eq("tenant_id", tid).eq("status", "active");
+    const clientIds = new Set((activeClients ?? []).map((c: any) => String(c.ghl_contact_id)));
+    const clashes: any[] = [];
+    for (let d = String(a.date); d <= end && clashes.length < 20; d = addDays(d, 1)) {
+      const calls = await callsOn(tid, ghlToken, cfg, h, d, tz);
+      for (const x of calls.items) {
+        if (partDay && (x.time < String(a.from) || x.time >= String(a.to))) continue;
+        if (x.contactId) clashes.push(x);
+      }
+    }
+    if (!clashes.length) return "No booked calls with contacts on those days — nothing to rebook.";
+    // Add to today's drafts, numbered after anything already waiting
+    const { data: existing } = await supabase.from("message_drafts").select("rank").eq("tenant_id", tid).eq("status", "pending").eq("created_on", today);
+    let rank = Math.max(0, ...(existing ?? []).map((r: any) => Number(r.rank) || 0));
+    const made: string[] = []; const failed: string[] = [];
+    const channel = String(link?.brief_channel ?? "").toLowerCase().includes("whatsapp") ? "WA" : "SMS";
+    for (const x of clashes) {
+      const c = await ghl(ghlToken, `/contacts/${x.contactId}`, "GET");
+      const first = String(c.json?.contact?.firstName ?? c.json?.contact?.contactName ?? "there").split(" ")[0] || "there";
+      const full = [c.json?.contact?.firstName, c.json?.contact?.lastName].filter(Boolean).join(" ") || x.title;
+      const when = new Date(`${x.date}T12:00:00Z`).toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", timeZone: "UTC" });
+      const isClient = clientIds.has(String(x.contactId));
+      const bookUrl = (isClient ? link?.booking_link_client : link?.booking_link_lead) || link?.booking_link || "";
+      const body = `Hi ${first}, ${String(a.reason ?? "").trim() || "something's come up"} and I can't make our call on ${when} at ${x.time} — sorry about that. Can we move it?${bookUrl ? ` Grab a new time that suits you here: ${bookUrl}` : " Let me know a couple of times that work for you."}`;
+      rank++;
+      const { error } = await supabase.from("message_drafts").insert({ tenant_id: tid, rank, name: full, channel, body, contact_id: x.contactId, status: "pending", created_on: today });
+      if (error) { failed.push(`${full} (${error.message})`); rank--; } else made.push(`${rank}. ${full} (${isClient ? "client" : "lead"}) — ${when} ${x.time}`);
+    }
+    return [made.length ? `Drafted rebook messages:\n${made.join("\n")}` : "", failed.length ? `Couldn't draft: ${failed.join("; ")}` : "", made.length ? "Ask if they want them sent (archie_send_draft for each number)." : ""].filter(Boolean).join("\n");
+  }
+
+  if (name === "archie_move_deal") {
+    const who = String(a.name ?? "").trim();
+    if (!who) throw new Error("name required");
+    const loc = cfg?.ghl_location_id;
+    const V = "2021-07-28";
+    // The person
+    const cs = await ghl(ghlToken, `/contacts/?locationId=${loc}&query=${encodeURIComponent(who)}&limit=5`, "GET", undefined, V);
+    const people: any[] = cs.json?.contacts ?? [];
+    const nameOf = (c: any) => [c.firstName, c.lastName].filter(Boolean).join(" ") || c.contactName || c.email || "Contact";
+    if (!people.length) return `I can't find anyone called ${who} in your contacts.`;
+    const exact = people.filter((c) => nameOf(c).toLowerCase() === who.toLowerCase());
+    const pick = exact.length === 1 ? exact : people;
+    if (pick.length > 1) return `More than one match: ${pick.slice(0, 4).map((c) => `${nameOf(c)}${c.email ? ` (${c.email})` : ""}`).join(" / ")}. Ask which one.`;
+    const person = pick[0];
+    const personName = nameOf(person);
+    // The pipeline and its stages
+    const { data: pc } = await supabase.from("tenant_config").select("pipeline_id, pipeline_name").eq("tenant_id", tid).maybeSingle();
+    const pl = await ghl(ghlToken, `/opportunities/pipelines?locationId=${loc}`, "GET", undefined, V);
+    const pipes: any[] = pl.json?.pipelines ?? [];
+    const pipe = pipes.find((x) => x.id === pc?.pipeline_id) ?? pipes.find((x) => String(x.name).trim() === String(pc?.pipeline_name ?? "").trim()) ?? pipes[0];
+    if (!pipe) return "I couldn't find your pipeline.";
+    const stages: any[] = pipe.stages ?? [];
+    const want = String(a.stage ?? "").trim().toLowerCase();
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const stage = want ? (stages.find((s) => norm(s.name) === norm(want)) ?? stages.find((s) => norm(s.name).includes(norm(want)) || norm(want).includes(norm(s.name)))) : null;
+    if (want && !stage) return `No stage called "${a.stage}". Your stages are: ${stages.map((s) => s.name).join(", ")}.`;
+    // Their deal in this pipeline
+    const os = await ghl(ghlToken, `/opportunities/search?location_id=${loc}&pipeline_id=${pipe.id}&contact_id=${person.id}&limit=10`, "GET", undefined, V);
+    const opps: any[] = (os.json?.opportunities ?? []).filter((o: any) => (o.contactId ?? o.contact?.id) === person.id);
+    const openOpps = opps.filter((o) => String(o.status) === "open");
+    let opp: any = openOpps[0] ?? (a.status ? opps[0] : null);
+    if (openOpps.length > 1) return `${personName} has ${openOpps.length} open deals: ${openOpps.map((o) => o.name).join(" / ")}. Ask which one.`;
+    const done: string[] = [];
+    // No deal yet → add them to the pipeline
+    if (!opp) {
+      if (!stage) return `${personName} isn't in your pipeline yet — which stage should I add them to? (${stages.map((s) => s.name).join(", ")})`;
+      const cr = await ghl(ghlToken, `/opportunities/`, "POST", {
+        pipelineId: pipe.id, locationId: loc, name: personName, pipelineStageId: stage.id, status: "open", contactId: person.id,
+        ...(Number(a.value) > 0 ? { monetaryValue: Number(a.value) } : {}),
+      }, V);
+      if (!cr.ok) return `Couldn't add ${personName} to the pipeline (${cr.status}): ${cr.text.slice(0, 150)}`;
+      opp = cr.json?.opportunity ?? cr.json;
+      done.push(`Added ${personName} to ${stage.name}`);
+    } else if (stage && opp.pipelineStageId !== stage.id) {
+      const up = await ghl(ghlToken, `/opportunities/${opp.id}`, "PUT", { pipelineStageId: stage.id, pipelineId: pipe.id }, V);
+      if (!up.ok) return `Couldn't move ${personName} (${up.status}): ${up.text.slice(0, 150)}`;
+      done.push(`Moved ${personName} to ${stage.name}`);
+    }
+    // Status change (won / lost / abandoned / open)
+    const status = String(a.status ?? "").toLowerCase();
+    if (["won", "lost", "abandoned", "open"].includes(status) && opp?.id && String(opp.status) !== status) {
+      const st = await ghl(ghlToken, `/opportunities/${opp.id}/status`, "PUT", { status }, V);
+      if (!st.ok) return `${done.length ? done.join(". ") + ". " : ""}Couldn't mark ${personName} as ${status} (${st.status}): ${st.text.slice(0, 150)}`;
+      done.push(`Marked ${personName} as ${status}${status === "won" ? " — onboarding will start" : ""}`);
+    }
+    if (String(a.reason ?? "").trim()) {
+      await ghl(ghlToken, `/contacts/${person.id}/notes`, "POST", { body: `[deal ${status || "update"}] ${today} — ${String(a.reason).trim().slice(0, 500)}` }, V);
+      done.push("reason saved as a note");
+    }
+    return done.length ? done.join(". ") + "." : `${personName} is already there — nothing to change.`;
+  }
+
   if (name === "archie_back_on") {
     const h = resolve(a.handle);
     if (!isDate(a.date)) throw new Error("date required (YYYY-MM-DD)");
@@ -614,14 +747,14 @@ async function ghlUserId(tid: string, token: string, cfg: any, handle?: string):
 // Calls booked for a user on one local day
 async function callsOn(tid: string, token: string, cfg: any, h: string, date: string, tz: string) {
   const userId = await ghlUserId(tid, token, cfg, h);
-  if (!userId) return { items: [] as { time: string; title: string }[], error: "no GHL user found" };
+  if (!userId) return { items: [] as { time: string; title: string; contactId: string; date: string }[], error: "no GHL user found" };
   const start = Date.parse(isoAt(date, "00:00", tz)), end = Date.parse(isoAt(date, "23:59", tz));
   const r = await ghl(token, `/calendars/events?locationId=${cfg?.ghl_location_id}&userId=${userId}&startTime=${start}&endTime=${end}`, "GET");
   if (!r.ok) return { items: [], error: `${r.status}` };
   const events: any[] = r.json?.events ?? [];
   const items = events
     .filter((e) => String(e.appointmentStatus ?? e.status ?? "").toLowerCase() !== "cancelled" && !String(e.title ?? "").startsWith("Off — set by Archie") && !e.isBlockSlot && e.type !== "block")
-    .map((e) => ({ time: new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(e.startTime)), title: String(e.title ?? "Appointment") }))
+    .map((e) => ({ time: new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(e.startTime)), title: String(e.title ?? "Appointment"), contactId: String(e.contactId ?? e.contact_id ?? ""), date }))
     .sort((x, y) => x.time.localeCompare(y.time));
   return { items, error: null };
 }
@@ -639,10 +772,10 @@ function isoAt(date: string, hhmm: string, tz: string) {
   return `${date}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00${sign}${oh}:${om}`;
 }
 
-async function ghl(token: string, path: string, method = "GET", body?: unknown) {
+async function ghl(token: string, path: string, method = "GET", body?: unknown, version = "2021-04-15") {
   const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 15000);
   try {
-    const r = await fetch(BASE + path, { method, signal: ctrl.signal, headers: { "Authorization": `Bearer ${token}`, "Version": "2021-04-15", "Accept": "application/json", "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+    const r = await fetch(BASE + path, { method, signal: ctrl.signal, headers: { "Authorization": `Bearer ${token}`, "Version": version, "Accept": "application/json", "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
     const text = await r.text(); let j: any = null; try { j = JSON.parse(text); } catch { j = null; }
     return { ok: r.ok, status: r.status, json: j, text };
   } catch (e) { return { ok: false, status: 0, json: null, text: String(e) }; }
