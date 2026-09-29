@@ -1,4 +1,4 @@
-// archie-screens v4.1 — data and actions for the Archie AI Studio pages.
+// archie-screens v4.2 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -22,6 +22,7 @@
 // v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
 // v2.8: media_videos looks through the whole library (all pages and folders), newest first, grouped by month.
 // v2.9: brain dump splits one line into several tasks at commas/semicolons when it's clearly a list ("A must 45m, B 15m, C").
+// v4.2: 'how's this week looking?' in Talk to Archie (week report, owner only) and a week-so-far pace line in the owner's brief.
 // v4.1: weekly report on the schedule — nightly save (23:30) and Monday 07:00 WhatsApp review of last week.
 // v4.0.1: messages count shows its working (fetched / outbound / automated / to the team) so any gap is visible.
 // v4.0: weekly report — report action: messages sent, calls booked/held/no-show, sales, new income, revenue and MRR vs goals,
@@ -1172,11 +1173,21 @@ async function briefRun(tid: string, p: any) {
     // 3. The Brief agent, fresh session every day
     const agentId = await agentIdFor(tid, "brief", token, loc);
     if (!agentId) return log("failed", "", "couldn't find the Brief agent — check it's published and named Archie Brief");
+    // Week so far (cached for an hour) → one pace line in the owner's brief
+    let weekLine = "";
+    try {
+      const wr: any = await weeklyReport(tid, { week: "this" });
+      const n = wr.numbers ?? {};
+      weekLine = wr.is_current && wr.day_of_week > 1
+        ? `Week so far: ${n.calls_booked ?? 0} booked · ${n.calls_held ?? 0} held · ${n.sales_count ?? 0} sale${(n.sales_count ?? 0) === 1 ? "" : "s"} — ${wr.pace?.on_pace ? "on pace" : "behind pace"} (need ~${wr.pace?.calls_booked_per_week ?? "?"} booked a week)`
+        : `This week's pace: ~${wr.pace?.calls_booked_per_week ?? "?"} calls booked, ${wr.pace?.sales_per_week ?? "?"} sales, £${wr.pace?.new_mrr_per_week ?? "?"} new MRR`;
+    } catch { weekLine = ""; }
     const message = [
       "Execute your instructions now. Use ONLY the data below. It is today's data. Ignore anything from earlier runs or conversations.",
       `The header date must be exactly: ${expected}.`,
       "Capacity comes from the OWNER CAPACITY line. The Today list is exactly the LINEUP lines, with their numbers. Never add a task that is not listed there. At risk comes only from the AT_RISK line.",
       "Voice-first footer (overrides your instructions): do NOT include the command lines 'add P1 · wait P1 · drop P1', 'Reply SEND 1 · SKIP 1' or 'done 1 · move 2 fri · 👍/👎'. Keep the numbers on the lists (1, 2… and P1, P2…) so people can refer to them. End the OWNER brief with exactly one line: 🎙️ Just reply or send a voice note — e.g. \"done the first one\", \"send Jase's message\", \"give P2 to Sara\". End the TEAM brief with exactly one line: 🎙️ Just reply starting with \"Archie\" — e.g. \"Archie, done the first one\".",
+      weekLine ? `Weekly pace (OWNER brief only, never the TEAM brief): add this as one line under Money, exactly: 📊 ${weekLine}` : "",
       "Return only the two briefs in the marker format.",
       "", "BRIEF CONTEXT:", ctx.slice(0, 6000),
       "", "FINANCIALS OUTPUT:", moneyTxt,
@@ -1631,6 +1642,7 @@ const TALK_RULES = [
   "- If a day off shows calls already booked, ask 'Want me to draft messages to rebook them?'. On yes → put archie_rebook_drafts in ACTIONS_JSON with the same dates/times (add a reason if they gave one). NEVER write a rebook message yourself in REPLY — it must come from archie_rebook_drafts so it has the right booking link and is saved so it can be sent.",
   "- After archie_rebook_drafts has run, show the drafts it made (with their numbers) and ask 'Send them?'. On yes → archie_send_draft for each of those numbers.",
   "- General rule for messages to customers: only ever offer to send something that exists as a waiting draft. If they ask you to send something that isn't a draft yet, create it through the right tool first (e.g. archie_rebook_drafts), never freehand.",
+  "- 'How's this week looking?' / 'how did last week go?' / 'am I on pace?' → archie_week with args {\"week\":\"this\"} or {\"week\":\"last\"} — messages sent, calls booked/held, sales, income, revenue and MRR vs goals, and pace. Give it back tidy and short, with one line on what stands out.",
   "- Numbers or money → archie_numbers (never guess). Calls on a day → archie_calls. Writing (posts, reels, carousels, stories, proposals, objection replies, SOPs, briefs) → archie_run_skill.",
   "- 'Remember that…' → archie_remember.",
   "- Pipeline: 'add Ross McKenley to follow up' / 'move Martin to proposal sent' → archie_move_deal with name + stage (moves and adds just happen). 'Move Jase to abandoned' / 'Jase is lost' / 'mark Martin won' → archie_move_deal with status — ask 'Mark Jase as abandoned? Yes?' first (won also starts onboarding), and only run it after they say yes. Include the reason if they gave one.",
@@ -1782,12 +1794,17 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
-      const OWNER_ONLY = ["archie_numbers", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
+      const OWNER_ONLY = ["archie_numbers", "archie_week", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = await runArchieTool(accessToken, act.tool, args);
+      const r = act.tool === "archie_week"
+        ? await (async () => {
+            try { const wr: any = await weeklyReport(tid, { week: String(args.week ?? "this") === "last" ? "last" : "this" }); return { ok: true, text: reportMessage(wr) }; }
+            catch (e) { return { ok: false, text: String(e).slice(0, 120) }; }
+          })()
+        : await runArchieTool(accessToken, act.tool, args);
       ran.push(`${act.tool}${r.ok ? "" : " (failed)"}`);
       results.push(`${act.tool} ${JSON.stringify(args)} → ${r.ok ? "OK" : "FAILED"}: ${r.text.slice(0, act.tool === "archie_run_skill" ? 6000 : 800)}`);
     }
