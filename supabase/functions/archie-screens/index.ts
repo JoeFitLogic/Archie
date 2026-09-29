@@ -1,4 +1,4 @@
-// archie-screens v3.9 — data and actions for the Archie AI Studio pages.
+// archie-screens v4.1 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -22,6 +22,10 @@
 // v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
 // v2.8: media_videos looks through the whole library (all pages and folders), newest first, grouped by month.
 // v2.9: brain dump splits one line into several tasks at commas/semicolons when it's clearly a list ("A must 45m, B 15m, C").
+// v4.1: weekly report on the schedule — nightly save (23:30) and Monday 07:00 WhatsApp review of last week.
+// v4.0.1: messages count shows its working (fetched / outbound / automated / to the team) so any gap is visible.
+// v4.0: weekly report — report action: messages sent, calls booked/held/no-show, sales, new income, revenue and MRR vs goals,
+//       pace to the goal, any week vs the week before; this week cached for an hour; finished weeks saved.
 // v3.9: pipeline by voice — 'add Ross to follow up', 'move Jase to abandoned', 'mark Martin won' (won/lost/abandoned confirmed first).
 // v3.8: Sara's routing — the Scraper assigns an owner to each task using the business's routing; failed payments become
 //       tasks for the payments person each morning; the owner can ask what a team member has on.
@@ -81,6 +85,8 @@ Deno.serve(async (req) => {
       if (action === "plan_context") return j(await planContext(tenant_id));
       if (action === "plan_save") return j(await planSave(tenant_id, p));
       if (action === "talk") { startInBackground(talk(tenant_id, p)); return j({ ok: true, started: true }); }
+      if (action === "report_nightly_run") { startInBackground(weeklyReport(tenant_id, { week: "this", refresh: "yes" })); return j({ ok: true, started: true }); }
+      if (action === "report_weekly_run") { startInBackground(reportWeeklyRun(tenant_id)); return j({ ok: true, started: true }); }
       if (action === "evening_run") { startInBackground(eveningRun(tenant_id)); return j({ ok: true, started: true }); }
       if (action === "monthly_run") { startInBackground(monthlyRun(tenant_id, p)); return j({ ok: true, started: true }); }
       if (action === "renewals_run") { startInBackground(renewalsRun(tenant_id)); return j({ ok: true, started: true }); }
@@ -129,6 +135,7 @@ Deno.serve(async (req) => {
       case "to_planner": return j(await toPlanner(c, p));
       case "planner_accounts": return j(await plannerAccounts(c));
       case "fathom_calls": return j(await fathomCalls(c));
+      case "report": return j(await weeklyReport(c.tid, p));
       case "talk_page": {
         const text = String(p.text ?? "").trim();
         if (!text) return j({ ok: false, error: "nothing to say" });
@@ -1492,6 +1499,8 @@ async function dispatch(_p: any) {
       { job: "morning", due: days(cfg.sched_morning_days, "0,1,2,3,4,5,6").includes(now.weekday) && dueNow(now.minutes, hhmm(cfg.sched_morning, "04:30")), key: now.date, action: "morning_run", body: { referral_link: String(cfg.referral_link ?? "") } },
       { job: "evening", due: days(cfg.sched_evening_days, "0,1,2,3,4").includes(now.weekday) && dueNow(now.minutes, hhmm(cfg.sched_evening, "20:00")), key: now.date, action: "evening_run" },
       { job: "plan", due: now.weekday === Number(cfg.sched_plan_day ?? 6) && dueNow(now.minutes, hhmm(cfg.sched_plan, "08:00")), key: now.date, action: "plan_run" },
+      { job: "report_nightly", due: dueNow(now.minutes, hhmm(cfg.sched_report_nightly, "23:30")), key: now.date, action: "report_nightly_run" },
+      { job: "report_weekly", due: now.weekday === Number(cfg.sched_report_day ?? 1) && dueNow(now.minutes, hhmm(cfg.sched_report, "07:00")), key: now.date, action: "report_weekly_run" },
       { job: "monthly", due: now.day === Number(cfg.sched_monthly_day ?? 1) && dueNow(now.minutes, hhmm(cfg.sched_monthly, "09:00")), key: now.date.slice(0, 7), action: "monthly_run", body: { referral_link: String(cfg.referral_link ?? "") } },
     ];
     for (const jb of jobs) {
@@ -1883,6 +1892,221 @@ async function paymentTasks(tid: string, summary: string): Promise<string> {
   }));
   if (fresh.length) await supabase.from("tasks").insert(fresh);
   return String(fresh.length);
+}
+
+// ===================== v4.0: weekly report =====================
+function isoAtTz(date: string, hhmm: string, tz: string) {
+  const [h, m] = hhmm.split(":").map(Number);
+  const guess = new Date(`${date}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00Z`);
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(guess);
+  const g = (k: string) => Number(parts.find((x) => x.type === k)?.value);
+  const shown = Date.UTC(g("year"), g("month") - 1, g("day"), g("hour") % 24, g("minute"));
+  return new Date(guess.getTime() - (shown - guess.getTime())).toISOString();
+}
+function mondayOf(date: string) {
+  const d = new Date(`${date}T12:00:00Z`);
+  const dow = (d.getUTCDay() + 6) % 7; // Monday = 0
+  return addDays(date, -dow);
+}
+
+async function weeklyReport(tid: string, p: any) {
+  const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).single();
+  const tz = cfg?.timezone || "Europe/London";
+  const today = localDate(Date.now(), tz);
+  const thisMonday = mondayOf(today);
+  const which = String(p.week ?? "this");
+  const weekStart = which === "last" ? addDays(thisMonday, -7) : /^\d{4}-\d{2}-\d{2}$/.test(which) ? mondayOf(which) : thisMonday;
+  const current = weekStart === thisMonday;
+
+  const cur = await weekNumbers(tid, cfg, weekStart, current, String(p.refresh ?? "") === "yes");
+  const prev = await weekNumbers(tid, cfg, addDays(weekStart, -7), false, false);
+
+  // Pace to the goal
+  const mrrGoal = Number(cfg?.mrr_target ?? 0) || 0;
+  const revGoal = Number(cfg?.revenue_target ?? 0) || 0;
+  const goalDate = /^\d{4}-\d{2}-\d{2}$/.test(String(cfg?.goal_date ?? "")) ? String(cfg.goal_date) : addDays(today, 182);
+  const weeksLeft = Math.max(1, Math.round((Date.parse(goalDate) - Date.parse(today)) / (7 * 86400000)));
+  const avgSale = Number(cfg?.avg_sale_value ?? 0) || 297;
+  const showRate = Number(cfg?.show_rate ?? 0) || 0.7;
+  const closeRate = Number(cfg?.close_rate ?? 0) || 0.45;
+  const mrrNow = cur.mrr ?? prev.mrr ?? 0;
+  const newMrrNeeded = mrrGoal > mrrNow ? Math.ceil((mrrGoal - mrrNow) / weeksLeft) : 0;
+  const salesNeeded = newMrrNeeded ? Math.max(1, Math.ceil(newMrrNeeded / avgSale)) : 0;
+  const heldNeeded = salesNeeded ? Math.ceil(salesNeeded / closeRate) : 0;
+  const bookedNeeded = heldNeeded ? Math.ceil(heldNeeded / showRate) : 0;
+  const dayOfWeek = current ? Math.min(7, Math.round((Date.parse(today) - Date.parse(weekStart)) / 86400000) + 1) : 7;
+  const expectedBooked = Math.round(bookedNeeded * dayOfWeek / 7);
+  const onPace = !bookedNeeded || (cur.calls_booked ?? 0) >= expectedBooked;
+
+  return {
+    ok: true,
+    week_start: weekStart, week_end: addDays(weekStart, 6), is_current: current, day_of_week: dayOfWeek,
+    numbers: cur, previous: prev,
+    goals: { mrr_goal: mrrGoal, revenue_goal: revGoal, goal_date: goalDate, avg_sale_value: avgSale, show_rate: showRate, close_rate: closeRate },
+    pace: {
+      weeks_left: weeksLeft, new_mrr_per_week: newMrrNeeded, sales_per_week: salesNeeded, calls_held_per_week: heldNeeded, calls_booked_per_week: bookedNeeded,
+      expected_booked_so_far: expectedBooked, on_pace: onPace,
+      line: bookedNeeded
+        ? `Need ~${bookedNeeded} calls booked, ${heldNeeded} held, ${salesNeeded} sale${salesNeeded === 1 ? "" : "s"} and £${newMrrNeeded} new MRR a week. ${current ? `So far: ${cur.calls_booked ?? 0} booked, ${cur.sales_count ?? 0} sale${(cur.sales_count ?? 0) === 1 ? "" : "s"} — ${onPace ? "on pace" : "behind pace"}.` : ""}`
+        : "MRR goal reached — set a new one.",
+    },
+    updated_at: cur.updated_at,
+  };
+}
+
+// The seven numbers for one week (Mon–Sun, local time). This week is cached for an hour; finished weeks are saved for good.
+async function weekNumbers(tid: string, cfg: any, weekStart: string, current: boolean, refresh: boolean): Promise<any> {
+  const { data: cached } = await supabase.from("weekly_reports").select("data, is_final, updated_at").eq("tenant_id", tid).eq("week_start", weekStart).maybeSingle();
+  if (cached?.is_final) return cached.data;
+  if (cached && current && !refresh && Date.now() - Date.parse(cached.updated_at) < 60 * 60000) return cached.data;
+
+  const tz = cfg?.timezone || "Europe/London";
+  const loc = cfg?.ghl_location_id;
+  const token = cfg?.ghl_token || FALLBACK_TOKEN;
+  const weekEnd = addDays(weekStart, 7); // exclusive
+  const fromIso = isoAtTz(weekStart, "00:00", tz), toIso = isoAtTz(weekEnd, "00:00", tz);
+  const fromMs = Date.parse(fromIso), toMs = Date.parse(toIso), nowMs = Date.now();
+  const inWeek = (v: unknown) => { const t = Date.parse(String(v ?? "")); return !isNaN(t) && t >= fromMs && t < toMs; };
+  const out: any = { week_start: weekStart, errors: [] as string[] };
+
+  const { data: team } = await supabase.from("team_members").select("handle, ghl_contact_id, ghl_user_id, gets_financials").eq("tenant_id", tid);
+  const teamContacts = new Set((team ?? []).map((m: any) => m.ghl_contact_id).filter(Boolean));
+
+  // 1. Messages sent — outbound, by a person or Archie on their behalf (not workflows/campaigns), not to the team
+  try {
+    let cursor = "", sent = 0, pages = 0, fetched = 0, outbound = 0, automated = 0, toTeam = 0, total: number | null = null;
+    const startQ = fromIso.replace(/\.\d{3}Z$/, "Z"), endQ = toIso.replace(/\.\d{3}Z$/, "Z");
+    do {
+      const r = await ghl(token, `/conversations/messages/export?locationId=${loc}&startDate=${startQ}&endDate=${endQ}&limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`, "GET", undefined, "2021-04-15");
+      if (!r.ok) { out.errors.push(`messages ${r.status}: ${r.text.slice(0, 80)}`); break; }
+      const msgs: any[] = r.json?.messages ?? [];
+      if (total === null && r.json?.total !== undefined) total = Number(r.json.total);
+      fetched += msgs.length;
+      for (const m of msgs) {
+        if (String(m.direction) !== "outbound") continue;
+        outbound++;
+        const src = String(m.source ?? m.meta?.source ?? "").toLowerCase();
+        if (["workflow", "campaign", "bulk_actions"].includes(src)) { automated++; continue; }
+        if (teamContacts.has(m.contactId)) { toTeam++; continue; }
+        sent++;
+      }
+      cursor = String(r.json?.nextCursor ?? "");
+      pages++;
+    } while (cursor && pages < 30);
+    out.messages_sent = sent;
+    out.messages_detail = { fetched, total, outbound, automated, to_team: toTeam, pages };
+  } catch (e) { out.errors.push(`messages: ${String(e).slice(0, 80)}`); }
+
+  // 2. Calls — booked (created this week), held (happened this week, not no-show/cancelled), no-shows
+  try {
+    const owner = (team ?? []).find((m: any) => m.gets_financials);
+    const userId = owner?.ghl_user_id || cfg?.ghl_user_id;
+    if (!userId) out.errors.push("calls: no GHL user for the owner");
+    else {
+      const r = await ghl(token, `/calendars/events?locationId=${loc}&userId=${userId}&startTime=${fromMs - 60 * 86400000}&endTime=${toMs + 90 * 86400000}`, "GET", undefined, "2021-04-15");
+      if (!r.ok) out.errors.push(`calls ${r.status}`);
+      else {
+        const ev: any[] = (r.json?.events ?? []).filter((e: any) => !e.isBlockSlot && e.type !== "block" && !String(e.title ?? "").startsWith("Off — set by Archie"));
+        const st = (e: any) => String(e.appointmentStatus ?? e.status ?? "").toLowerCase();
+        out.calls_booked = ev.filter((e) => inWeek(e.dateAdded) && st(e) !== "cancelled").length;
+        const thisWeek = ev.filter((e) => inWeek(e.startTime) && Date.parse(e.startTime) <= nowMs);
+        out.calls_noshow = thisWeek.filter((e) => st(e) === "noshow" || st(e) === "no_show").length;
+        out.calls_held = thisWeek.filter((e) => !["cancelled", "noshow", "no_show", "invalid"].includes(st(e))).length;
+        const scheduled = out.calls_held + out.calls_noshow;
+        out.show_rate = scheduled ? Math.round((out.calls_held / scheduled) * 100) : null;
+      }
+    }
+  } catch (e) { out.errors.push(`calls: ${String(e).slice(0, 80)}`); }
+
+  // 3. Sales — deals marked won this week
+  try {
+    let page = 1, count = 0, value = 0; const names: string[] = [];
+    while (page <= 5) {
+      const r = await ghl(token, `/opportunities/search?location_id=${loc}&status=won&limit=100&page=${page}`, "GET", undefined, "2021-07-28");
+      if (!r.ok) { out.errors.push(`sales ${r.status}`); break; }
+      const opps: any[] = r.json?.opportunities ?? [];
+      for (const o of opps) if (inWeek(o.lastStatusChangeAt ?? o.updatedAt)) { count++; value += Number(o.monetaryValue ?? 0) || 0; names.push(String(o.name ?? "")); }
+      if (opps.length < 100) break;
+      page++;
+    }
+    out.sales_count = count; out.sales_value = Math.round(value); out.sales_names = names.slice(0, 10);
+  } catch (e) { out.errors.push(`sales: ${String(e).slice(0, 80)}`); }
+
+  // 4. Money — from the daily Stripe snapshots
+  try {
+    const { data: rows } = await supabase.from("daily_metrics").select("metric_date, mrr, mrr_new, revenue_mtd, cash_24h")
+      .eq("tenant_id", tid).gte("metric_date", addDays(weekStart, -1)).lt("metric_date", weekEnd).order("metric_date", { ascending: true });
+    const days = (rows ?? []).filter((r: any) => r.metric_date >= weekStart);
+    out.new_income = Math.round(days.reduce((a: number, r: any) => a + (Number(r.cash_24h) || 0), 0));
+    const withMrr = (rows ?? []).filter((r: any) => r.mrr !== null && r.mrr !== undefined);
+    const last = withMrr[withMrr.length - 1];
+    const before = withMrr.find((r: any) => r.metric_date < weekStart) ?? withMrr[0];
+    out.mrr = last ? Math.round(Number(last.mrr)) : null;
+    out.revenue_mtd = last && last.revenue_mtd !== null ? Math.round(Number(last.revenue_mtd)) : null;
+    // New MRR this week: growth in the month's new-MRR figure (resets on the 1st)
+    if (last && before) {
+      const sameMonth = String(last.metric_date).slice(0, 7) === String(before.metric_date).slice(0, 7);
+      const a = Number(before.mrr_new ?? 0) || 0, b = Number(last.mrr_new ?? 0) || 0;
+      out.new_mrr = Math.max(0, Math.round(sameMonth ? b - a : b));
+      out.mrr_change = Math.round(Number(last.mrr) - Number(before.mrr));
+    }
+  } catch (e) { out.errors.push(`money: ${String(e).slice(0, 80)}`); }
+
+  out.updated_at = new Date().toISOString();
+  if (!out.errors.length) delete out.errors;
+  const finished = Date.now() >= toMs;
+  await supabase.from("weekly_reports").upsert({ tenant_id: tid, week_start: weekStart, data: out, is_final: finished && !out.errors, updated_at: out.updated_at }, { onConflict: "tenant_id,week_start" });
+  return out;
+}
+
+// ===================== v4.1: Monday WhatsApp review =====================
+function reportMessage(r: any): string {
+  const n = r.numbers ?? {}, p = r.previous ?? {}, g = r.goals ?? {};
+  const f = (v: unknown) => (v === null || v === undefined ? "—" : Number(v).toLocaleString("en-GB"));
+  const money = (v: unknown) => (v === null || v === undefined ? "—" : `£${Math.round(Number(v)).toLocaleString("en-GB")}`);
+  const arrow = (a: unknown, b: unknown) => {
+    if (a === null || a === undefined || b === null || b === undefined) return "";
+    const d = Number(a) - Number(b);
+    return d > 0 ? ` (▲${d.toLocaleString("en-GB")})` : d < 0 ? ` (▼${Math.abs(d).toLocaleString("en-GB")})` : " (=)";
+  };
+  const range = `${new Date(`${r.week_start}T12:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" })}–${new Date(`${r.week_end}T12:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" })}`;
+  const pct = (a: unknown, b: unknown) => (Number(b) > 0 && a !== null && a !== undefined ? ` (${Math.round((Number(a) / Number(b)) * 100)}%)` : "");
+  // Biggest change vs the week before
+  const cands = [
+    ["calls booked", n.calls_booked, p.calls_booked], ["calls held", n.calls_held, p.calls_held],
+    ["sales", n.sales_count, p.sales_count], ["messages sent", n.messages_sent, p.messages_sent], ["new income", n.new_income, p.new_income],
+  ].filter(([, a, b]) => a !== null && a !== undefined && b !== null && b !== undefined) as [string, number, number][];
+  let biggest = "";
+  let best = 0;
+  for (const [label, a, b] of cands) {
+    const change = b ? (a - b) / b : a ? 1 : 0;
+    if (Math.abs(change) > Math.abs(best)) { best = change; biggest = `${label} ${change > 0 ? "up" : "down"} ${Math.round(Math.abs(change) * 100)}% on the week before`; }
+  }
+  return [
+    `📊 *Week in review* · ${range}`,
+    "",
+    `✉️ Messages sent: ${f(n.messages_sent)}${arrow(n.messages_sent, p.messages_sent)}`,
+    `📅 Calls booked: ${f(n.calls_booked)}${arrow(n.calls_booked, p.calls_booked)} · held ${f(n.calls_held)}${n.show_rate !== null && n.show_rate !== undefined ? ` · show rate ${n.show_rate}%` : ""}`,
+    `🤝 Sales: ${f(n.sales_count)}${arrow(n.sales_count, p.sales_count)} · ${money(n.sales_value)}`,
+    `💰 New income: ${money(n.new_income)}${arrow(n.new_income, p.new_income)}`,
+    `📈 Revenue this month: ${money(n.revenue_mtd)}${g.revenue_goal ? ` of ${money(g.revenue_goal)}${pct(n.revenue_mtd, g.revenue_goal)}` : ""}`,
+    `🔁 MRR: ${money(n.mrr)}${g.mrr_goal ? ` of ${money(g.mrr_goal)}${pct(n.mrr, g.mrr_goal)}` : ""} · new MRR ${money(n.new_mrr)}`,
+    "",
+    `🎯 ${r.pace?.line ?? ""}`.trim(),
+    biggest ? `👉 Biggest change: ${biggest}.` : "",
+    "",
+    `Ask me "how's this week looking?" anytime.`,
+  ].filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n").trim();
+}
+
+async function reportWeeklyRun(tid: string) {
+  const now = new Date().toISOString();
+  try {
+    const r: any = await weeklyReport(tid, { week: "last", refresh: "yes" });
+    await sendToTeam(tid, reportMessage(r), "", "report");
+  } catch (e) {
+    await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "report", trigger: "api", status: "failed", started_at: now, finished_at: now, error: String(e).slice(0, 200) });
+  }
 }
 
 // ===================== workflow side =====================
