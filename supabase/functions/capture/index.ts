@@ -1,4 +1,4 @@
-// capture v6.2 — everything the owner or team texts (or voice-notes) to Archie.
+// capture v6.5 — everything the owner or team texts (or voice-notes) to Archie.
 // Quick commands (instant, free) — as v5:
 // task: / <handle>: / capacity: / done: <text>
 // done 2  ·  done 1 3            — tick off today's numbered tasks
@@ -13,6 +13,10 @@
 //       Default: owner 'all', team 'wake' — so normal chat between the owner and the team is left alone.
 // v6.2: voice notes — if the message has no text, Archie finds the latest voice note from that person in GHL,
 //       transcribes it (OpenAI), and handles the words exactly like a typed message.
+// v6.3: voice notes found more ways (audio link in the text, attachments in the payload, the latest inbound message),
+//       clear logging of each step, and plain-English help.
+// v6.4: a message that's just the placeholder (e.g. "🔈 Voice Note") counts as a voice note.
+// v6.5: the audio's real format is read from the file itself (WhatsApp voice notes are often Ogg/Opus even when the link says .mp3).
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 const SECRET = Deno.env.get("ARCHIE_SECRET")!;
@@ -23,20 +27,23 @@ const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
 const TRANSCRIBE_MODEL = Deno.env.get("TRANSCRIBE_MODEL") ?? "gpt-4o-mini-transcribe";
 
 const HELP = [
-  "Just talk to me — e.g. \"done the Lhea one\", \"I'm off Friday\", \"write a post about systems\".",
+  "Just talk to me, or send a voice note — e.g. \"done the Lhea one\", \"I'm off Friday\", \"write a post about systems\".",
   "",
-  "Quick commands:",
-  "task: [thing] [must/high/bonus]",
-  "done 2 · move 3 fri · snooze 2",
-  "send 1 · skip 1",
-  "add P1 · wait P1 · sara P1 · drop P1 · inbox",
-  "capacity: 90 · capacity: tomorrow 0",
-  "👍 or 👎 [why] on the brief",
-  "quiet today · quiet till fri · quiet off",
+  "Shortcuts if you want them:",
+  "task: call Lewis tomorrow must — add a task (must/high/bonus)",
+  "sara: send Niamh the form — add a task for Sara",
+  "done 2 — tick off task 2 on today's list",
+  "move 3 fri · snooze 2 — push a task to Friday / tomorrow",
+  "send 1 · skip 1 — send or bin draft message 1 from your brief",
+  "inbox — things I spotted in your messages (P1, P2…)",
+  "add P1 · sara P1 · wait P1 · drop P1 — make it your task · give it to Sara · you're waiting on them · bin it",
+  "capacity: tomorrow 0 — how much time you've got",
+  "👍 or 👎 [why] — rate this morning's brief",
+  "quiet till fri · quiet off — only urgent messages until then",
 ].join("\n");
 
 Deno.serve(async (req) => {
-  console.log("capture v6.2 start");
+  console.log("capture v6.5 start");
   try {
     if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     const raw = await req.json();
@@ -49,13 +56,33 @@ Deno.serve(async (req) => {
 
     const { data: cfg } = await supabase.from("tenant_config").select("timezone, ghl_token, ghl_location_id").eq("tenant_id", tenant_id).single();
 
-    // Voice note: no text (or a placeholder) → find the audio in GHL and transcribe it
+    // Voice note → find the audio and transcribe it. It can arrive as: no text, a placeholder like "Voice message",
+    // an audio link in the text, attachments in the payload, or only in GHL's copy of the message.
     let heard = "";
-    if ((!text || /^\[?(audio|voice|attachment|media)\]?$/i.test(text)) && senderContact) {
-      const audioUrl = await latestAudio(cfg?.ghl_token || FALLBACK_TOKEN, cfg?.ghl_location_id, senderContact, str(p.message_id));
+    const AUDIO_URL = /(https?:\/\/\S+\.(?:ogg|oga|opus|mp3|m4a|aac|wav|webm|amr)(?:\?\S*)?)/i;
+    const payloadAtts: any[] = [p.attachments, raw.attachments, raw.message?.attachments, p.message?.attachments].flatMap((x) => {
+      if (!x) return [];
+      if (Array.isArray(x)) return x;
+      if (typeof x === "string") { try { const v = JSON.parse(x); return Array.isArray(v) ? v : [x]; } catch { return x.split(/[\s,]+/); } }
+      return [x];
+    });
+    const attUrl = payloadAtts.map((a) => (typeof a === "string" ? a : a?.url ?? "")).find((u) => /^https?:/.test(u) && (AUDIO_URL.test(u) || /audio|voice/i.test(u)));
+    const inText = text.match(AUDIO_URL)?.[1] ?? "";
+    const plain = text.replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim().toLowerCase();
+    // Only the placeholder itself counts ("Voice Note", "🔈 Voice Note", "[audio]") — not a sentence that mentions voice
+    const looksLikeVoice = !text || /^(?:(?:voice|audio)(?: (?:note|message|memo|clip|file))?|ptt|attachment|media)$/.test(plain) || !!inText || !!attUrl;
+    console.log("voice check:", JSON.stringify({ textLen: text.length, textStart: text.slice(0, 40), inText: !!inText, attUrl: !!attUrl, looksLikeVoice }));
+    if (looksLikeVoice) {
+      const audioUrl = attUrl || inText || (senderContact ? await latestAudio(cfg?.ghl_token || FALLBACK_TOKEN, cfg?.ghl_location_id, senderContact, str(p.message_id)) : null);
+      console.log("voice audio url found:", audioUrl ? audioUrl.slice(0, 80) : "none");
       if (audioUrl) {
         heard = await transcribe(audioUrl);
+        console.log("voice heard:", heard ? heard.slice(0, 80) : "(nothing)");
         if (heard) text = heard;
+      }
+      if (!heard) {
+        // Couldn't hear it — say so plainly rather than passing a placeholder to Archie
+        return j({ ok: true, reply: "🎙️ I couldn't hear that voice note — try again, or type it for now.", has_reply: "yes" });
       }
     }
     if (!text) return j({ ok: true, reply: "" });
@@ -263,7 +290,7 @@ let HEARD_PREFIX = "";
 function reply(text: string) { const out = text ? HEARD_PREFIX + text : text; console.log("reply:", out); return j({ ok: true, reply: out, has_reply: out ? "yes" : "no" }); }
 // The newest voice note/audio this contact sent (optionally the exact message), from GHL
 async function latestAudio(token: string, loc: string | undefined, contactId: string, messageId: string): Promise<string | null> {
-  const isAudio = (u: string) => /\.(ogg|oga|opus|mp3|m4a|aac|wav|webm|amr)(\?|$)/i.test(u) || /audio/i.test(u);
+  const isAudio = (u: string) => /\.(ogg|oga|opus|mp3|m4a|aac|wav|webm|amr)(\?|$)/i.test(u) || /audio|voice/i.test(u);
   if (messageId) {
     const m = await ghl(token, `/conversations/messages/${messageId}`, "GET");
     const atts: any[] = m.json?.message?.attachments ?? m.json?.attachments ?? [];
@@ -276,9 +303,11 @@ async function latestAudio(token: string, loc: string | undefined, contactId: st
   if (!conv?.id) return null;
   const ms = await ghl(token, `/conversations/${conv.id}/messages?limit=5`, "GET");
   const list: any[] = ms.json?.messages?.messages ?? ms.json?.messages ?? [];
-  const since = Date.now() - 10 * 60 * 1000;
+  const since = Date.now() - 15 * 60 * 1000;
+  console.log("latestAudio: checking", Array.isArray(list) ? list.length : 0, "recent messages");
   for (const m of Array.isArray(list) ? list : []) {
     if (String(m.direction ?? "").toLowerCase() !== "inbound") continue;
+    console.log("latestAudio msg:", JSON.stringify({ type: m.messageType ?? m.type, contentType: m.contentType, atts: (m.attachments ?? []).length, body: String(m.body ?? "").slice(0, 40) }));
     if (m.dateAdded && Date.parse(m.dateAdded) < since) continue;
     const atts: any[] = m.attachments ?? [];
     const hit = atts.map((a) => (typeof a === "string" ? a : a?.url ?? "")).find((u) => u && isAudio(u));
@@ -289,20 +318,35 @@ async function latestAudio(token: string, loc: string | undefined, contactId: st
 }
 
 // Speech to text (OpenAI). Returns "" if it can't.
+// The file type is taken from the audio's own first bytes, not the link — WhatsApp notes are usually Ogg/Opus
+// even when the link ends in .mp3, and a wrong name makes the transcription fail.
 async function transcribe(url: string): Promise<string> {
   if (!OPENAI_KEY) { console.log("no OPENAI_API_KEY — can't transcribe"); return ""; }
   try {
     const a = await fetch(url);
-    if (!a.ok) return "";
-    const blob = await a.blob();
-    if (blob.size > 24 * 1024 * 1024) return "";
-    const ext = (url.match(/\.(ogg|oga|opus|mp3|m4a|aac|wav|webm)(\?|$)/i)?.[1] ?? "ogg").toLowerCase().replace("opus", "ogg").replace("oga", "ogg");
+    if (!a.ok) { console.log("audio download failed", a.status); return ""; }
+    const buf = new Uint8Array(await a.arrayBuffer());
+    const head = Array.from(buf.slice(0, 12));
+    const ascii = String.fromCharCode(...head.map((b) => (b >= 32 && b < 127 ? b : 46)));
+    console.log("audio file:", JSON.stringify({ bytes: buf.length, contentType: a.headers.get("content-type"), starts: ascii }));
+    if (buf.length < 500) { console.log("audio too small — probably not audio"); return ""; }
+    if (buf.length > 24 * 1024 * 1024) return "";
+    let ext = "mp3", mime = "audio/mpeg";
+    if (ascii.startsWith("OggS")) { ext = "ogg"; mime = "audio/ogg"; }
+    else if (ascii.startsWith("RIFF")) { ext = "wav"; mime = "audio/wav"; }
+    else if (ascii.slice(4, 8) === "ftyp") { ext = "m4a"; mime = "audio/mp4"; }
+    else if (head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) { ext = "webm"; mime = "audio/webm"; }
+    else if (ascii.startsWith("#!AMR")) { ext = "amr"; mime = "audio/amr"; }
+    else if (ascii.startsWith("ID3") || (head[0] === 0xff && (head[1] & 0xe0) === 0xe0)) { ext = "mp3"; mime = "audio/mpeg"; }
+    else if (ascii.startsWith("<") || ascii.startsWith("{")) { console.log("got a web page, not audio"); return ""; }
+    if (ext === "amr") { console.log("AMR audio isn't supported for transcription"); return ""; }
     const form = new FormData();
-    form.append("file", new File([blob], `voice.${ext}`, { type: blob.type || `audio/${ext}` }));
+    form.append("file", new File([buf], `voice.${ext}`, { type: mime }));
     form.append("model", TRANSCRIBE_MODEL);
     form.append("language", "en");
     const r = await fetch("https://api.openai.com/v1/audio/transcriptions", { method: "POST", headers: { Authorization: `Bearer ${OPENAI_KEY}` }, body: form });
     const js: any = await r.json().catch(() => null);
+    if (!r.ok) console.log("transcription error", r.status, JSON.stringify(js).slice(0, 200));
     return String(js?.text ?? "").trim();
   } catch (e) { console.log("transcribe failed", String(e)); return ""; }
 }

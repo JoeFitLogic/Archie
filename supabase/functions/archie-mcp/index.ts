@@ -1,8 +1,11 @@
-// archie-mcp v1.2 — Archie as an MCP server for GHL Managed Agents and Ask AI.
+// archie-mcp v1.4 — Archie as an MCP server for GHL Managed Agents and Ask AI.
 // URL: /functions/v1/archie-mcp/<tenant access_token>
 // The token picks the tenant. Nothing from any other tenant is ever returned.
 // v1.1: archie_notify — scheduled tasks and agents can message the owner (WhatsApp/SMS) and log to the Archie feed.
 // v1.2: Talk to Archie toolbox — move tasks, capacity, quiet mode, day off (blocks the calendar), back on, calls on a day, run a skill, remember.
+// v1.3: add/complete just act (no confirm step) — Talk to Archie's rules decide; tasks due today go straight onto today's list.
+// v1.4: drafts and proposals by voice — list/send/skip drafts, list proposals, add/give/wait/drop a proposal.
+// v1.4.1: only the latest batch of drafts counts (older unsent ones are ignored), so numbers match today's brief.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 const FALLBACK_TOKEN = Deno.env.get("GHL_AGENCY_API_KEY") ?? "";
@@ -30,7 +33,7 @@ const TOOLS = [
   },
   {
     name: "archie_add_task",
-    description: "Add a task. Confirm the details with the user before calling.",
+    description: "Add a task when someone asks for one. Just do it — no need to confirm. Title is just the job; set tier, effort_minutes and due_date (YYYY-MM-DD, today's date for 'today') from what they said.",
     inputSchema: {
       type: "object",
       properties: {
@@ -45,7 +48,7 @@ const TOOLS = [
   },
   {
     name: "archie_complete_task",
-    description: "Mark a task done, by its number on today's list (rank) or by part of its title. Confirm with the user before calling.",
+    description: "Mark a task done, by its number on today's list (rank) or by part of its title. Just do it when they say it's done; if more than one task matches, ask which.",
     inputSchema: {
       type: "object",
       properties: {
@@ -71,6 +74,43 @@ const TOOLS = [
         urgent: { type: "boolean", description: "True only if it can't wait — sends even when the owner is in quiet mode." },
       },
       required: ["title", "message"],
+    },
+  },
+  {
+    name: "archie_drafts",
+    description: "Message drafts waiting to be sent (the 'Ready to send' list in the brief), numbered.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "archie_send_draft",
+    description: "Send one waiting draft to the customer — only when the owner has clearly said to send it (e.g. 'send the Jase message', 'send 1'). Find it by number or the person's name.",
+    inputSchema: { type: "object", properties: { rank: { type: "number" }, name: { type: "string", description: "The person the draft is for." } } },
+  },
+  {
+    name: "archie_skip_draft",
+    description: "Bin a waiting draft without sending it. Find it by number or the person's name.",
+    inputSchema: { type: "object", properties: { rank: { type: "number" }, name: { type: "string" } } },
+  },
+  {
+    name: "archie_proposals",
+    description: "Things Archie spotted in messages that might need doing, numbered P1, P2… (the 'From your messages' list).",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "archie_proposal",
+    description: "Decide on a proposal. action: add (task for the person talking), give (task for someone else — set to_handle, e.g. sara), wait (waiting on someone else), drop (bin it). Find it by P number or part of its title.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        rank: { type: "number", description: "The P number (P2 → 2)." },
+        title: { type: "string" },
+        action: { type: "string", enum: ["add", "give", "wait", "drop"] },
+        to_handle: { type: "string", description: "Who it's for when action is give." },
+        tier: { type: "string", enum: ["must", "high", "bonus"] },
+        waiting_for: { type: "string", description: "Who you're waiting on, for wait." },
+        handle: { type: "string" },
+      },
+      required: ["action"],
     },
   },
   {
@@ -165,7 +205,7 @@ async function handle(tenant: any, msg: any) {
     return ok(id, {
       protocolVersion: msg?.params?.protocolVersion ?? "2025-03-26",
       capabilities: { tools: {} },
-      serverInfo: { name: "archie", version: "1.2.0" },
+      serverInfo: { name: "archie", version: "1.4.0" },
     });
   }
   if (method === "ping") return ok(id, {});
@@ -243,6 +283,7 @@ async function run(tenant: any, name: string, a: any): Promise<string> {
     const { error } = await supabase.from("tasks").insert({
       tenant_id: tid, title: title.slice(0, 200), detail: "Added via Archie MCP", tier, kind: "shallow",
       effort_minutes: effort, status: "open", owner: h, source: "mcp", source_ref: `mcp:${crypto.randomUUID()}`, due_date: due,
+      ...(due === today ? { today: true, today_set_on: today } : {}),
     });
     if (error) throw new Error(error.message);
     return `Added: ${title} — ${tier}, ${effort} min, for ${h}${due ? `, due ${due}` : ""}`;
@@ -331,6 +372,89 @@ async function run(tenant: any, name: string, a: any): Promise<string> {
     }
     throw new Error("rank or title required");
   };
+
+  // Drafts: only the newest batch (the one in today's brief) — older unsent drafts are ignored
+  const latestDrafts = async () => {
+    const { data: newest } = await supabase.from("message_drafts").select("created_on").eq("tenant_id", tid).eq("status", "pending").order("created_on", { ascending: false }).limit(1).maybeSingle();
+    if (!newest?.created_on) return [] as any[];
+    const { data } = await supabase.from("message_drafts").select("*").eq("tenant_id", tid).eq("status", "pending").eq("created_on", newest.created_on).order("rank", { ascending: true }).limit(10);
+    return data ?? [];
+  };
+
+  if (name === "archie_drafts") {
+    const data = await latestDrafts();
+    if (!data.length) return "No drafts waiting.";
+    return data.map((d: any) => `${d.rank}. ${d.name} (${d.channel}): ${String(d.body ?? "").slice(0, 160)}`).join("\n");
+  }
+
+  if (name === "archie_send_draft" || name === "archie_skip_draft") {
+    const byRank = a.rank !== undefined && a.rank !== null && a.rank !== "";
+    const batch = await latestDrafts();
+    let hits: any[];
+    if (byRank) hits = batch.filter((d: any) => Number(d.rank) === Number(a.rank));
+    else if (String(a.name ?? "").trim()) hits = batch.filter((d: any) => String(d.name ?? "").toLowerCase().includes(String(a.name).trim().toLowerCase()));
+    else throw new Error("rank or name required");
+    if (!hits?.length) return "No matching draft waiting.";
+    if (hits.length > 1 && !byRank) return `More than one draft matches: ${hits.map((d: any) => `${d.rank}. ${d.name}`).join(" / ")}. Ask which one.`;
+    const d: any = hits[0];
+    if (name === "archie_skip_draft") {
+      await supabase.from("message_drafts").update({ status: "dismissed" }).eq("id", d.id);
+      return `Binned draft ${d.rank} to ${d.name}.`;
+    }
+    const type = ({ WA: "WhatsApp", SMS: "SMS", IG: "IG", FB: "FB", Chat: "Live_Chat" } as Record<string, string>)[d.channel];
+    if (!type) return `Draft ${d.rank} is for ${d.channel}, which Archie can't send — send it from GHL: ${d.body}`;
+    const r = await ghl(ghlToken, "/conversations/messages", "POST", { type, contactId: d.contact_id, message: d.body });
+    if (!r.ok) return `Couldn't send draft ${d.rank} (${r.status}). Send it from GHL: ${d.body}`;
+    await supabase.from("message_drafts").update({ status: "sent", sent_at: new Date().toISOString() }).eq("id", d.id);
+    return `Sent to ${d.name} on ${type}.`;
+  }
+
+  if (name === "archie_proposals") {
+    // Same numbering as the brief and inbox: keep existing P numbers; number any new ones after them
+    const { data: props } = await supabase.from("tasks").select("id, title, proposal_rank, created_at").eq("tenant_id", tid).eq("status", "proposed").order("created_at", { ascending: false }).limit(10);
+    if (!props?.length) return "Nothing new from your messages.";
+    let next = Math.max(0, ...props.map((p: any) => Number(p.proposal_rank) || 0));
+    for (const p of props as any[]) {
+      if (!p.proposal_rank) { next++; p.proposal_rank = next; await supabase.from("tasks").update({ proposal_rank: next }).eq("id", p.id); }
+    }
+    return (props as any[]).sort((x, y) => x.proposal_rank - y.proposal_rank).map((p) => `P${p.proposal_rank} ${p.title}`).join("\n");
+  }
+
+  if (name === "archie_proposal") {
+    const h = resolve(a.handle);
+    let hits: any[] = [];
+    if (a.rank !== undefined && a.rank !== null && a.rank !== "") {
+      const { data } = await supabase.from("tasks").select("id, title, client_id").eq("tenant_id", tid).eq("status", "proposed").eq("proposal_rank", Number(a.rank));
+      hits = data ?? [];
+    } else if (String(a.title ?? "").trim()) {
+      const { data } = await supabase.from("tasks").select("id, title, client_id").eq("tenant_id", tid).eq("status", "proposed").ilike("title", `%${String(a.title).trim()}%`).limit(3);
+      hits = data ?? [];
+    } else throw new Error("rank or title required");
+    if (!hits.length) return "No matching proposal — the list may have changed. Ask 'what did you spot in my messages?' to see the current list.";
+    if (hits.length > 1) return `More than one proposal matches: ${hits.map((x) => `"${x.title}"`).join(" / ")}. Ask which one.`;
+    const p = hits[0];
+    const now = new Date().toISOString();
+    const action = String(a.action ?? "").toLowerCase();
+    if (action === "drop") {
+      await supabase.from("tasks").update({ status: "dismissed", dismissed_reason: "dropped via Archie", proposal_rank: null }).eq("id", p.id);
+      return `Dropped: ${p.title}`;
+    }
+    if (action === "wait") {
+      let who = String(a.waiting_for ?? "").trim();
+      if (!who && p.client_id) { const { data: cl } = await supabase.from("clients").select("name").eq("id", p.client_id).maybeSingle(); who = cl?.name ?? ""; }
+      await supabase.from("tasks").update({ status: "waiting", owner: h, waiting_for: who || "them", waiting_since: today, accepted_by: h, accepted_at: now, proposal_rank: null }).eq("id", p.id);
+      return `Waiting on ${who || "them"}: ${p.title}. I'll nudge after 5 days.`;
+    }
+    if (action === "add" || action === "give") {
+      if (action === "give" && !String(a.to_handle ?? "").trim()) throw new Error("to_handle required for give");
+      const owner = action === "give" ? resolve(a.to_handle) : h;
+      const patch: Record<string, unknown> = { status: "open", owner, accepted_by: h, accepted_at: now, proposal_rank: null };
+      if (["must", "high", "bonus"].includes(String(a.tier ?? ""))) patch.tier = a.tier;
+      await supabase.from("tasks").update(patch).eq("id", p.id);
+      return `Added${owner !== h ? ` for ${owner}` : ""}: ${p.title}`;
+    }
+    throw new Error("action must be add, give, wait or drop");
+  }
 
   if (name === "archie_move_task") {
     const h = resolve(a.handle);

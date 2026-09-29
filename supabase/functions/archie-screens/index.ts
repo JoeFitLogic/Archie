@@ -1,4 +1,4 @@
-// archie-screens v3.1 — data and actions for the Archie AI Studio pages.
+// archie-screens v3.4 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -22,6 +22,11 @@
 // v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
 // v2.8: media_videos looks through the whole library (all pages and folders), newest first, grouped by month.
 // v2.9: brain dump splits one line into several tasks at commas/semicolons when it's clearly a list ("A must 45m, B 15m, C").
+// v3.4: talk knows today's drafts and proposals — "send the Jase message", "bin the second one", "give P2 to Sara". Team members can't send drafts.
+// v3.3: talk — the backend does the actions. The agent answers with REPLY + ACTIONS_JSON; Archie runs each action
+//       through the Archie toolbox itself, then (if anything ran) asks the agent for the final reply from the real results.
+//       No more "Done" without anything happening.
+// v3.2: talk logs which tools the agent actually used (toolsFired), so a "Done" without a tool call is visible.
 // v3.1: Fathom calls — fathom_calls lists recent recorded calls; a skill run can carry a call (its summary and transcript go to the agent).
 // v3.0: talk — Talk to Archie. A WhatsApp message goes to the Archie Assistant agent with today's context and a session per person per day; the reply goes back on WhatsApp.
 // The token picks the tenant. Nothing from any other tenant is ever returned or changed.
@@ -1573,18 +1578,56 @@ async function agentsHealth(c: any) {
 
 // ===================== v3.0: Talk to Archie =====================
 const TALK_RULES = [
-  "You are Archie, talking to a member of this business on WhatsApp. Reply like a sharp, friendly colleague: short, plain, UK English, no markdown headings, no bullet walls.",
-  "Use the Archie tools to actually do things. Always pass handle for the person you're talking to when a tool takes one.",
-  "Internal actions — ticking tasks off, moving tasks, adding tasks, capacity, quiet mode, days off — just do them, then say in one line what you did. Don't ask 'are you sure?' for these.",
-  "Anything that goes to a customer or involves money (sending a message to a client, a quote, an invoice) — draft it and ask 'Send it?' before anything is sent. You cannot send client messages yourself.",
-  "'I'm off Friday' / 'block Thursday 2 till 4' / 'I'm away Mon–Wed' → use archie_day_off with real dates worked out from today's date. If calls are already booked, list them and offer to draft rebook messages.",
-  "For numbers use archie_numbers — never guess a figure.",
-  "For content or sales writing use archie_run_skill with the right skill and a clear input, then give the result.",
-  "'Remember that…' → archie_remember.",
-  "Numbers on today's list and P numbers refer to the lists in the context below.",
-  "If something is unclear, ask one short question. Never invent tasks, names, numbers or results.",
-  "Keep replies under about 8 lines unless you're returning written content.",
+  "You are Archie, talking to a member of this business on WhatsApp. Reply like a sharp, friendly colleague: short, plain UK English, no markdown headings, no bullet walls, under about 8 lines unless returning written content.",
+  "DO NOT call any tools or apps yourself. Instead, list the actions Archie should take in ACTIONS_JSON — Archie's backend runs them and tells you the results.",
+  "Output format, exactly:",
+  "REPLY: <what to say to them now — if you listed actions, keep this to a short holding line like 'On it.'>",
+  'ACTIONS_JSON: [{"tool":"archie_add_task","args":{"title":"…","tier":"bonus","effort_minutes":15,"due_date":"YYYY-MM-DD"}}]',
+  "Use ACTIONS_JSON: [] when nothing needs doing (just chat or a question you can answer from the CONTEXT).",
+  "Rules for actions:",
+  "- Internal actions (add/complete/move tasks, capacity, quiet mode, day off, back on) — just do them, no 'are you sure?'.",
+  "- Tasks: the title is just the job; set tier (must/high/bonus), effort_minutes and due_date from what they said; 'today' = today's date from the CONTEXT. Never put the tier or time in the title.",
+  "- 'I'm off Friday' / 'block Thursday 2 till 4' / 'away Mon–Wed' → archie_day_off with real dates. 'Actually I'm working Friday' → archie_back_on.",
+  "- Numbers or money → archie_numbers (never guess). Calls on a day → archie_calls. Writing (posts, reels, carousels, stories, proposals, objection replies, SOPs, briefs) → archie_run_skill.",
+  "- 'Remember that…' → archie_remember.",
+  "- Drafts waiting (the 'Ready to send' list): 'send the Jase message' / 'send 1' → archie_send_draft (rank or name). 'Bin that' / 'skip 2' → archie_skip_draft. 'What drafts are waiting?' → archie_drafts. Sending a waiting draft IS allowed when the owner clearly says send — that's their yes.",
+  "- Proposals (P1, P2… things spotted in messages): 'add P1' / 'add the Niamh one' → archie_proposal action add. 'Give P2 to Sara' → action give, to_handle sara. 'I'm waiting on Seve for that' → action wait, waiting_for. 'Drop P3' / 'bin that one' → action drop. 'What did you spot?' → archie_proposals.",
+  "- Anything new that goes to a customer (not an existing draft): never send it. Draft it in REPLY and ask 'Send it?'.",
+  "- Team members (not the owner) never get money figures.",
+  "- If it's unclear which task they mean, ask one short question and use ACTIONS_JSON: [].",
+  "- Never invent tasks, names, numbers, dates or results.",
 ].join("\n");
+
+const TALK_FOLLOWUP = [
+  "RESULTS from Archie's backend are below — this is what actually happened.",
+  "Now write the final message to send them. Base it only on these results: say what was done in one line each; if something failed, say so plainly and what to do instead; if a result contains written content (a post, script, proposal), give it to them.",
+  "Output format, exactly:",
+  "REPLY: <the message>",
+  "ACTIONS_JSON: []",
+].join("\n");
+
+// Run one Archie tool through the Archie MCP, the same toolbox Ask AI and the agents use
+async function runArchieTool(accessToken: string, name: string, args: Record<string, unknown>): Promise<{ ok: boolean; text: string }> {
+  try {
+    const r = await fetch(`${SUPA_URL}/functions/v1/archie-mcp/${accessToken}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+    });
+    const js: any = await r.json().catch(() => null);
+    if (js?.error) return { ok: false, text: String(js.error.message ?? "error") };
+    const text = (js?.result?.content ?? []).map((x: any) => x?.text ?? "").join("\n").trim();
+    return { ok: !js?.result?.isError, text: text || "(no result)" };
+  } catch (e) { return { ok: false, text: String(e) }; }
+}
+
+function parseTalk(text: string) {
+  const t = String(text ?? "");
+  const part = extractArray(t, "ACTIONS_JSON:");
+  const actions = safeArray(part.json).filter((x: any) => x && typeof x.tool === "string" && x.tool.startsWith("archie_")).slice(0, 6);
+  let reply = part.start >= 0 ? t.slice(0, part.start) : t;
+  reply = reply.replace(/^\s*REPLY:\s*/i, "").trim();
+  return { reply, actions };
+}
 
 async function talk(tid: string, p: any) {
   const contactId = String(p.contact_id ?? "").trim();
@@ -1614,6 +1657,15 @@ async function talk(tid: string, p: any) {
     if (!agentId) return log("failed", "", "couldn't find the Archie Assistant agent — check it's published");
 
     // What's in front of them
+    // Today's drafts (newest batch) — owner only
+    let drafts: any[] = [];
+    if (member.gets_financials) {
+      const { data: newest } = await supabase.from("message_drafts").select("created_on").eq("tenant_id", tid).eq("status", "pending").order("created_on", { ascending: false }).limit(1).maybeSingle();
+      if (newest?.created_on) {
+        const { data: dr } = await supabase.from("message_drafts").select("rank, name, channel, body").eq("tenant_id", tid).eq("status", "pending").eq("created_on", newest.created_on).order("rank", { ascending: true }).limit(10);
+        drafts = dr ?? [];
+      }
+    }
     const [{ data: list }, { data: proposals }, { data: memories }] = await Promise.all([
       supabase.from("tasks").select("title, tier, effort_minutes, today_rank").eq("tenant_id", tid).eq("owner", member.handle).eq("today", true).in("status", ["open", "doing"]).order("today_rank", { ascending: true }),
       member.gets_financials
@@ -1626,33 +1678,72 @@ async function talk(tid: string, p: any) {
       `You're talking to ${member.name ?? member.handle} (handle: ${member.handle}${member.gets_financials ? ", the owner" : ", a team member — no money figures"}).`,
       `Their list today: ${(list ?? []).length ? (list ?? []).map((x: any) => `#${x.today_rank ?? "-"} ${x.title} [${x.tier}, ${x.effort_minutes ?? 30}m]`).join("; ") : "empty"}.`,
       (proposals ?? []).length ? `Proposals waiting (as numbered in the brief/inbox): ${(proposals ?? []).map((x: any) => `P${x.proposal_rank} ${x.title}`).join("; ")}. To add/wait/drop one, tell them to text e.g. "add P1" — or do it for them by adding the task with archie_add_task.` : "",
+      drafts.length ? `Drafts waiting to send: ${drafts.map((d: any) => `${d.rank}. ${d.name} (${d.channel}): "${String(d.body ?? "").slice(0, 80)}…"`).join("; ")}.` : "",
       (memories ?? []).length ? `Things to remember: ${(memories ?? []).map((m: any) => m.fact).join(" | ")}` : "",
     ].filter(Boolean).join("\n");
 
     // One conversation per person per day
     const { data: sess } = await supabase.from("talk_sessions").select("session_id").eq("tenant_id", tid).eq("handle", member.handle).eq("day", today).maybeSingle();
-    const message = `${TALK_RULES}\n\nCONTEXT\n${ctx}\n\nTHEIR MESSAGE\n${text}`.slice(0, 9900);
-    const body: Record<string, unknown> = { locationId: loc, message, contactId };
-    if (sess?.session_id) body.sessionId = sess.session_id;
-
-    let res = await agentExecute(token, agentId, body, `talk-${tid}-${Date.now()}`);
-    if (res.status === 429 || res.status >= 500) {
-      await new Promise((ok) => setTimeout(ok, Math.min(20, Number(res.retryAfter) || 8) * 1000));
-      res = await agentExecute(token, agentId, body, `talk-${tid}-${Date.now()}`);
-    }
+    const { data: tok } = await supabase.from("tenants").select("access_token").eq("id", tid).single();
+    const accessToken = String(tok?.access_token ?? "");
     const channel = String(cfg?.brief_channel ?? "sms").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS";
     const reply = async (msg: string) => ghl(token, "/conversations/messages", "POST", { type: channel, contactId, message: msg.slice(0, 3500) }, "2021-04-15");
-    if (!res.ok || res.json?.success === false) {
+
+    let sessionId = sess?.session_id ?? "";
+    const ask = async (message: string) => {
+      const body: Record<string, unknown> = { locationId: loc, message: message.slice(0, 9900), contactId };
+      if (sessionId) body.sessionId = sessionId;
+      let res = await agentExecute(token, agentId, body, `talk-${tid}-${Date.now()}`);
+      if (res.status === 429 || res.status >= 500) {
+        await new Promise((ok) => setTimeout(ok, Math.min(20, Number(res.retryAfter) || 8) * 1000));
+        res = await agentExecute(token, agentId, body, `talk-${tid}-${Date.now()}`);
+      }
+      const sid = String(res.json?.sessionId ?? "");
+      if (sid && sid !== sessionId) {
+        sessionId = sid;
+        await supabase.from("talk_sessions").upsert({ tenant_id: tid, handle: member.handle, day: today, session_id: sid }, { onConflict: "tenant_id,handle,day" });
+      }
+      return res;
+    };
+
+    // Round 1: what do they want?
+    const first = await ask(`${TALK_RULES}\n\nCONTEXT\n${ctx}\n\nTHEIR MESSAGE\n${text}`);
+    if (!first.ok || first.json?.success === false) {
       await reply("Sorry — I couldn't process that just now. Try again in a minute, or use a quick command like done 1.");
-      return log("failed", "", `Archie Assistant error ${res.status}: ${String(res.text).slice(0, 200)}`);
+      return log("failed", "", `Archie Assistant error ${first.status}: ${String(first.text).slice(0, 200)}`);
     }
-    const newSession = String(res.json?.sessionId ?? "");
-    if (newSession && newSession !== sess?.session_id) {
-      await supabase.from("talk_sessions").upsert({ tenant_id: tid, handle: member.handle, day: today, session_id: newSession }, { onConflict: "tenant_id,handle,day" });
+    const plan = parseTalk(tidy(clean(String(first.json?.finalText ?? ""))));
+
+    // Nothing to do → send the reply as it is
+    if (!plan.actions.length || !accessToken) {
+      const answer = plan.reply.replace(/^#+\s*/gm, "").trim() || "👍";
+      const sent = await reply(answer);
+      return log(sent.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${answer.slice(0, 80)} | actions: none`, sent.ok ? null : `reply not sent (${sent.status})`);
     }
-    const answer = tidy(clean(String(res.json?.finalText ?? ""))).replace(/^#+\s*/gm, "").trim() || "Done.";
+
+    // Round 2: Archie does the actions itself
+    const results: string[] = [];
+    const ran: string[] = [];
+    for (const act of plan.actions) {
+      const args: Record<string, unknown> = { ...(act.args ?? {}) };
+      // Default to the person talking; the owner can still give work to someone else by naming them
+      const NO_HANDLE = ["archie_numbers", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals"];
+      if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
+      const OWNER_ONLY = ["archie_numbers", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
+      if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
+      const r = await runArchieTool(accessToken, act.tool, args);
+      ran.push(`${act.tool}${r.ok ? "" : " (failed)"}`);
+      results.push(`${act.tool} ${JSON.stringify(args)} → ${r.ok ? "OK" : "FAILED"}: ${r.text.slice(0, act.tool === "archie_run_skill" ? 6000 : 800)}`);
+    }
+
+    // Round 3: the final reply, from what actually happened
+    const second = await ask(`${TALK_FOLLOWUP}\n\nTHEIR MESSAGE\n${text}\n\nRESULTS\n${results.join("\n\n")}`);
+    let answer = "";
+    if (second.ok && second.json?.success !== false) answer = parseTalk(tidy(clean(String(second.json?.finalText ?? "")))).reply;
+    if (!answer) answer = results.map((x) => x.replace(/^archie_\w+ \{[^}]*\} → /, "")).join("\n");
+    answer = answer.replace(/^#+\s*/gm, "").trim();
     const sent = await reply(answer);
-    await log(sent.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${answer.slice(0, 80)}`, sent.ok ? null : `reply not sent (${sent.status})`);
+    await log(sent.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${answer.slice(0, 80)} | actions: ${ran.join(", ")}`, sent.ok ? null : `reply not sent (${sent.status})`);
   } catch (e) {
     await log("failed", "", `talk crashed: ${String(e).slice(0, 200)}`);
   }
