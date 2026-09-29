@@ -1,4 +1,4 @@
-// archie-screens v3.4 — data and actions for the Archie AI Studio pages.
+// archie-screens v3.5 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -22,6 +22,7 @@
 // v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
 // v2.8: media_videos looks through the whole library (all pages and folders), newest first, grouped by month.
 // v2.9: brain dump splits one line into several tasks at commas/semicolons when it's clearly a list ("A must 45m, B 15m, C").
+// v3.5: voice-first brief — the command lines at the bottom are replaced by one "just reply or send a voice note" line.
 // v3.4: talk knows today's drafts and proposals — "send the Jase message", "bin the second one", "give P2 to Sara". Team members can't send drafts.
 // v3.3: talk — the backend does the actions. The agent answers with REPLY + ACTIONS_JSON; Archie runs each action
 //       through the Archie toolbox itself, then (if anything ran) asks the agent for the final reply from the real results.
@@ -1149,6 +1150,7 @@ async function briefRun(tid: string, p: any) {
       "Execute your instructions now. Use ONLY the data below. It is today's data. Ignore anything from earlier runs or conversations.",
       `The header date must be exactly: ${expected}.`,
       "Capacity comes from the OWNER CAPACITY line. The Today list is exactly the LINEUP lines, with their numbers. Never add a task that is not listed there. At risk comes only from the AT_RISK line.",
+      "Voice-first footer (overrides your instructions): do NOT include the command lines 'add P1 · wait P1 · drop P1', 'Reply SEND 1 · SKIP 1' or 'done 1 · move 2 fri · 👍/👎'. Keep the numbers on the lists (1, 2… and P1, P2…) so people can refer to them. End the OWNER brief with exactly one line: 🎙️ Just reply or send a voice note — e.g. \"done the first one\", \"send Jase's message\", \"give P2 to Sara\". End the TEAM brief with exactly one line: 🎙️ Just reply starting with \"Archie\" — e.g. \"Archie, done the first one\".",
       "Return only the two briefs in the marker format.",
       "", "BRIEF CONTEXT:", ctx.slice(0, 6000),
       "", "FINANCIALS OUTPUT:", moneyTxt,

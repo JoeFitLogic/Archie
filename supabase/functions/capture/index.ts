@@ -1,4 +1,4 @@
-// capture v6.5 — everything the owner or team texts (or voice-notes) to Archie.
+// capture v6.6 — everything the owner or team texts (or voice-notes) to Archie.
 // Quick commands (instant, free) — as v5:
 // task: / <handle>: / capacity: / done: <text>
 // done 2  ·  done 1 3            — tick off today's numbered tasks
@@ -16,6 +16,7 @@
 // v6.3: voice notes found more ways (audio link in the text, attachments in the payload, the latest inbound message),
 //       clear logging of each step, and plain-English help.
 // v6.4: a message that's just the placeholder (e.g. "🔈 Voice Note") counts as a voice note.
+// v6.6: forgiving shortcuts ("1 done", "done with 2", "tick 3", "finished 2") and a voice-first help.
 // v6.5: the audio's real format is read from the file itself (WhatsApp voice notes are often Ogg/Opus even when the link says .mp3).
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -27,23 +28,19 @@ const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
 const TRANSCRIBE_MODEL = Deno.env.get("TRANSCRIBE_MODEL") ?? "gpt-4o-mini-transcribe";
 
 const HELP = [
-  "Just talk to me, or send a voice note — e.g. \"done the Lhea one\", \"I'm off Friday\", \"write a post about systems\".",
+  "🎙️ Just talk to me — type or send a voice note. For example:",
+  "• \"what's on today?\"",
+  "• \"done the Lhea one\" · \"push the content one to Friday\"",
+  "• \"send Jase's message\" · \"bin that draft\"",
+  "• \"what did you spot in my messages?\" · \"give P2 to Sara\"",
+  "• \"I'm off Friday\" · \"how's money this month?\"",
+  "• \"write me a post about systems over hustle\"",
   "",
-  "Shortcuts if you want them:",
-  "task: call Lewis tomorrow must — add a task (must/high/bonus)",
-  "sara: send Niamh the form — add a task for Sara",
-  "done 2 — tick off task 2 on today's list",
-  "move 3 fri · snooze 2 — push a task to Friday / tomorrow",
-  "send 1 · skip 1 — send or bin draft message 1 from your brief",
-  "inbox — things I spotted in your messages (P1, P2…)",
-  "add P1 · sara P1 · wait P1 · drop P1 — make it your task · give it to Sara · you're waiting on them · bin it",
-  "capacity: tomorrow 0 — how much time you've got",
-  "👍 or 👎 [why] — rate this morning's brief",
-  "quiet till fri · quiet off — only urgent messages until then",
+  "Quick shortcuts still work if you like them: done 1 · move 2 fri · send 1 · add P1 · quiet till fri · 👍 / 👎",
 ].join("\n");
 
 Deno.serve(async (req) => {
-  console.log("capture v6.5 start");
+  console.log("capture v6.6 start");
   try {
     if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     const raw = await req.json();
@@ -149,7 +146,9 @@ Deno.serve(async (req) => {
     }
 
     // ---------- done 2 / done 1 3 ----------
-    const dn = lower.match(/^(?:done|did|✅)\s+([\d\s,&and]+)$/);
+    const DONE_WORDS = "done|did|✅|✔️|tick|ticked|finished|complete|completed";
+    const dn = lower.match(new RegExp(`^(?:${DONE_WORDS})(?:\\s+with)?(?:\\s+(?:number|no\\.?|#))?\\s*([\\d\\s,&and]+)$`, "u"))
+      ?? lower.match(new RegExp(`^(?:number\\s+|#)?([\\d\\s,&and]+?)\\s+(?:is\\s+)?(?:${DONE_WORDS})$`, "u"));
     if (dn) {
       const ranks = (dn[1].match(/\d+/g) ?? []).map(Number);
       const { data: hits } = await supabase.from("tasks").select("id, title, today_rank").eq("tenant_id", tenant_id).eq("owner", me.handle).eq("today", true).in("today_rank", ranks);
