@@ -1,4 +1,4 @@
-// archie-screens v4.7.2 — data and actions for the Archie AI Studio pages.
+// archie-screens v4.8 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -22,6 +22,8 @@
 // v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
 // v2.8: media_videos looks through the whole library (all pages and folders), newest first, grouped by month.
 // v2.9: brain dump splits one line into several tasks at commas/semicolons when it's clearly a list ("A must 45m, B 15m, C").
+// v4.8: Archie spots email gaps — no nurture for new leads, lots of quiet leads, past clients with no win-back — and offers
+//       the right sequence in 'where to focus'; 'do N' writes it and asks to save it to GHL.
 // v4.7.2: skills know the owner's first name and the booking links (lead / client), so emails and posts don't need [CHECK] for them.
 // v4.7.1: saving works even when the JSON block is missing or broken — reads the emails from the written sequence instead.
 // v4.7: email sequences → GHL — save_sequence turns each email in a sequence into its own GHL email template (never sent);
@@ -1835,7 +1837,8 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
           answer = d.ok ? `${d.text.replace(/\nAsk if they want them sent.*$/s, "")}\n\nSend them? (or "bin 2", "send 1")` : d.text;
         } else if (item.do === "skill" && item.skill) {
           const r = await runArchieTool(accessToken, "archie_run_skill", { skill: item.skill, input: item.input || item.title });
-          answer = r.text;
+          answer = r.text.split("EMAILS_JSON:")[0].trim();
+          if (item.skill === "email-sequence" && r.ok) answer += `\n\nSave them to GHL as templates? (say "save that sequence to GHL")`;
         } else {
           const r = await runArchieTool(accessToken, "archie_add_task", { title: item.title, tier: "high", handle: member.handle });
           answer = r.ok ? `Added to your list: ${item.title}` : r.text;
@@ -2277,6 +2280,11 @@ async function getFocus(tid: string, refresh: boolean) {
   const early = items.filter((x) => /conversation|lead|follow/i.test(String(x.stage)) && x.days >= 5).map((x) => x.name).slice(0, 8);
   const noShows = [...(thisW.numbers?.noshow_names ?? []), ...(lastW.numbers?.noshow_names ?? [])].slice(0, 6);
   const { data: memories } = await supabase.from("memories").select("fact").eq("tenant_id", tid).order("created_at", { ascending: false }).limit(10);
+  // Email gaps: which sequences exist (saved to GHL), how many quiet leads and past clients there are
+  const { data: seqRuns } = await supabase.from("screen_runs").select("input, saved").eq("tenant_id", tid).eq("skill", "email-sequence").eq("status", "done").order("created_at", { ascending: false }).limit(30);
+  const savedTypes = new Set((seqRuns ?? []).filter((r: any) => r.saved).map((r: any) => (String(r.input ?? "").match(/type:\s*([a-z-]+)/i)?.[1] ?? "").toLowerCase()).filter(Boolean));
+  const quietLong = items.filter((x) => /conversation|lead|follow/i.test(String(x.stage)) && x.days >= 30).length;
+  const { count: pastClients } = await supabase.from("clients").select("id", { count: "exact", head: true }).eq("tenant_id", tid).neq("status", "active");
 
   const facts = [
     `Goals: £${cfg?.mrr_target ?? "?"} MRR, £${cfg?.revenue_target ?? "?"} revenue a month, by ${cfg?.goal_date ?? "?"}. Average sale £${cfg?.avg_sale_value ?? "?"}.`,
@@ -2287,6 +2295,7 @@ async function getFocus(tid: string, refresh: boolean) {
     `Proposals waiting 3+ days: ${proposals.join(", ") || "none"}`,
     `Early-stage leads quiet 5+ days: ${early.join(", ") || "none"}`,
     `No-shows (this week and last): ${noShows.join(", ") || "none"}`,
+    `Email sequences saved to GHL: ${savedTypes.size ? [...savedTypes].join(", ") : "none"}. Leads quiet 30+ days: ${quietLong}. Past clients: ${pastClients ?? 0}. Open leads in early stages: ${early.length}.`,
     (memories ?? []).length ? `Things to remember: ${(memories ?? []).map((m: any) => m.fact).join(" | ")}` : "",
   ].filter(Boolean).join("\n");
 
@@ -2295,6 +2304,7 @@ async function getFocus(tid: string, refresh: boolean) {
     "Use real names from the FACTS. Never invent people, numbers or results. Prefer actions Archie can start:",
     "- do: \"draft\" — Archie drafts a short message to each named person (names from the FACTS; purpose: follow up on proposal / re-open quiet lead / rebook no-show / ask for referral / check in).",
     "- do: \"skill\" — Archie runs one of: write-post, create-reel-script, create-carousel, stories, reply-to-objection, email-sequence (skill + input).",
+    "Email gaps: if there's no nurture sequence and new leads keep coming in, or lots of leads are quiet 30+ days with no re-engagement sequence, or there are past clients and no win-back sequence, one of the 3 actions can be to write that sequence: do \"skill\", skill \"email-sequence\", input starting \"Type: Nurture.\" (or Re-engagement, Win-back, Onboarding) then who it's for. Only suggest a type that isn't already saved.",
     "- do: \"task\" — something only the owner can do (title).",
     "Return ONLY a JSON array of 3 objects, no other text:",
     '[{"title":"short action, under 60 chars","why":"one line tied to the numbers","do":"draft|skill|task","names":["…"],"purpose":"…","skill":"…","input":"…"}]',
@@ -2317,6 +2327,8 @@ async function getFocus(tid: string, refresh: boolean) {
     if (proposals.length) focus.push({ title: `Chase ${proposals.length} open proposal${proposals.length > 1 ? "s" : ""}`, why: "Proposals waiting 3+ days are the quickest sales this week.", do: "draft", names: proposals, purpose: "follow up on proposal", skill: "", input: "" });
     if (early.length) focus.push({ title: `Re-open ${early.length} quiet lead${early.length > 1 ? "s" : ""}`, why: "More conversations → more calls booked.", do: "draft", names: early, purpose: "re-open quiet lead", skill: "", input: "" });
     if (noShows.length) focus.push({ title: `Rebook ${noShows.length} no-show${noShows.length > 1 ? "s" : ""}`, why: "They already wanted a call.", do: "draft", names: noShows, purpose: "rebook no-show", skill: "", input: "" });
+    if (focus.length < 3 && !savedTypes.has("nurture") && early.length) focus.push({ title: "Set up a nurture email sequence for new leads", why: "New leads get nothing after the first reply — a 5-email nurture keeps them warm until they book.", do: "skill", names: [], purpose: "", skill: "email-sequence", input: "Type: Nurture. For new leads who messaged but haven't booked a call yet." });
+    if (focus.length < 3 && !savedTypes.has("re-engagement") && quietLong >= 5) focus.push({ title: `Re-engage ${quietLong} leads gone quiet`, why: "They were interested once — a short 3-email check-in brings some back.", do: "skill", names: [], purpose: "", skill: "email-sequence", input: "Type: Re-engagement. For leads who went quiet 30+ days ago." });
     if (focus.length < 3) focus.push({ title: "Post one piece that invites a call", why: "Top up leads for next week.", do: "skill", names: [], purpose: "", skill: "write-post", input: "Purpose: Sell. A post that invites people to book a call." });
     focus = focus.slice(0, 3);
   }
