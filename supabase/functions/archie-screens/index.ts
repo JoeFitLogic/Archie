@@ -1,4 +1,4 @@
-// archie-screens v4.5 — data and actions for the Archie AI Studio pages.
+// archie-screens v4.6.1 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -22,6 +22,9 @@
 // v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
 // v2.8: media_videos looks through the whole library (all pages and folders), newest first, grouped by month.
 // v2.9: brain dump splits one line into several tasks at commas/semicolons when it's clearly a list ("A must 45m, B 15m, C").
+// v4.6.1: events on anyone's Personal calendar never count as calls in the weekly report.
+// v4.6: recurring tasks — repeats (daily, weekdays, weekly, fortnightly, monthly) put on the right list each morning,
+//       never doubled, skipped on days off, missed ones noted once; managed from Forge and by voice.
 // v4.5: booking by voice — calls onto GHL calendars (confirmed first) and personal events straight into your calendar.
 // v4.4.1: 'do 1/2/3' runs exactly that focus item (no guessing), and follow-up drafts know each person's pipeline stage
 //         (only mention a proposal if they're at a proposal stage).
@@ -92,6 +95,7 @@ Deno.serve(async (req) => {
       if (action === "plan_context") return j(await planContext(tenant_id));
       if (action === "plan_save") return j(await planSave(tenant_id, p));
       if (action === "talk") { startInBackground(talk(tenant_id, p)); return j({ ok: true, started: true }); }
+      if (action === "recurring_run") { const r = await recurringRun(tenant_id); return j({ ok: true, ...r }); }
       if (action === "report_nightly_run") { startInBackground(weeklyReport(tenant_id, { week: "this", refresh: "yes" })); return j({ ok: true, started: true }); }
       if (action === "report_weekly_run") { startInBackground(reportWeeklyRun(tenant_id)); return j({ ok: true, started: true }); }
       if (action === "evening_run") { startInBackground(eveningRun(tenant_id)); return j({ ok: true, started: true }); }
@@ -144,6 +148,10 @@ Deno.serve(async (req) => {
       case "fathom_calls": return j(await fathomCalls(c));
       case "report": return j(await weeklyReport(c.tid, p));
       case "goals": return j(await getGoals(c.tid));
+      case "recurring_list": return j(await recurringList(c.tid, p.handle ? c.resolve(p.handle) : ""));
+      case "recurring_add": return j(await recurringAdd(c.tid, { ...p, handle: c.resolve(p.handle) }));
+      case "recurring_update": return j(await recurringUpdate(c.tid, p));
+      case "recurring_delete": { await supabase.from("recurring_tasks").delete().eq("tenant_id", c.tid).eq("id", String(p.id ?? "")); return j({ ok: true }); }
       case "focus": return j(await getFocus(c.tid, String(p.refresh ?? "") === "yes"));
       case "set_goals": return j(await setGoals(c.tid, p));
       case "talk_page": {
@@ -1519,6 +1527,7 @@ async function dispatch(_p: any) {
       { job: "morning", due: days(cfg.sched_morning_days, "0,1,2,3,4,5,6").includes(now.weekday) && dueNow(now.minutes, hhmm(cfg.sched_morning, "04:30")), key: now.date, action: "morning_run", body: { referral_link: String(cfg.referral_link ?? "") } },
       { job: "evening", due: days(cfg.sched_evening_days, "0,1,2,3,4").includes(now.weekday) && dueNow(now.minutes, hhmm(cfg.sched_evening, "20:00")), key: now.date, action: "evening_run" },
       { job: "plan", due: now.weekday === Number(cfg.sched_plan_day ?? 6) && dueNow(now.minutes, hhmm(cfg.sched_plan, "08:00")), key: now.date, action: "plan_run" },
+      { job: "recurring", due: dueNow(now.minutes, hhmm(cfg.sched_recurring, "04:00")), key: now.date, action: "recurring_run" },
       { job: "report_nightly", due: dueNow(now.minutes, hhmm(cfg.sched_report_nightly, "23:30")), key: now.date, action: "report_nightly_run" },
       { job: "report_weekly", due: now.weekday === Number(cfg.sched_report_day ?? 1) && dueNow(now.minutes, hhmm(cfg.sched_report, "07:00")), key: now.date, action: "report_weekly_run" },
       { job: "monthly", due: now.day === Number(cfg.sched_monthly_day ?? 1) && dueNow(now.minutes, hhmm(cfg.sched_monthly, "09:00")), key: now.date.slice(0, 7), action: "monthly_run", body: { referral_link: String(cfg.referral_link ?? "") } },
@@ -1656,6 +1665,7 @@ const TALK_RULES = [
   "- Where to focus: 'what should I focus on?' → read the FOCUS list in the CONTEXT. 'Do 1' / 'do the first one' → carry out that focus item: if it says draft → archie_draft_followups with its names and purpose (then show the drafts and ask 'Send them?'); if it says skill → archie_run_skill; if it says task → archie_add_task.",
   "- Numbers or money → archie_numbers (never guess). Calls on a day → archie_calls. Writing (posts, reels, carousels, stories, proposals, objection replies, SOPs, briefs) → archie_run_skill.",
   "- 'Remember that…' → archie_remember.",
+  "- Repeating tasks: 'every Monday, content filming, 2 hours, must' / 'every weekday Sara checks the support inbox' / 'on the 1st of every month, send invoices' → archie_add_recurring {title, pattern: daily|weekdays|weekly|fortnightly|monthly|monthly_last, days: [\"mon\",…] for weekly/fortnightly/monthly_last, month_day for monthly, tier, effort_minutes, handle}. 'What's on repeat?' → archie_recurring. 'Pause the Monday filming for 2 weeks' → archie_pause_recurring {title, until: YYYY-MM-DD}; 'stop the Friday check-in one' → archie_pause_recurring {title, stop: true}; 'restart it' → {title, resume: true}.",
   "- Booking calls: 'book Martin a diagnostic call Thursday at 2' → ask 'Book Martin, diagnostic call, Thursday 1 Oct at 14:00? Yes?' and only on yes → archie_book_call {name, calendar, date, time}. No time given ('get Steph in for a support call next week') → archie_free_slots {calendar, date} and offer 3 times; then book the one they pick (after a yes). 'What calendars have I got?' → archie_calendars.",
   "- Personal events: 'coffee with Dave Thursday 10 till 11' / 'dentist Friday 3pm' → archie_personal_event {title, date, from, to} straight away (no confirm; default one hour). Title in their words, e.g. 'Coffee with Dave'.",
   "- Pipeline: 'add Ross McKenley to follow up' / 'move Martin to proposal sent' → archie_move_deal with name + stage (moves and adds just happen). 'Move Jase to abandoned' / 'Jase is lost' / 'mark Martin won' → archie_move_deal with status — ask 'Mark Jase as abandoned? Yes?' first (won also starts onboarding), and only run it after they say yes. Include the reason if they gave one.",
@@ -1836,12 +1846,18 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
       const OWNER_ONLY = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_draft_followups"
+      const r = act.tool === "archie_add_recurring"
+        ? await (async () => { const x: any = await recurringAdd(tid, { ...args, handle: args.handle || member.handle }); return { ok: !!x.ok, text: x.ok ? x.text : String(x.error) }; })()
+        : act.tool === "archie_recurring"
+        ? await (async () => { const x: any = await recurringList(tid, member.gets_financials ? String(args.handle ?? "") : member.handle); return { ok: true, text: x.text }; })()
+        : act.tool === "archie_pause_recurring"
+        ? await (async () => { const x: any = await recurringPauseByTitle(tid, member.gets_financials ? String(args.handle ?? "") : member.handle, args); return { ok: !!x.ok, text: x.text }; })()
+        : act.tool === "archie_draft_followups"
         ? await (async () => { const d: any = await draftFollowups(tid, args); return { ok: !!d.ok, text: d.text }; })()
         : act.tool === "archie_set_goals"
         ? await (async () => { const g: any = await setGoals(tid, args); return { ok: !!g.ok, text: g.ok ? `Goals now: ${g.summary}` : String(g.error) }; })()
@@ -2032,7 +2048,7 @@ async function weekNumbers(tid: string, cfg: any, weekStart: string, current: bo
   const inWeek = (v: unknown) => { const t = Date.parse(String(v ?? "")); return !isNaN(t) && t >= fromMs && t < toMs; };
   const out: any = { week_start: weekStart, errors: [] as string[] };
 
-  const { data: team } = await supabase.from("team_members").select("handle, ghl_contact_id, ghl_user_id, gets_financials").eq("tenant_id", tid);
+  const { data: team } = await supabase.from("team_members").select("handle, ghl_contact_id, ghl_user_id, gets_financials, personal_calendar_id").eq("tenant_id", tid);
   const teamContacts = new Set((team ?? []).map((m: any) => m.ghl_contact_id).filter(Boolean));
 
   // 1. Messages sent — outbound, by a person or Archie on their behalf (not workflows/campaigns), not to the team
@@ -2069,7 +2085,8 @@ async function weekNumbers(tid: string, cfg: any, weekStart: string, current: bo
       const r = await ghl(token, `/calendars/events?locationId=${loc}&userId=${userId}&startTime=${fromMs - 60 * 86400000}&endTime=${toMs + 90 * 86400000}`, "GET", undefined, "2021-04-15");
       if (!r.ok) out.errors.push(`calls ${r.status}`);
       else {
-        const ev: any[] = (r.json?.events ?? []).filter((e: any) => !e.isBlockSlot && e.type !== "block" && !String(e.title ?? "").startsWith("Off — set by Archie"));
+        const personal = new Set((team ?? []).map((m: any) => m.personal_calendar_id).filter(Boolean));
+        const ev: any[] = (r.json?.events ?? []).filter((e: any) => !e.isBlockSlot && e.type !== "block" && !String(e.title ?? "").startsWith("Off — set by Archie") && !personal.has(e.calendarId));
         const st = (e: any) => String(e.appointmentStatus ?? e.status ?? "").toLowerCase();
         out.calls_booked = ev.filter((e) => inWeek(e.dateAdded) && st(e) !== "cancelled").length;
         const thisWeek = ev.filter((e) => inWeek(e.startTime) && Date.parse(e.startTime) <= nowMs);
@@ -2339,6 +2356,156 @@ async function draftFollowups(tid: string, p: any) {
     if (error) rank--; else made.push(`${rank}. ${f.name}: ${body.slice(0, 90)}…`);
   }
   return { ok: true, text: `Drafted ${made.length} message${made.length === 1 ? "" : "s"} (${purpose}):\n${made.join("\n")}${missing.length ? `\nCouldn't find: ${missing.join(", ")}` : ""}\nAsk if they want them sent (archie_send_draft for each number).` };
+}
+
+// ===================== v4.6: recurring tasks =====================
+const DOW = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+function dowOf(date: string) { return (new Date(`${date}T12:00:00Z`).getUTCDay() + 6) % 7; } // Mon=0
+function daysArr(v: unknown): number[] {
+  const raw = Array.isArray(v) ? v : String(v ?? "").split(/[\s,]+/);
+  return [...new Set(raw.map((x: any) => {
+    if (typeof x === "number") return x;
+    const k = String(x).toLowerCase().slice(0, 3);
+    const i = DOW.indexOf(k);
+    return i >= 0 ? i : Number.isFinite(Number(x)) ? Number(x) : -1;
+  }).filter((n: number) => n >= 0 && n <= 6))].sort();
+}
+function repeatMatches(r: any, date: string): boolean {
+  const dow = dowOf(date);
+  const days: number[] = Array.isArray(r.days) ? r.days : [];
+  const dom = Number(date.slice(8, 10));
+  const lastDom = new Date(Date.UTC(Number(date.slice(0, 4)), Number(date.slice(5, 7)), 0)).getUTCDate();
+  switch (r.pattern) {
+    case "daily": return true;
+    case "weekdays": return dow < 5;
+    case "weekly": return days.includes(dow);
+    case "fortnightly": {
+      if (!days.includes(dow)) return false;
+      const anchor = String(r.anchor_date ?? date);
+      const weeks = Math.round((Date.parse(mondayOf(date)) - Date.parse(mondayOf(anchor))) / (7 * 86400000));
+      return weeks % 2 === 0;
+    }
+    case "monthly": { const md = Number(r.month_day) || 1; return dom === Math.min(md, lastDom); }
+    case "monthly_last": return days.includes(dow) && dom + 7 > lastDom;
+    default: return false;
+  }
+}
+function describeRepeat(r: any): string {
+  const names = (Array.isArray(r.days) ? r.days : []).map((d: number) => ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][d]).join(", ");
+  switch (r.pattern) {
+    case "daily": return "every day";
+    case "weekdays": return "every weekday";
+    case "weekly": return `every ${names}`;
+    case "fortnightly": return `every other ${names}`;
+    case "monthly": { const n = Number(r.month_day) || 1; const suf = n % 10 === 1 && n !== 11 ? "st" : n % 10 === 2 && n !== 12 ? "nd" : n % 10 === 3 && n !== 13 ? "rd" : "th"; return `on the ${n}${suf} of each month`; }
+    case "monthly_last": return `last ${names} of each month`;
+    default: return r.pattern;
+  }
+}
+
+async function recurringAdd(tid: string, p: any) {
+  const title = String(p.title ?? "").trim().slice(0, 200);
+  if (!title) return { ok: false, error: "title required" };
+  let pattern = String(p.pattern ?? "").toLowerCase().replace(/[\s-]/g, "_");
+  if (pattern === "every_weekday" || pattern === "weekday") pattern = "weekdays";
+  if (pattern === "biweekly" || pattern === "every_other_week") pattern = "fortnightly";
+  if (!["daily", "weekdays", "weekly", "fortnightly", "monthly", "monthly_last"].includes(pattern)) return { ok: false, error: "pattern must be daily, weekdays, weekly, fortnightly, monthly or monthly_last" };
+  const days = daysArr(p.days);
+  if (["weekly", "fortnightly", "monthly_last"].includes(pattern) && !days.length) return { ok: false, error: "which day(s)?" };
+  const monthDay = Math.min(31, Math.max(1, Number(p.month_day) || 1));
+  const { data: cfg } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", tid).maybeSingle();
+  const today = localDate(Date.now(), cfg?.timezone || "Europe/London");
+  const tier = ["must", "high", "bonus"].includes(String(p.tier)) ? String(p.tier) : "high";
+  const effort = Number(p.effort_minutes) > 0 ? Math.max(15, Math.round(Number(p.effort_minutes) / 15) * 15) : 30;
+  const handle = String(p.handle ?? "").toLowerCase() || null;
+  const { data: row, error } = await supabase.from("recurring_tasks").insert({
+    tenant_id: tid, owner: handle, title, detail: String(p.detail ?? "").slice(0, 1000), tier, effort_minutes: effort,
+    pattern, days, month_day: pattern === "monthly" ? monthDay : null, anchor_date: today, active: true,
+  }).select("*").single();
+  if (error) return { ok: false, error: error.message };
+  // If it's due today, put today's one on the list now
+  let now = "";
+  if (repeatMatches(row, today)) { const n = await createRecurringInstance(tid, row, today); if (n) now = " Today's one is on the list."; }
+  return { ok: true, item: row, text: `On repeat: ${title} — ${describeRepeat(row)}${handle ? ` (${handle})` : ""}, ${tier}, ${effort}m.${now}` };
+}
+
+async function createRecurringInstance(tid: string, r: any, date: string): Promise<boolean> {
+  const ref = `rec:${r.id}:${date}`;
+  const { data: exists } = await supabase.from("tasks").select("id").eq("tenant_id", tid).eq("source_ref", ref).maybeSingle();
+  if (exists) return false;
+  const { error } = await supabase.from("tasks").insert({
+    tenant_id: tid, title: r.title, detail: r.detail || null, tier: r.tier, kind: "shallow", effort_minutes: r.effort_minutes,
+    status: "open", owner: r.owner, source: "recurring", source_ref: ref, due_date: date, today: true, today_set_on: date,
+    accepted_by: "recurring", accepted_at: new Date().toISOString(),
+  });
+  if (error) return false;
+  await supabase.from("recurring_tasks").update({ last_created: date }).eq("id", r.id);
+  return true;
+}
+
+async function recurringRun(tid: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", tid).maybeSingle();
+  const today = localDate(Date.now(), cfg?.timezone || "Europe/London");
+  const { data: reps } = await supabase.from("recurring_tasks").select("*").eq("tenant_id", tid).eq("active", true);
+  const { data: offs } = await supabase.from("archie_blocks").select("handle").eq("tenant_id", tid).eq("day", today);
+  const offToday = new Set((offs ?? []).map((o: any) => String(o.handle)));
+  let created = 0, missed = 0;
+  // Last time's unfinished repeats: marked missed (not carried over, so they never pile up)
+  const { data: old } = await supabase.from("tasks").select("id, title, owner").eq("tenant_id", tid).eq("source", "recurring").eq("status", "open").lt("due_date", today);
+  for (const t of old ?? []) {
+    await supabase.from("tasks").update({ status: "dismissed", dismissed_reason: "missed (recurring)" }).eq("id", t.id);
+    missed++;
+  }
+  for (const r of reps ?? []) {
+    if (r.paused_until && String(r.paused_until) >= today) continue;
+    if (r.owner && offToday.has(String(r.owner))) continue;
+    if (!repeatMatches(r, today)) continue;
+    if (await createRecurringInstance(tid, r, today)) created++;
+  }
+  return { created, missed };
+}
+
+async function recurringList(tid: string, handle: string) {
+  let q = supabase.from("recurring_tasks").select("*").eq("tenant_id", tid).order("created_at", { ascending: true });
+  if (handle) q = q.eq("owner", handle);
+  const { data } = await q;
+  const items = (data ?? []).map((r: any) => ({ ...r, describe: describeRepeat(r), state: !r.active ? "stopped" : r.paused_until ? `paused until ${r.paused_until}` : "on" }));
+  const text = items.length ? items.map((r: any, i: number) => `${i + 1}. ${r.title} — ${r.describe}${r.owner ? ` (${r.owner})` : ""} · ${r.state}`).join("\n") : "Nothing on repeat yet.";
+  return { ok: true, items, text };
+}
+
+async function recurringUpdate(tid: string, p: any) {
+  const id = String(p.id ?? "");
+  if (!id) return { ok: false, error: "id required" };
+  const patch: Record<string, unknown> = {};
+  if (p.title !== undefined) patch.title = String(p.title).slice(0, 200);
+  if (p.tier !== undefined && ["must", "high", "bonus"].includes(String(p.tier))) patch.tier = p.tier;
+  if (p.effort_minutes !== undefined && Number(p.effort_minutes) > 0) patch.effort_minutes = Math.max(15, Math.round(Number(p.effort_minutes) / 15) * 15);
+  if (p.owner !== undefined) patch.owner = String(p.owner || "").toLowerCase() || null;
+  if (p.pattern !== undefined) patch.pattern = String(p.pattern);
+  if (p.days !== undefined) patch.days = daysArr(p.days);
+  if (p.month_day !== undefined) patch.month_day = Number(p.month_day) || null;
+  if (p.active !== undefined) patch.active = p.active === true || String(p.active) === "true";
+  if (p.paused_until !== undefined) patch.paused_until = /^\d{4}-\d{2}-\d{2}$/.test(String(p.paused_until)) ? p.paused_until : null;
+  const { error } = await supabase.from("recurring_tasks").update(patch).eq("tenant_id", tid).eq("id", id);
+  return error ? { ok: false, error: error.message } : { ok: true };
+}
+
+async function recurringPauseByTitle(tid: string, handle: string, p: any) {
+  const want = String(p.title ?? "").trim().toLowerCase();
+  let q = supabase.from("recurring_tasks").select("*").eq("tenant_id", tid);
+  if (handle) q = q.eq("owner", handle);
+  const { data } = await q;
+  const hits = (data ?? []).filter((r: any) => !want || String(r.title).toLowerCase().includes(want) || want.split(/\s+/).every((w) => `${r.title} ${describeRepeat(r)}`.toLowerCase().includes(w)));
+  if (!hits.length) return { ok: false, text: `Nothing on repeat matches "${p.title}".` };
+  if (hits.length > 1) return { ok: false, text: `More than one matches: ${hits.map((r: any) => `${r.title} (${describeRepeat(r)})`).join(" / ")}. Ask which one.` };
+  const r = hits[0];
+  if (p.stop === true || String(p.stop) === "true") { await supabase.from("recurring_tasks").update({ active: false }).eq("id", r.id); return { ok: true, text: `Stopped: ${r.title} (${describeRepeat(r)}).` }; }
+  if (p.resume === true || String(p.resume) === "true") { await supabase.from("recurring_tasks").update({ active: true, paused_until: null }).eq("id", r.id); return { ok: true, text: `Back on: ${r.title} (${describeRepeat(r)}).` }; }
+  const until = /^\d{4}-\d{2}-\d{2}$/.test(String(p.until ?? "")) ? String(p.until) : null;
+  if (!until) return { ok: false, text: "Until when? (a date)" };
+  await supabase.from("recurring_tasks").update({ paused_until: until }).eq("id", r.id);
+  return { ok: true, text: `Paused until ${until}: ${r.title} (${describeRepeat(r)}).` };
 }
 
 // ===================== workflow side =====================

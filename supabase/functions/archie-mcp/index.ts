@@ -1,10 +1,12 @@
-// archie-mcp v1.7 — Archie as an MCP server for GHL Managed Agents and Ask AI.
+// archie-mcp v1.8 — Archie as an MCP server for GHL Managed Agents and Ask AI.
 // URL: /functions/v1/archie-mcp/<tenant access_token>
 // The token picks the tenant. Nothing from any other tenant is ever returned.
 // v1.1: archie_notify — scheduled tasks and agents can message the owner (WhatsApp/SMS) and log to the Archie feed.
 // v1.2: Talk to Archie toolbox — move tasks, capacity, quiet mode, day off (blocks the calendar), back on, calls on a day, run a skill, remember.
 // v1.3: add/complete just act (no confirm step) — Talk to Archie's rules decide; tasks due today go straight onto today's list.
 // v1.4: drafts and proposals by voice — list/send/skip drafts, list proposals, add/give/wait/drop a proposal.
+// v1.8: personal events go on each person's Personal calendar as a real event (so Google sync picks them up);
+//       personal events are never counted as calls, clashes or rebooks.
 // v1.7: booking by voice — archie_calendars, archie_free_slots, archie_book_call (a contact onto a GHL calendar),
 //       archie_personal_event (coffee, dentist… onto your own calendar, synced to Google).
 // v1.6: pipeline by voice — archie_move_deal adds someone to a stage, moves a deal between stages, or marks it won / lost / abandoned.
@@ -280,7 +282,7 @@ async function handle(tenant: any, msg: any) {
     return ok(id, {
       protocolVersion: msg?.params?.protocolVersion ?? "2025-03-26",
       capabilities: { tools: {} },
-      serverInfo: { name: "archie", version: "1.7.0" },
+      serverInfo: { name: "archie", version: "1.8.0" },
     });
   }
   if (method === "ping") return ok(id, {});
@@ -792,13 +794,24 @@ async function run(tenant: any, name: string, a: any): Promise<string> {
     const userId = await ghlUserId(tid, ghlToken, cfg, h);
     if (!userId) return `No GHL user set for ${h} — add their ghl_user_id in team_members.`;
     const title = String(a.title ?? "Personal").trim().slice(0, 100) || "Personal";
+    const when = new Date(`${a.date}T12:00:00Z`).toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", timeZone: "UTC" });
+    // A real event on their Personal calendar syncs to Google; a block slot doesn't
+    const { data: me } = await supabase.from("team_members").select("personal_calendar_id, ghl_contact_id").eq("tenant_id", tid).eq("handle", h).maybeSingle();
+    if (me?.personal_calendar_id && me?.ghl_contact_id) {
+      const ap = await ghl(ghlToken, "/calendars/events/appointments", "POST", {
+        calendarId: me.personal_calendar_id, locationId: cfg?.ghl_location_id, contactId: me.ghl_contact_id, assignedUserId: userId,
+        startTime: isoAt(String(a.date), from, tz), endTime: isoAt(String(a.date), to, tz),
+        title, appointmentStatus: "confirmed", toNotify: false, ignoreFreeSlotValidation: true, ignoreDateRange: true,
+      });
+      if (ap.ok) return `In your calendar: ${title} — ${when}, ${from}–${to}. It'll show in Google too, and that time's blocked for bookings.`;
+      // fall through to a block slot if the calendar rejected it
+    }
     const r = await ghl(ghlToken, "/calendars/events/block-slots", "POST", {
       locationId: cfg?.ghl_location_id, assignedUserId: userId, title,
       startTime: isoAt(String(a.date), from, tz), endTime: isoAt(String(a.date), to, tz),
     });
     if (!r.ok) return `Couldn't add it (${r.status}): ${r.text.slice(0, 160)}`;
-    const when = new Date(`${a.date}T12:00:00Z`).toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", timeZone: "UTC" });
-    return `In your calendar: ${title} — ${when}, ${from}–${to}. That time's blocked for bookings.`;
+    return `In your calendar: ${title} — ${when}, ${from}–${to}. That time's blocked for bookings${me?.personal_calendar_id ? "" : " (it won't show in Google until a Personal calendar is set up)"}.`;
   }
 
   if (name === "archie_back_on") {
@@ -870,8 +883,10 @@ async function callsOn(tid: string, token: string, cfg: any, h: string, date: st
   const r = await ghl(token, `/calendars/events?locationId=${cfg?.ghl_location_id}&userId=${userId}&startTime=${start}&endTime=${end}`, "GET");
   if (!r.ok) return { items: [], error: `${r.status}` };
   const events: any[] = r.json?.events ?? [];
+  const { data: pcs } = await supabase.from("team_members").select("personal_calendar_id").eq("tenant_id", tid);
+  const personal = new Set((pcs ?? []).map((x: any) => x.personal_calendar_id).filter(Boolean));
   const items = events
-    .filter((e) => String(e.appointmentStatus ?? e.status ?? "").toLowerCase() !== "cancelled" && !String(e.title ?? "").startsWith("Off — set by Archie") && !e.isBlockSlot && e.type !== "block")
+    .filter((e) => String(e.appointmentStatus ?? e.status ?? "").toLowerCase() !== "cancelled" && !String(e.title ?? "").startsWith("Off — set by Archie") && !e.isBlockSlot && e.type !== "block" && !personal.has(e.calendarId))
     .map((e) => ({ time: new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(e.startTime)), title: String(e.title ?? "Appointment"), contactId: String(e.contactId ?? e.contact_id ?? ""), date }))
     .sort((x, y) => x.time.localeCompare(y.time));
   return { items, error: null };
