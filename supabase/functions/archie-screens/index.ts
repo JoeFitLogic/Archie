@@ -1,4 +1,4 @@
-// archie-screens v4.6.1 — data and actions for the Archie AI Studio pages.
+// archie-screens v4.7.2 — data and actions for the Archie AI Studio pages.
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -22,6 +22,10 @@
 // v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
 // v2.8: media_videos looks through the whole library (all pages and folders), newest first, grouped by month.
 // v2.9: brain dump splits one line into several tasks at commas/semicolons when it's clearly a list ("A must 45m, B 15m, C").
+// v4.7.2: skills know the owner's first name and the booking links (lead / client), so emails and posts don't need [CHECK] for them.
+// v4.7.1: saving works even when the JSON block is missing or broken — reads the emails from the written sequence instead.
+// v4.7: email sequences → GHL — save_sequence turns each email in a sequence into its own GHL email template (never sent);
+//       the EMAILS_JSON block is hidden from the pages; 'save that sequence to GHL' by voice.
 // v4.6.1: events on anyone's Personal calendar never count as calls in the weekly report.
 // v4.6: recurring tasks — repeats (daily, weekdays, weekly, fortnightly, monthly) put on the right list each morning,
 //       never doubled, skipped on days off, missed ones noted once; managed from Forge and by voice.
@@ -148,6 +152,7 @@ Deno.serve(async (req) => {
       case "fathom_calls": return j(await fathomCalls(c));
       case "report": return j(await weeklyReport(c.tid, p));
       case "goals": return j(await getGoals(c.tid));
+      case "save_sequence": return j(await saveSequence(c.tid, p));
       case "recurring_list": return j(await recurringList(c.tid, p.handle ? c.resolve(p.handle) : ""));
       case "recurring_add": return j(await recurringAdd(c.tid, { ...p, handle: c.resolve(p.handle) }));
       case "recurring_update": return j(await recurringUpdate(c.tid, p));
@@ -572,7 +577,14 @@ async function nudge(c: any, p: any) {
 async function runGet(c: any, p: any) {
   const { data } = await supabase.from("screen_runs").select("id, kind, skill, input, status, output, error, saved, created_at, finished_at")
     .eq("tenant_id", c.tid).eq("id", String(p.run_id ?? "")).maybeSingle();
-  return data ? { ok: true, run: data } : { ok: false, error: "run not found" };
+  return data ? { ok: true, run: showRun(data) } : { ok: false, error: "run not found" };
+}
+
+// Pages never show the machine-readable EMAILS_JSON block — they get has_emails instead
+function showRun(r: any) {
+  if (!r || typeof r.output !== "string") return r;
+  const i = r.output.indexOf("EMAILS_JSON:");
+  return i < 0 ? r : { ...r, output: r.output.slice(0, i).trim(), has_emails: true };
 }
 
 async function runs(c: any, p: any) {
@@ -581,7 +593,7 @@ async function runs(c: any, p: any) {
   if (RUN_KINDS.includes(String(p.kind ?? ""))) q = q.eq("kind", p.kind);
   if (p.kinds && Array.isArray(p.kinds)) q = q.in("kind", p.kinds.filter((k: string) => RUN_KINDS.includes(k)));
   const { data } = await q.order("created_at", { ascending: false }).limit(limit);
-  return { ok: true, runs: data ?? [] };
+  return { ok: true, runs: (data ?? []).map(showRun) };
 }
 
 async function save(c: any, p: any) {
@@ -592,10 +604,14 @@ async function save(c: any, p: any) {
 
 // ===================== content (v1.3) =====================
 async function businessContext(tid: string) {
-  const [{ data: t }, { data: cfg }] = await Promise.all([
+  const [{ data: t }, { data: cfg }, { data: owner }] = await Promise.all([
     supabase.from("tenants").select("business_name").eq("id", tid).maybeSingle(),
-    supabase.from("tenant_config").select("brand_context, icp, core_offer, brand_voice, customer_word, sale_word, content_pillars").eq("tenant_id", tid).maybeSingle(),
+    supabase.from("tenant_config").select("brand_context, icp, core_offer, brand_voice, customer_word, sale_word, content_pillars, booking_link, booking_link_lead, booking_link_client").eq("tenant_id", tid).maybeSingle(),
+    supabase.from("team_members").select("name").eq("tenant_id", tid).eq("gets_financials", true).limit(1).maybeSingle(),
   ]);
+  const ownerFirst = String(owner?.name ?? "").trim().split(/\s+/)[0] || "";
+  const leadLink = cfg?.booking_link_lead || cfg?.booking_link || "";
+  const clientLink = cfg?.booking_link_client || cfg?.booking_link || "";
   const pillarsList = Array.isArray(cfg?.content_pillars) ? cfg!.content_pillars : [];
   const { data: tzRow } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", tid).maybeSingle();
   const todayLong = new Intl.DateTimeFormat("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: tzRow?.timezone || "Europe/London" }).format(new Date());
@@ -608,7 +624,10 @@ async function businessContext(tid: string) {
     `Voice: ${cfg?.brand_voice ?? "not set"}`,
     `Content pillars: ${pillarsList.length ? pillarsList.join(", ") : "not set yet"}`,
     `Words: say "${cfg?.customer_word ?? "client"}" and "${cfg?.sale_word ?? "proposal"}"`,
-  ].join("\n");
+    ownerFirst ? `Owner's first name (for sign-offs): ${ownerFirst}` : "",
+    leadLink ? `Booking link for leads / new people: ${leadLink}` : "",
+    clientLink ? `Booking link for existing clients: ${clientLink}` : "",
+  ].filter(Boolean).join("\n");
 }
 
 async function pillars(c: any, p: any) {
@@ -1665,6 +1684,7 @@ const TALK_RULES = [
   "- Where to focus: 'what should I focus on?' → read the FOCUS list in the CONTEXT. 'Do 1' / 'do the first one' → carry out that focus item: if it says draft → archie_draft_followups with its names and purpose (then show the drafts and ask 'Send them?'); if it says skill → archie_run_skill; if it says task → archie_add_task.",
   "- Numbers or money → archie_numbers (never guess). Calls on a day → archie_calls. Writing (posts, reels, carousels, stories, proposals, objection replies, SOPs, briefs) → archie_run_skill.",
   "- 'Remember that…' → archie_remember.",
+  "- Email sequences: 'write me a nurture sequence for new leads' / 'a launch sequence for the November intake' → archie_run_skill with skill email-sequence and an input that starts 'Type: Nurture.' (or Launch, Re-engagement, Onboarding, Win-back) then who it's for and what it's about. Give them the emails (not the EMAILS_JSON line) and ask 'Save them to GHL as templates?'. On yes, or 'save that sequence to GHL' → archie_save_sequence (no args = the latest sequence).",
   "- Repeating tasks: 'every Monday, content filming, 2 hours, must' / 'every weekday Sara checks the support inbox' / 'on the 1st of every month, send invoices' → archie_add_recurring {title, pattern: daily|weekdays|weekly|fortnightly|monthly|monthly_last, days: [\"mon\",…] for weekly/fortnightly/monthly_last, month_day for monthly, tier, effort_minutes, handle}. 'What's on repeat?' → archie_recurring. 'Pause the Monday filming for 2 weeks' → archie_pause_recurring {title, until: YYYY-MM-DD}; 'stop the Friday check-in one' → archie_pause_recurring {title, stop: true}; 'restart it' → {title, resume: true}.",
   "- Booking calls: 'book Martin a diagnostic call Thursday at 2' → ask 'Book Martin, diagnostic call, Thursday 1 Oct at 14:00? Yes?' and only on yes → archie_book_call {name, calendar, date, time}. No time given ('get Steph in for a support call next week') → archie_free_slots {calendar, date} and offer 3 times; then book the one they pick (after a yes). 'What calendars have I got?' → archie_calendars.",
   "- Personal events: 'coffee with Dave Thursday 10 till 11' / 'dentist Friday 3pm' → archie_personal_event {title, date, from, to} straight away (no confirm; default one hour). Title in their words, e.g. 'Coffee with Dave'.",
@@ -1846,12 +1866,14 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
-      const OWNER_ONLY = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
+      const OWNER_ONLY = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_add_recurring"
+      const r = act.tool === "archie_save_sequence"
+        ? await (async () => { const x: any = await saveSequence(tid, args); return { ok: !!x.ok, text: x.ok ? x.text : String(x.error) }; })()
+        : act.tool === "archie_add_recurring"
         ? await (async () => { const x: any = await recurringAdd(tid, { ...args, handle: args.handle || member.handle }); return { ok: !!x.ok, text: x.ok ? x.text : String(x.error) }; })()
         : act.tool === "archie_recurring"
         ? await (async () => { const x: any = await recurringList(tid, member.gets_financials ? String(args.handle ?? "") : member.handle); return { ok: true, text: x.text }; })()
@@ -2506,6 +2528,73 @@ async function recurringPauseByTitle(tid: string, handle: string, p: any) {
   if (!until) return { ok: false, text: "Until when? (a date)" };
   await supabase.from("recurring_tasks").update({ paused_until: until }).eq("id", r.id);
   return { ok: true, text: `Paused until ${until}: ${r.title} (${describeRepeat(r)}).` };
+}
+
+// ===================== v4.7: email sequences → GHL templates =====================
+function emailHtml(body: string): string {
+  const esc = (t: string) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const link = (t: string) => t.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" style="color:#E0312B">$1</a>');
+  const paras = String(body ?? "").replace(/\r/g, "").split(/\n{2,}/).map((p) => p.trim()).filter(Boolean)
+    .map((p) => `<p style="margin:0 0 16px">${link(esc(p)).replace(/\n/g, "<br>")}</p>`).join("");
+  return `<div style="font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.6;color:#222222;max-width:560px;margin:0 auto;padding:8px">${paras}</div>`;
+}
+
+async function saveSequence(tid: string, p: any) {
+  // Which sequence: a given run, or the latest email-sequence run
+  let q = supabase.from("screen_runs").select("id, input, output, status, created_at").eq("tenant_id", tid);
+  q = p.run_id ? q.eq("id", String(p.run_id)) : q.eq("skill", "email-sequence").eq("status", "done");
+  const { data: run } = await q.order("created_at", { ascending: false }).limit(1).maybeSingle();
+  if (!run?.output) return { ok: false, error: "No finished email sequence found to save." };
+  const part = extractArray(String(run.output), "EMAILS_JSON:");
+  let emails = safeArray(part.json).filter((e: any) => e && String(e.body ?? "").trim()).slice(0, 12);
+  if (!emails.length) emails = parseEmailsFromText(String(run.output));
+  if (!emails.length) return { ok: false, error: "That sequence doesn't have the emails in a form I can save — run it again." };
+  const type = (String(run.input ?? "").match(/type:\s*([a-z-]+)/i)?.[1] ?? "Sequence").replace(/^\w/, (c: string) => c.toUpperCase());
+
+  const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+  const token = cfg?.ghl_token || FALLBACK_TOKEN;
+  const loc = cfg?.ghl_location_id;
+  const made: string[] = []; const failed: string[] = [];
+  for (let i = 0; i < emails.length; i++) {
+    const e: any = emails[i];
+    const subject = String(e.subject ?? "").trim().slice(0, 120);
+    const name = `${type} ${i + 1}/${emails.length} · day ${Number(e.day) || 0} · ${subject || "email"}`.slice(0, 120);
+    const cr = await ghl(token, "/emails/builder", "POST", { locationId: loc, title: name, type: "html", builderVersion: "2" }, "2021-07-28");
+    const id = cr.json?.id ?? cr.json?.redirect;
+    if (!cr.ok || !id) { failed.push(`${i + 1} (${cr.status})`); continue; }
+    const up = await ghl(token, "/emails/builder/data", "POST", {
+      locationId: loc, templateId: id, updatedBy: "archie", editorType: "html",
+      previewText: String(e.preview ?? "").slice(0, 150), html: emailHtml(String(e.body)),
+      dnd: { elements: [], attrs: {}, templateSettings: {} },
+    }, "2021-07-28");
+    if (up.ok) made.push(name); else failed.push(`${i + 1} (content ${up.status})`);
+  }
+  await supabase.from("screen_runs").update({ saved: true }).eq("id", run.id);
+  return {
+    ok: made.length > 0, saved: made.length, failed,
+    text: made.length
+      ? `Saved ${made.length} email${made.length === 1 ? "" : "s"} to GHL as templates (Marketing → Emails → Templates):\n${made.map((n) => `• ${n}`).join("\n")}${failed.length ? `\nCouldn't save: ${failed.join(", ")}` : ""}\nThe subject lines are in the template names — add them when you drop each email into a workflow.`
+      : `Couldn't save the emails to GHL: ${failed.join(", ")}`,
+    error: made.length ? undefined : `Couldn't save: ${failed.join(", ")}`,
+  };
+}
+
+// Fallback: read the emails from the human-readable sequence ("Email 1 · day 0", "Subject:", "Preview:", body)
+function parseEmailsFromText(out: string): any[] {
+  const text = out.split("EMAILS_JSON:")[0].replace(/\r/g, "");
+  const heads = [...text.matchAll(/^[#*\s]*Email\s+(\d+)\s*[·•\-–—|,:]*\s*(?:day\s*(\d+))?[*\s]*$/gim)];
+  const emails: any[] = [];
+  for (let i = 0; i < heads.length; i++) {
+    const start = (heads[i].index ?? 0) + heads[i][0].length;
+    const end = i + 1 < heads.length ? (heads[i + 1].index ?? text.length) : text.length;
+    let block = text.slice(start, end).trim();
+    const subject = block.match(/^[*\s]*Subject:?[*\s]*:?\s*(.+)$/im)?.[1]?.replace(/\*+/g, "").trim() ?? "";
+    const preview = block.match(/^[*\s]*Preview(?: text)?:?[*\s]*:?\s*(.+)$/im)?.[1]?.replace(/\*+/g, "").trim() ?? "";
+    block = block.replace(/^[*\s]*Subject:?.*$/im, "").replace(/^[*\s]*Preview(?: text)?:?.*$/im, "");
+    const body = block.replace(/^\s*(?:-{3,}|\*{3,})\s*$/gm, "").replace(/\*\*(.+?)\*\*/g, "$1").trim();
+    if (body) emails.push({ day: Number(heads[i][2] ?? 0) || 0, subject, preview, body });
+  }
+  return emails.slice(0, 12);
 }
 
 // ===================== workflow side =====================
