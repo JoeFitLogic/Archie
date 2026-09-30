@@ -1,10 +1,12 @@
-// archie-mcp v1.6 — Archie as an MCP server for GHL Managed Agents and Ask AI.
+// archie-mcp v1.7 — Archie as an MCP server for GHL Managed Agents and Ask AI.
 // URL: /functions/v1/archie-mcp/<tenant access_token>
 // The token picks the tenant. Nothing from any other tenant is ever returned.
 // v1.1: archie_notify — scheduled tasks and agents can message the owner (WhatsApp/SMS) and log to the Archie feed.
 // v1.2: Talk to Archie toolbox — move tasks, capacity, quiet mode, day off (blocks the calendar), back on, calls on a day, run a skill, remember.
 // v1.3: add/complete just act (no confirm step) — Talk to Archie's rules decide; tasks due today go straight onto today's list.
 // v1.4: drafts and proposals by voice — list/send/skip drafts, list proposals, add/give/wait/drop a proposal.
+// v1.7: booking by voice — archie_calendars, archie_free_slots, archie_book_call (a contact onto a GHL calendar),
+//       archie_personal_event (coffee, dentist… onto your own calendar, synced to Google).
 // v1.6: pipeline by voice — archie_move_deal adds someone to a stage, moves a deal between stages, or marks it won / lost / abandoned.
 // v1.5.1: rebook messages use the client link for clients and the lead link for everyone else.
 // v1.5: rebook messages — archie_rebook_drafts drafts a 'can we move our call?' message for each call booked on days off.
@@ -191,6 +193,45 @@ const TOOLS = [
     },
   },
   {
+    name: "archie_calendars",
+    description: "List the business's GHL calendars (e.g. Diagnostic Call, Support Call) with their length.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "archie_free_slots",
+    description: "Next free times on a calendar, matched by name ('diagnostic', 'support'). Optional date (YYYY-MM-DD) to start from, and days to look ahead (default 5).",
+    inputSchema: { type: "object", properties: { calendar: { type: "string" }, date: { type: "string" }, days: { type: "number" } }, required: ["calendar"] },
+  },
+  {
+    name: "archie_book_call",
+    description: "Book a contact onto a GHL calendar at a date and time. The contact gets the calendar's normal confirmation, so confirm with the owner first ('Book Martin, diagnostic call, Thursday 2pm? Yes?').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The contact's name." },
+        calendar: { type: "string", description: "Calendar name or word, e.g. diagnostic, support." },
+        date: { type: "string", description: "YYYY-MM-DD" },
+        time: { type: "string", description: "HH:MM, 24-hour" },
+      },
+      required: ["name", "calendar", "date", "time"],
+    },
+  },
+  {
+    name: "archie_personal_event",
+    description: "Put a personal event in the person's own calendar (coffee with Dave, dentist, school run) — it blocks that time so nobody books over it, and syncs to their Google Calendar. Just do it, no need to confirm.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        date: { type: "string", description: "YYYY-MM-DD" },
+        from: { type: "string", description: "HH:MM" },
+        to: { type: "string", description: "HH:MM (default one hour after from)" },
+        handle: { type: "string" },
+      },
+      required: ["title", "date", "from"],
+    },
+  },
+  {
     name: "archie_back_on",
     description: "Undo a day off: removes the calendar blocks Archie made for those days and restores normal capacity. Use for 'actually I'm working Friday'.",
     inputSchema: { type: "object", properties: { date: { type: "string" }, end_date: { type: "string" }, handle: { type: "string" } }, required: ["date"] },
@@ -239,7 +280,7 @@ async function handle(tenant: any, msg: any) {
     return ok(id, {
       protocolVersion: msg?.params?.protocolVersion ?? "2025-03-26",
       capabilities: { tools: {} },
-      serverInfo: { name: "archie", version: "1.6.0" },
+      serverInfo: { name: "archie", version: "1.7.0" },
     });
   }
   if (method === "ping") return ok(id, {});
@@ -681,6 +722,83 @@ async function run(tenant: any, name: string, a: any): Promise<string> {
       done.push("reason saved as a note");
     }
     return done.length ? done.join(". ") + "." : `${personName} is already there — nothing to change.`;
+  }
+
+  if (name === "archie_calendars" || name === "archie_free_slots" || name === "archie_book_call") {
+    const loc = cfg?.ghl_location_id;
+    const cl = await ghl(ghlToken, `/calendars/?locationId=${loc}`, "GET");
+    const cals: any[] = (cl.json?.calendars ?? []).filter((c: any) => c.isActive !== false);
+    if (!cals.length) return `I couldn't read your calendars (${cl.status}).`;
+    if (name === "archie_calendars") return cals.map((c) => `${c.name}${c.slotDuration ? ` (${c.slotDuration} min)` : ""}`).join("\n");
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const want = norm(String(a.calendar ?? ""));
+    const matches = cals.filter((c) => norm(c.name) === want).length ? cals.filter((c) => norm(c.name) === want) : cals.filter((c) => norm(c.name).includes(want) || want.includes(norm(c.name)));
+    if (!matches.length) return `No calendar matching "${a.calendar}". Your calendars: ${cals.map((c) => c.name).join(", ")}.`;
+    if (matches.length > 1) return `More than one calendar matches "${a.calendar}": ${matches.map((c) => c.name).join(" / ")}. Ask which one.`;
+    const cal = matches[0];
+    const slotsFor = async (from: string, days: number) => {
+      const start = Date.parse(isoAt(from, "00:00", tz)), end = Date.parse(isoAt(addDays(from, days), "00:00", tz));
+      const r = await ghl(ghlToken, `/calendars/${cal.id}/free-slots?startDate=${start}&endDate=${end}&timezone=${encodeURIComponent(tz)}`, "GET");
+      const out: { date: string; time: string; iso: string }[] = [];
+      for (const [k, v] of Object.entries(r.json ?? {})) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(k)) continue;
+        for (const iso of ((v as any)?.slots ?? [])) {
+          out.push({ date: k, time: new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(iso)), iso });
+        }
+      }
+      return out.sort((x, y) => x.iso.localeCompare(y.iso));
+    };
+    const dayName = (d: string) => new Date(`${d}T12:00:00Z`).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" });
+    if (name === "archie_free_slots") {
+      const from = isDate(a.date) ? String(a.date) : today;
+      const slots = (await slotsFor(from, Math.min(14, Math.max(1, Number(a.days) || 5)))).filter((s) => Date.parse(s.iso) > Date.now());
+      if (!slots.length) return `No free ${cal.name} slots from ${dayName(from)} for the next few days.`;
+      const byDay = new Map<string, string[]>();
+      for (const s of slots) { const l = byDay.get(s.date) ?? []; if (l.length < 4) l.push(s.time); byDay.set(s.date, l); }
+      return `${cal.name} — free times:\n${[...byDay.entries()].slice(0, 4).map(([d, t]) => `${dayName(d)}: ${t.join(", ")}`).join("\n")}`;
+    }
+    // archie_book_call
+    if (!isDate(a.date) || !/^\d{1,2}:\d{2}$/.test(String(a.time ?? ""))) throw new Error("date (YYYY-MM-DD) and time (HH:MM) required");
+    const time = String(a.time).padStart(5, "0");
+    const cs = await ghl(ghlToken, `/contacts/?locationId=${loc}&query=${encodeURIComponent(String(a.name ?? "").trim())}&limit=5`, "GET", undefined, "2021-07-28");
+    const people: any[] = cs.json?.contacts ?? [];
+    const nameOf = (c: any) => [c.firstName, c.lastName].filter(Boolean).join(" ") || c.contactName || c.email || "Contact";
+    const exact = people.filter((c) => nameOf(c).toLowerCase() === String(a.name).trim().toLowerCase());
+    const pick = exact.length === 1 ? exact : people;
+    if (!pick.length) return `I can't find ${a.name} in your contacts.`;
+    if (pick.length > 1) return `More than one match: ${pick.slice(0, 4).map((c) => `${nameOf(c)}${c.email ? ` (${c.email})` : ""}`).join(" / ")}. Ask which one.`;
+    const person = pick[0];
+    const free = await slotsFor(String(a.date), 1);
+    if (free.length && !free.some((s) => s.time === time)) {
+      return `${time} on ${dayName(String(a.date))} isn't free on ${cal.name}. Free that day: ${free.slice(0, 6).map((s) => s.time).join(", ") || "none"}.`;
+    }
+    const startIso = isoAt(String(a.date), time, tz);
+    const mins = Number(cal.slotDuration) || 30;
+    const endIso = new Date(Date.parse(startIso) + mins * 60000).toISOString();
+    const assigned = cal.teamMembers?.[0]?.userId ?? (await ghlUserId(tid, ghlToken, cfg, resolve(a.handle)));
+    const r = await ghl(ghlToken, "/calendars/events/appointments", "POST", {
+      calendarId: cal.id, locationId: loc, contactId: person.id, startTime: startIso, endTime: endIso,
+      title: `${cal.name} — ${nameOf(person)}`, appointmentStatus: "confirmed", ...(assigned ? { assignedUserId: assigned } : {}), toNotify: true,
+    });
+    if (!r.ok) return `Couldn't book it (${r.status}): ${r.text.slice(0, 160)}`;
+    return `Booked: ${nameOf(person)} — ${cal.name}, ${dayName(String(a.date))} at ${time} (${mins} min). They'll get the usual confirmation.`;
+  }
+
+  if (name === "archie_personal_event") {
+    const h = resolve(a.handle);
+    if (!isDate(a.date) || !/^\d{1,2}:\d{2}$/.test(String(a.from ?? ""))) throw new Error("date (YYYY-MM-DD) and from (HH:MM) required");
+    const from = String(a.from).padStart(5, "0");
+    const to = /^\d{1,2}:\d{2}$/.test(String(a.to ?? "")) ? String(a.to).padStart(5, "0") : (() => { const [hh, mm] = from.split(":").map(Number); return `${String(Math.min(23, hh + 1)).padStart(2, "0")}:${String(mm).padStart(2, "0")}`; })();
+    const userId = await ghlUserId(tid, ghlToken, cfg, h);
+    if (!userId) return `No GHL user set for ${h} — add their ghl_user_id in team_members.`;
+    const title = String(a.title ?? "Personal").trim().slice(0, 100) || "Personal";
+    const r = await ghl(ghlToken, "/calendars/events/block-slots", "POST", {
+      locationId: cfg?.ghl_location_id, assignedUserId: userId, title,
+      startTime: isoAt(String(a.date), from, tz), endTime: isoAt(String(a.date), to, tz),
+    });
+    if (!r.ok) return `Couldn't add it (${r.status}): ${r.text.slice(0, 160)}`;
+    const when = new Date(`${a.date}T12:00:00Z`).toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", timeZone: "UTC" });
+    return `In your calendar: ${title} — ${when}, ${from}–${to}. That time's blocked for bookings.`;
   }
 
   if (name === "archie_back_on") {
