@@ -1,4 +1,6 @@
-// archie-screens v5.1 — data and actions for the Archie AI Studio pages.
+// archie-screens v5.2 — data and actions for the Archie AI Studio pages.
+// v5.2: member health — every active client scored Green / Yellow / Red nightly with the reasons and dates (last contact,
+//       waiting on our reply, failed payment, paused/cancel tags, next booking); drafted check-ins; in the brief and by voice.
 // v5.1: speed-to-lead (enquiries, slow replies, median first reply, who's waiting now), honest pipeline check
 //       ("14 open, 3 real"), and a sharper Focus line in the brief (one action, one name, highest value first).
 // v5.0: business memory — definitions, voice rules and corrections, what worked, services, facts, baselines ("normal week"),
@@ -119,6 +121,7 @@ Deno.serve(async (req) => {
         return j({ ok: true, tenants: out });
       }
       if (action === "recurring_run") { const r = await recurringRun(tenant_id); return j({ ok: true, ...r }); }
+      if (action === "health_run") { startInBackground(memberHealthRun(tenant_id)); return j({ ok: true, started: true }); }
       if (action === "report_nightly_run") { startInBackground(weeklyReport(tenant_id, { week: "this", refresh: "yes" })); return j({ ok: true, started: true }); }
       if (action === "report_weekly_run") { startInBackground(reportWeeklyRun(tenant_id)); return j({ ok: true, started: true }); }
       if (action === "evening_run") { startInBackground(eveningRun(tenant_id)); return j({ ok: true, started: true }); }
@@ -172,6 +175,7 @@ Deno.serve(async (req) => {
       case "report": return j(await weeklyReport(c.tid, p));
       case "goals": return j(await getGoals(c.tid));
       case "checkup": return j(await checkup(c.tid));
+      case "member_health": return j(await memberHealthList(c.tid, String(p.status ?? "")));
       case "memory_list": return j(await memoryList(c.tid, String(p.kind ?? "")));
       case "memory_save": return j(await memoryAction(c.tid, { handle: c.owner?.handle ?? "owner", gets_financials: true }, { ...p, action: "save" }));
       case "memory_archive": return j(await memoryAction(c.tid, { handle: c.owner?.handle ?? "owner", gets_financials: true }, { ...p, action: "archive" }));
@@ -1299,6 +1303,14 @@ async function briefRun(tid: string, p: any) {
       if (its.length) pipeLine = `Pipeline check (my read): ${its.length} open, ${its.filter((x) => x.real).length} real — touched in the last 14 days and past first contact.`;
     } catch { /* lines are a bonus */ }
 
+    // Client health → one line for the owner
+    let healthLine = "";
+    try {
+      const { data: mh } = await supabase.from("member_health").select("name, status, reasons").eq("tenant_id", tid).in("status", ["red", "yellow"]).order("status", { ascending: true });
+      const reds = (mh ?? []).filter((m: any) => m.status === "red"), yellows = (mh ?? []).filter((m: any) => m.status === "yellow");
+      if (reds.length || yellows.length) healthLine = `Client health (Archie's scoring): ${reds.length} red, ${yellows.length} yellow.${reds.length ? ` Red: ${reds.slice(0, 3).map((m: any) => `${m.name} (${(m.reasons ?? [])[0] ?? ""})`).join("; ")}.` : ""}`;
+    } catch { /* bonus */ }
+
     // Findings that keep coming back → one "Nth week in a row" line
     const { data: reps } = await supabase.from("business_memory").select("value, weeks_seen").eq("tenant_id", tid).eq("kind", "finding").eq("status", "active").gte("weeks_seen", 2).order("weeks_seen", { ascending: false }).limit(1);
     const repeatLine = reps?.[0] ? `${["", "", "Second", "Third", "Fourth", "Fifth"][Math.min(5, Number(reps[0].weeks_seen))] || `${reps[0].weeks_seen}th`} week running — ${String(reps[0].value).slice(0, 160)}` : "";
@@ -1308,7 +1320,7 @@ async function briefRun(tid: string, p: any) {
       "Capacity comes from the OWNER CAPACITY line. The Today list is exactly the LINEUP lines, with their numbers. Never add a task that is not listed there. At risk comes only from the AT_RISK line.",
       "Voice-first footer (overrides your instructions): do NOT include the command lines 'add P1 · wait P1 · drop P1', 'Reply SEND 1 · SKIP 1' or 'done 1 · move 2 fri · 👍/👎'. Keep the numbers on the lists (1, 2… and P1, P2…) so people can refer to them. End the OWNER brief with exactly one line: 🎙️ Just reply or send a voice note — e.g. \"done the first one\", \"send Jase's message\", \"give P2 to Sara\". End the TEAM brief with exactly one line: 🎙️ Just reply starting with \"Archie\" — e.g. \"Archie, done the first one\".",
       weekLine ? `Weekly pace (OWNER brief only, never the TEAM brief): add this as one line under Money, exactly: 📊 ${weekLine}` : "",
-      [speedLine, waitingLine, pipeLine].filter(Boolean).length ? `OWNER brief only — add these under Money/Pipeline as short lines, exactly as facts are given: ${[speedLine, waitingLine, pipeLine].filter(Boolean).join(" ")}` : "",
+      [speedLine, waitingLine, pipeLine, healthLine].filter(Boolean).length ? `OWNER brief only — add these under Money/Pipeline as short lines, exactly as facts are given: ${[speedLine, waitingLine, pipeLine, healthLine].filter(Boolean).join(" ")}` : "",
       "FOCUS LINE (owner brief): one action, one name, the highest value first — someone waiting on a reply right now beats a proposal waiting, which beats the top must task. E.g. \"Reply to Steph — she's waited 6 hours.\" Never a generic focus.",
       repeatLine ? `Repeating issue (OWNER brief only): mention this in one short line near the Focus, e.g. "Third week in a row: …": ${repeatLine}` : "",
       "Return only the two briefs in the marker format.",
@@ -1641,6 +1653,7 @@ async function dispatch(_p: any) {
       { job: "evening", due: days(cfg.sched_evening_days, "0,1,2,3,4").includes(now.weekday) && dueNow(now.minutes, hhmm(cfg.sched_evening, "20:00")), key: now.date, action: "evening_run" },
       { job: "plan", due: now.weekday === Number(cfg.sched_plan_day ?? 6) && dueNow(now.minutes, hhmm(cfg.sched_plan, "08:00")), key: now.date, action: "plan_run" },
       { job: "recurring", due: dueNow(now.minutes, hhmm(cfg.sched_recurring, "04:00")), key: now.date, action: "recurring_run" },
+      { job: "health", due: dueNow(now.minutes, hhmm(cfg.sched_health, "03:30")), key: now.date, action: "health_run" },
       { job: "report_nightly", due: dueNow(now.minutes, hhmm(cfg.sched_report_nightly, "23:30")), key: now.date, action: "report_nightly_run" },
       { job: "report_weekly", due: now.weekday === Number(cfg.sched_report_day ?? 1) && dueNow(now.minutes, hhmm(cfg.sched_report, "07:00")), key: now.date, action: "report_weekly_run" },
       { job: "monthly", due: now.day === Number(cfg.sched_monthly_day ?? 1) && dueNow(now.minutes, hhmm(cfg.sched_monthly, "09:00")), key: now.date.slice(0, 7), action: "monthly_run", body: { referral_link: String(cfg.referral_link ?? "") } },
@@ -1778,6 +1791,7 @@ const TALK_RULES = [
   "- Where to focus: 'what should I focus on?' → read the FOCUS list in the CONTEXT. 'Do 1' / 'do the first one' → carry out that focus item: if it says draft → archie_draft_followups with its names and purpose (then show the drafts and ask 'Send them?'); if it says skill → archie_run_skill; if it says task → archie_add_task.",
   "- Numbers or money → archie_numbers (never guess). Calls on a day → archie_calls. Writing (posts, reels, carousels, stories, proposals, objection replies, SOPs, briefs) → archie_run_skill.",
   "- 'Remember that…' → archie_remember.",
+  "- Client health: 'who's at risk?' / 'how are my clients doing?' / 'any reds?' → archie_member_health {status: red|yellow|green or empty for all}. 'Draft a check-in for Lhea' / 'check in with the reds' → archie_draft_followups {names:[…], purpose:\"check in with a client\"}, then ask 'Send them?'.",
   "- Business memory → archie_memory. 'Remember we don't do refunds after 14 days' → {action:\"save\", kind:\"fact\", key, value}. 'A member means anyone on a paid plan' / 'a trial is the £30 intro' → kind \"definition\" (key: member, trial, paused, refund…). 'That doesn't sound like me — I'd never say crush it' → kind \"voice\" (a rule for how they write). 'The free workshop worked really well' → kind \"worked\". 'We offer 1:1 PT, small group and online' → kind \"service\". 'What do you know about my business?' → {action:\"list\"}. 'Forget the refund one' → {action:\"archive\", key, reason}. Keys short and lower-case (e.g. member, refunds, tone-hype). Never save money figures for team members.",
   "- 'Checkup' / 'is everything working?' / 'something's not right with Archie' → archie_checkup, and give them the report as it is.",
   "- Email sequences: 'write me a nurture sequence for new leads' / 'a launch sequence for the November intake' → archie_run_skill with skill email-sequence and an input that starts 'Type: Nurture.' (or Launch, Re-engagement, Onboarding, Win-back) then who it's for and what it's about. Give them the emails (not the EMAILS_JSON line) and ask 'Save them to GHL as templates?'. On yes, or 'save that sequence to GHL' → archie_save_sequence (no args = the latest sequence).",
@@ -1965,12 +1979,14 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
       const OWNER_ONLY = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_memory"
+      const r = act.tool === "archie_member_health"
+        ? await (async () => { const x: any = await memberHealthList(tid, String(args.status ?? "")); return { ok: true, text: x.text }; })()
+        : act.tool === "archie_memory"
         ? await (async () => { const x: any = await memoryAction(tid, member, args); return { ok: !!x.ok, text: x.text }; })()
         : act.tool === "archie_checkup"
         ? await (async () => { const x: any = await checkup(tid); return { ok: true, text: x.text }; })()
@@ -2477,7 +2493,7 @@ async function draftFollowups(tid: string, p: any) {
       `Write a short WhatsApp message (2–4 sentences) from the owner to each person below. Purpose: ${purpose}.`,
       "Friendly, plain, in the owner's voice (Archie Voice). One easy thing to reply to. No discounts, no pressure. Never invent details.",
       "Fit each message to where the person is (shown in brackets): only mention a proposal or quote if their stage is a proposal/quote stage; for early-stage leads, re-open the conversation and invite a quick call instead.",
-      `Booking link if useful: ${cfg?.booking_link_lead || cfg?.booking_link || "none"}.`,
+      `Booking link if useful: ${/check.?in|client|renew/i.test(purpose) ? (cfg?.booking_link_client || cfg?.booking_link || "none") : (cfg?.booking_link_lead || cfg?.booking_link || "none")}.`,
       'Return ONLY a JSON array: [{"name":"…","message":"…"}]',
       "",
       found.map((f) => `- ${f.name} (first name ${f.first}; ${stageOf(f)})`).join("\n"),
@@ -2915,6 +2931,83 @@ function speedToLead(all: { c: string; d: string; t: number; s: string }[], team
   const median = delays.length ? delays[Math.floor(delays.length / 2)] : null;
   awaiting.sort((a, b) => b.hours - a.hours);
   return { enquiries, reply_slow: slow, reply_median_min: median, awaiting: awaiting.slice(0, 10) };
+}
+
+// ===================== v5.2: member health =====================
+// Green / Yellow / Red per active client, with reasons and dates. Rules (plain and explainable):
+//   Red    — failed payment open · paused / cancel / at-risk tag · no contact 21+ days · their message unanswered 48h+
+//   Yellow — no contact 10–20 days · their message unanswered 24–48h · no contact 7+ days and nothing booked in the next 30 days
+//   Green  — none of the above
+async function memberHealthRun(tid: string) {
+  const started = new Date().toISOString();
+  try {
+    const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id, timezone").eq("tenant_id", tid).single();
+    const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
+    const tz = cfg?.timezone || "Europe/London";
+    const nowMs = Date.now();
+    const { data: clients } = await supabase.from("clients").select("id, name, ghl_contact_id, started_at, last_contact_at").eq("tenant_id", tid).eq("status", "active").limit(300);
+    const { data: chase } = await supabase.from("tasks").select("source_ref, created_at").eq("tenant_id", tid).eq("source", "stripe").in("status", ["open", "doing"]).like("source_ref", "stripe-chase:%");
+    const failedByEmail = new Map((chase ?? []).map((t: any) => [String(t.source_ref).split(":")[1]?.toLowerCase(), String(t.created_at).slice(0, 10)]));
+    const fmt = (ms: number) => new Date(ms).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: tz });
+    const rows: any[] = [];
+    for (const cl of clients ?? []) {
+      if (!cl.ghl_contact_id) continue;
+      const reasons: string[] = []; let level = 0; // 0 green, 1 yellow, 2 red
+      const [cv, ct, ap] = await Promise.all([
+        ghl(token, `/conversations/search?locationId=${loc}&contactId=${cl.ghl_contact_id}&limit=1`, "GET", undefined, "2021-04-15"),
+        ghl(token, `/contacts/${cl.ghl_contact_id}`, "GET", undefined, "2021-07-28"),
+        ghl(token, `/contacts/${cl.ghl_contact_id}/appointments`, "GET", undefined, "2021-07-28"),
+      ]);
+      const conv = cv.json?.conversations?.[0];
+      const lastMs = Math.max(Number(conv?.lastMessageDate ?? 0) || 0, Date.parse(String(cl.last_contact_at ?? "")) || 0);
+      const lastDir = String(conv?.lastMessageDirection ?? "").toLowerCase();
+      const contact = ct.json?.contact ?? {};
+      const tags: string[] = (contact.tags ?? []).map((t: string) => String(t).toLowerCase());
+      const email = String(contact.email ?? "").toLowerCase();
+      const name = cl.name || [contact.firstName, contact.lastName].filter(Boolean).join(" ") || "Client";
+      const daysQuiet = lastMs ? Math.floor((nowMs - lastMs) / 86400000) : null;
+      const hoursWaiting = lastDir === "inbound" && lastMs ? Math.floor((nowMs - lastMs) / 3600000) : 0;
+      const upcoming = (ap.json?.events ?? ap.json?.appointments ?? []).filter((e: any) => Date.parse(e.startTime) > nowMs && Date.parse(e.startTime) < nowMs + 30 * 86400000 && String(e.appointmentStatus ?? e.status ?? "").toLowerCase() !== "cancelled");
+      const red = (r: string) => { reasons.push(r); level = 2; };
+      const yellow = (r: string) => { reasons.push(r); if (level < 1) level = 1; };
+      if (email && failedByEmail.has(email)) red(`card failed (since ${fmt(Date.parse(String(failedByEmail.get(email))))})`);
+      const flagTag = tags.find((t) => /pause|cancel|at.?risk|churn|downgrade/.test(t));
+      if (flagTag) red(`tagged "${flagTag}"`);
+      if (hoursWaiting >= 48) red(`waiting ${Math.round(hoursWaiting / 24)} days for our reply (since ${fmt(lastMs)})`);
+      else if (hoursWaiting >= 24) yellow(`waiting ${hoursWaiting}h for our reply`);
+      if (daysQuiet === null) yellow("no messages on record");
+      else if (daysQuiet >= 21) red(`no contact for ${daysQuiet} days (last ${fmt(lastMs)})`);
+      else if (daysQuiet >= 10) yellow(`no contact for ${daysQuiet} days (last ${fmt(lastMs)})`);
+      else if (daysQuiet >= 7 && !upcoming.length) yellow(`quiet ${daysQuiet} days and nothing booked`);
+      rows.push({
+        tenant_id: tid, client_id: cl.id, contact_id: cl.ghl_contact_id, name,
+        status: ["green", "yellow", "red"][level], reasons: reasons.length ? reasons : ["all good"],
+        last_contact: lastMs ? new Date(lastMs).toISOString() : null,
+        next_booking: upcoming[0]?.startTime ?? null, computed_at: new Date().toISOString(),
+      });
+      await new Promise((ok) => setTimeout(ok, 250)); // stay well inside GHL's rate limit
+    }
+    if (rows.length) await supabase.from("member_health").upsert(rows, { onConflict: "tenant_id,client_id" });
+    const counts = { red: rows.filter((r) => r.status === "red").length, yellow: rows.filter((r) => r.status === "yellow").length, green: rows.filter((r) => r.status === "green").length };
+    await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "health", trigger: "api", status: "done", started_at: started, finished_at: new Date().toISOString(), summary: `${rows.length} clients: ${counts.red} red, ${counts.yellow} yellow, ${counts.green} green` });
+    return { ok: true, ...counts };
+  } catch (e) {
+    await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "health", trigger: "api", status: "failed", started_at: started, finished_at: new Date().toISOString(), error: String(e).slice(0, 200) });
+    return { ok: false };
+  }
+}
+
+async function memberHealthList(tid: string, status: string) {
+  let q = supabase.from("member_health").select("name, status, reasons, last_contact, next_booking, computed_at").eq("tenant_id", tid);
+  if (["red", "yellow", "green"].includes(status)) q = q.eq("status", status);
+  const { data } = await q.order("status", { ascending: true }).order("name").limit(300);
+  const items = (data ?? []).sort((a: any, b: any) => ["red", "yellow", "green"].indexOf(a.status) - ["red", "yellow", "green"].indexOf(b.status));
+  if (!items.length) return { ok: true, items, text: "No client health scores yet — they're worked out overnight (or run it now from the pages)." };
+  const dot: Record<string, string> = { red: "🔴", yellow: "🟡", green: "🟢" };
+  const counts = ["red", "yellow", "green"].map((k) => `${items.filter((i: any) => i.status === k).length} ${k}`).join(", ");
+  const shown = items.filter((i: any) => i.status !== "green" || status === "green").slice(0, 15);
+  const text = `Client health (Archie's scoring, ${new Date(items[0].computed_at).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}): ${counts}.\n${shown.map((i: any) => `${dot[i.status]} ${i.name} — ${(i.reasons ?? []).join("; ")}`).join("\n")}`;
+  return { ok: true, items, text };
 }
 
 // ===================== workflow side =====================
