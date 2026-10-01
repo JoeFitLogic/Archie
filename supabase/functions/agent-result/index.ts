@@ -1,6 +1,10 @@
-// agent-result v4 — agents report here via the workflow.
+// agent-result v5.1 — agents report here (from the backend or a workflow).
+// agent-result v5.1: accepts each client's own workflow secret as well as the master secret.
 // Logs the run, upserts whitelisted metrics, inserts proposed tasks (deduped), updates client last contact,
-// and carries out CRM actions (notes, tags) the agent cannot do itself when invoked from a workflow.
+// and carries out CRM actions (notes, tags) and message drafts.
+// v5: routing — tasks the Scraper assigns to a team member (e.g. Sara), or that match the routing rules
+//     (payments, card updates…), go straight onto that person's list as open tasks; the owner's stay as proposals.
+//     Older unsent drafts are dismissed when a new day's drafts arrive.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 const SECRET = Deno.env.get("ARCHIE_SECRET")!;
@@ -11,12 +15,21 @@ const ALLOWED_METRICS = ["pipeline_value", "pipeline_open", "stale_count", "stal
 const TIERS = ["must", "high", "bonus"];
 const KINDS = ["deep", "shallow"];
 
+// Master secret (you, the scheduler) or this client's own workflow secret
+async function secretOk(header: string | null, tenantId: string): Promise<boolean> {
+  if (!header) return false;
+  if (header === SECRET) return true;
+  if (!tenantId) return false;
+  const { data } = await supabase.from("tenant_config").select("workflow_secret").eq("tenant_id", tenantId).maybeSingle();
+  return !!data?.workflow_secret && data.workflow_secret === header;
+}
+
 Deno.serve(async (req) => {
-  console.log("agent-result v4 start");
+  console.log("agent-result v5 start");
   try {
-    if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     const raw = await req.json();
     const p = { ...raw, ...(raw.customData ?? {}) };
+    if (!(await secretOk(req.headers.get("x-archie-secret"), String(p.tenant_id ?? "")))) return j({ error: "unauthorized" }, 401);
     const tenant_id = p.tenant_id;
     const agent = p.agent;
     if (!tenant_id || !agent) return j({ error: "tenant_id and agent required" }, 400);
@@ -52,8 +65,33 @@ Deno.serve(async (req) => {
       if (ids.length) { await supabase.from("clients").update({ last_contact_at: now }).in("id", ids); touched = ids.length; }
     }
 
+    // ---- routing: who gets what ----
+    const [{ data: team }, { data: rcfg }] = await Promise.all([
+      supabase.from("team_members").select("handle, gets_financials").eq("tenant_id", tenant_id),
+      supabase.from("tenant_config").select("routing_auto, routing_rules").eq("tenant_id", tenant_id).maybeSingle(),
+    ]);
+    const ownerHandle = String((team ?? []).find((m: any) => m.gets_financials)?.handle ?? "");
+    const teamHandles = new Set((team ?? []).map((m: any) => String(m.handle).toLowerCase()));
+    const routingOn = rcfg?.routing_auto !== false;
+    const rules: { handle: string; match: string }[] = Array.isArray(rcfg?.routing_rules) ? rcfg!.routing_rules : [];
+    const routeTo = (x: any): string | null => {
+      if (!routingOn) return null;
+      const hinted = String(x?.owner ?? "").trim().toLowerCase();
+      if (hinted && teamHandles.has(hinted) && hinted !== ownerHandle.toLowerCase()) return hinted;
+      if (hinted && hinted === ownerHandle.toLowerCase()) return null;
+      const text = `${x?.title ?? ""} ${x?.detail ?? ""}`;
+      for (const r of rules) {
+        try {
+          if (r?.handle && r?.match && teamHandles.has(String(r.handle).toLowerCase()) && new RegExp(r.match, "i").test(text)) {
+            return String(r.handle).toLowerCase() === ownerHandle.toLowerCase() ? null : String(r.handle).toLowerCase();
+          }
+        } catch { /* bad pattern — ignore */ }
+      }
+      return null;
+    };
+
     // ---- proposed tasks ----
-    let inserted = 0, skipped = 0, invalid = 0;
+    let inserted = 0, routed = 0, skipped = 0, invalid = 0;
     const proposed: any[] = parseJson(p.tasks, []);
     if (!isError && Array.isArray(proposed) && proposed.length) {
       const refs = proposed.map((x) => String(x?.source_ref ?? "")).filter(Boolean);
@@ -75,6 +113,8 @@ Deno.serve(async (req) => {
         seen.add(ref);
         const client_id = clientByContact.get(String(x?.contact_id ?? "")) ?? null;
         const effort = Number(x?.effort_minutes);
+        const to = routeTo(x);
+        if (to) routed++;
         rows.push({
           tenant_id,
           title: title.slice(0, 200),
@@ -83,8 +123,10 @@ Deno.serve(async (req) => {
           kind: KINDS.includes(x?.kind) ? x.kind : "shallow",
           effort_minutes: Number.isFinite(effort) && effort > 0 ? Math.max(15, Math.round(effort / 15) * 15) : 30,
           due_date: /^\d{4}-\d{2}-\d{2}$/.test(String(x?.due_date ?? "")) ? x.due_date : null,
-          status: "proposed", source: agent, source_ref: ref,
-          client_id, project_id: client_id ? projectByClient.get(client_id) ?? null : null, owner: null,
+          // Routed work goes straight onto that person's list; the owner's stays as a proposal to decide on
+          status: to ? "open" : "proposed", source: agent, source_ref: ref,
+          client_id, project_id: client_id ? projectByClient.get(client_id) ?? null : null, owner: to,
+          ...(to ? { accepted_by: "routing", accepted_at: now } : {}),
         });
       }
       if (rows.length) {
@@ -95,7 +137,7 @@ Deno.serve(async (req) => {
     }
 
     // ---- CRM actions: notes and tags ----
-    let notesWritten = 0, notesSkipped = 0, tagsAdded = 0, actionErrors = 0, draftsCreated = 0;
+    let notesWritten = 0, notesSkipped = 0, tagsAdded = 0, actionErrors = 0, draftsCreated = 0, draftsExpired = 0;
     const actions: any[] = parseJson(p.actions, []);
     if (!isError && Array.isArray(actions) && actions.length) {
       const { data: cfg } = await supabase.from("tenant_config").select("ghl_token").eq("tenant_id", tenant_id).single();
@@ -123,9 +165,13 @@ Deno.serve(async (req) => {
         }
       }
 
-      // message drafts — ranked per day, sent only when the owner replies SEND n
+      // message drafts — ranked per day, sent only when the owner says so
       const drafts = actions.filter((a) => String(a?.draft ?? "").trim() && String(a?.contact_id ?? "").trim());
       if (drafts.length) {
+        // Yesterday's unsent drafts are out of date once today's arrive
+        const { count } = await supabase.from("message_drafts").update({ status: "dismissed" }, { count: "exact" })
+          .eq("tenant_id", tenant_id).eq("status", "pending").lt("created_on", today);
+        draftsExpired = count ?? 0;
         const { data: todays } = await supabase.from("message_drafts").select("rank, contact_id").eq("tenant_id", tenant_id).eq("created_on", today);
         const already = new Set((todays ?? []).map((d) => d.contact_id));
         let rank = (todays ?? []).reduce((m, d) => Math.max(m, d.rank ?? 0), 0);
@@ -139,7 +185,7 @@ Deno.serve(async (req) => {
     }
 
     // ---- activity counters (for the monthly receipt) ----
-    const bumps: [string, number][] = [["notes_written", notesWritten], ["tags_added", tagsAdded], ["tasks_proposed", inserted], ["drafts_created", draftsCreated]];
+    const bumps: [string, number][] = [["notes_written", notesWritten], ["tags_added", tagsAdded], ["tasks_proposed", inserted - routed], ["drafts_created", draftsCreated]];
     for (const [field, n] of bumps) if (n > 0) await supabase.rpc("bump_activity", { p_tenant: tenant_id, p_day: today, p_field: field, p_n: n });
 
     // ---- run log ----
@@ -154,9 +200,10 @@ Deno.serve(async (req) => {
     return j({
       ok: true, agent, status: isError ? "failed" : "done",
       metrics_written: Object.keys(cleanMetrics),
-      tasks_inserted: inserted, tasks_skipped: skipped, tasks_invalid: invalid,
+      tasks_inserted: inserted, tasks_routed: routed, tasks_skipped: skipped, tasks_invalid: invalid,
       clients_touched: touched,
-      notes_written: notesWritten, notes_skipped: notesSkipped, tags_added: tagsAdded, drafts_created: draftsCreated, action_errors: actionErrors,
+      notes_written: notesWritten, notes_skipped: notesSkipped, tags_added: tagsAdded,
+      drafts_created: draftsCreated, drafts_expired: draftsExpired, action_errors: actionErrors,
     });
   } catch (e) { return j({ error: String(e) }, 500); }
 });

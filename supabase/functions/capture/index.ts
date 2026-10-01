@@ -1,4 +1,5 @@
-// capture v6.7 — everything the owner or team texts (or voice-notes) to Archie.
+// capture v6.8 — everything the owner or team texts (or voice-notes) to Archie.
+// capture v6.8: accepts each client's own workflow secret as well as the master secret.
 // Quick commands (instant, free) — as v5:
 // task: / <handle>: / capacity: / done: <text>
 // done 2  ·  done 1 3            — tick off today's numbered tasks
@@ -41,12 +42,21 @@ const HELP = [
   "Quick shortcuts still work if you like them: done 1 · move 2 fri · send 1 · add P1 · quiet till fri · 👍 / 👎",
 ].join("\n");
 
+// Master secret (you, the scheduler) or this client's own workflow secret
+async function secretOk(header: string | null, tenantId: string): Promise<boolean> {
+  if (!header) return false;
+  if (header === SECRET) return true;
+  if (!tenantId) return false;
+  const { data } = await supabase.from("tenant_config").select("workflow_secret").eq("tenant_id", tenantId).maybeSingle();
+  return !!data?.workflow_secret && data.workflow_secret === header;
+}
+
 Deno.serve(async (req) => {
   console.log("capture v6.7 start");
   try {
-    if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     const raw = await req.json();
     const p = { ...raw, ...(raw.customData ?? {}) };
+    if (!(await secretOk(req.headers.get("x-archie-secret"), String(p.tenant_id ?? "")))) return j({ error: "unauthorized" }, 401);
     const tenant_id = str(p.tenant_id);
     let text = str(p.text ?? p.message ?? p.body ?? raw.message?.body ?? "").trim();
     const senderPhone = str(p.sender ?? p.phone ?? raw.phone ?? "").replace(/\s+/g, "");

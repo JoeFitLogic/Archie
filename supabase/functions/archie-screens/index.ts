@@ -1,4 +1,10 @@
-// archie-screens v6.0 — data and actions for the Archie AI Studio pages.
+// archie-screens v6.3 — data and actions for the Archie AI Studio pages.
+// v6.3: usage + costs — every agent run is logged (job, time, size); usage action shows runs per job and an estimated
+//       cost per client per month (rate set by you); in the checkup and for all clients.
+// v6.2: security — each client can have its own workflow secret (the master secret still works for you and the scheduler);
+//       page login: PIN checked by the backend with lockout after 5 wrong tries, 12-hour sessions, only when switched on.
+// v6.1: Settings — everything that was set by SQL is now readable/saveable from a Settings page: business, goals, links,
+//       team, routing, schedules, sales, connections (secrets masked), plus pickers for contacts, GHL users and calendars.
 // v6.0: ad-hoc data questions — "top 20 clients", "how did last week compare to the month before", "who paid the most this
 //       year" → Archie pulls the relevant live data (Stripe, GHL, weekly history, clients, health, pipeline) and answers from it.
 // v5.9: dump anything — "dump: …", "brain dump …" or a long rambling voice note becomes a clean note, tasks (for the right
@@ -122,8 +128,14 @@ Deno.serve(async (req) => {
     // ---------- workflow side ----------
     const secretHeader = req.headers.get("x-archie-secret");
     if (secretHeader !== null) {
-      if (secretHeader !== SECRET) return j({ error: "unauthorized" }, 401);
       const tenant_id = String(p.tenant_id ?? "").trim();
+      const master = secretHeader === SECRET;
+      if (!master) {
+        // A client's own workflow secret only works for that client, and never for the all-clients actions
+        if (!tenant_id || ["dispatch", "checkup_all", "usage_all"].includes(action)) return j({ error: "unauthorized" }, 401);
+        const { data: ws } = await supabase.from("tenant_config").select("workflow_secret").eq("tenant_id", tenant_id).maybeSingle();
+        if (!ws?.workflow_secret || ws.workflow_secret !== secretHeader) return j({ error: "unauthorized" }, 401);
+      }
       if (action === "dispatch") return j(await dispatch(p));
       if (!tenant_id) return j({ error: "tenant_id required" }, 400);
       if (action === "run_next") return j(await runNext(tenant_id, String(p.kind ?? "")));
@@ -137,6 +149,14 @@ Deno.serve(async (req) => {
         const out: any[] = [];
         for (const t of ts ?? []) { const r: any = await checkup(t.id); out.push({ tenant_id: t.id, business: t.business_name, status: r.status, problems: r.problems }); }
         return j({ ok: true, tenants: out });
+      }
+      if (action === "usage") return j(await usage(tenant_id, String(p.month ?? "")));
+      if (action === "usage_all") {
+        if (!master) return j({ error: "unauthorized" }, 401);
+        const { data: ts } = await supabase.from("tenants").select("id, business_name").eq("status", "active");
+        const out: any[] = [];
+        for (const t of ts ?? []) { const u: any = await usage(t.id, String(p.month ?? "")); out.push({ business: t.business_name, runs: u.runs, est_cost_gbp: u.est_cost_gbp }); }
+        return j({ ok: true, month: String(p.month ?? "") || new Date().toISOString().slice(0, 7), tenants: out, total_gbp: Math.round(out.reduce((a, x) => a + (x.est_cost_gbp || 0), 0) * 100) / 100 });
       }
       if (action === "recurring_run") { const r = await recurringRun(tenant_id); return j({ ok: true, ...r }); }
       if (action === "health_run") { startInBackground(memberHealthRun(tenant_id)); return j({ ok: true, started: true }); }
@@ -166,6 +186,15 @@ Deno.serve(async (req) => {
     if (!token || token === "archie-screens") return j({ error: "Unauthorised" }, 401);
     const { data: tenant } = await supabase.from("tenants").select("id, status").eq("access_token", token).maybeSingle();
     if (!tenant || tenant.status !== "active") return j({ error: "Unauthorised" }, 401);
+    // Page login (only when switched on for this client): PIN → 12-hour session; 5 wrong tries → 15-minute lockout
+    const { data: sec } = await supabase.from("tenant_config").select("page_pin_hash, page_pin_required, pin_fails, pin_locked_until").eq("tenant_id", tenant.id).maybeSingle();
+    if (action === "pin_login") return j(await pinLogin(tenant.id, sec, String(p.pin ?? ""), String(p.who ?? "")));
+    // The Archie toolbox (MCP) calls "run" and "runs" server-to-server with the token — those don't need a page login
+    if (sec?.page_pin_required && !["run", "runs"].includes(action)) {
+      const sess = String(p.session ?? "");
+      const { data: ok } = sess ? await supabase.from("page_sessions").select("token").eq("tenant_id", tenant.id).eq("token", sess).gt("expires_at", new Date().toISOString()).maybeSingle() : { data: null };
+      if (!ok) return j({ ok: false, error: "login_required" }, 401);
+    }
     const c = await context(tenant.id);
 
     switch (action) {
@@ -193,10 +222,21 @@ Deno.serve(async (req) => {
       case "report": return j(await weeklyReport(c.tid, p));
       case "goals": return j(await getGoals(c.tid));
       case "checkup": return j(await checkup(c.tid));
+      case "settings_get": return j(await settingsGet(c.tid));
+      case "usage": return j(await usage(c.tid, String(p.month ?? "")));
+      case "pin_set": return j(await pinSet(c.tid, p));
+      case "logout": { if (p.session) await supabase.from("page_sessions").delete().eq("tenant_id", c.tid).eq("token", String(p.session)); return j({ ok: true }); }
+      case "settings_save": return j(await settingsSave(c.tid, p));
+      case "team_save": return j(await teamSave(c.tid, p));
+      case "team_archive": return j(await teamArchive(c.tid, p));
+      case "pick_contacts": return j(await pickContacts(c.tid, String(p.query ?? "")));
+      case "pick_users": return j(await pickUsers(c.tid));
+      case "pick_calendars": return j(await pickCalendars(c.tid));
+      case "pick_stages": return j(await pickStages(c.tid));
       case "council": return j(await councilRun(c.tid, p));
       case "call_prep": return j(await callPrep(c.tid, p));
       case "ask_data": return j(await askData(c.tid, String(p.question ?? "")));
-      case "dump": return j(await dumpAnything(c.tid, { handle: c.owner?.handle ?? "owner", gets_financials: true }, String(p.text ?? "")));
+      case "dump_anything": return j(await dumpAnything(c.tid, { handle: c.owner?.handle ?? "owner", gets_financials: true }, String(p.text ?? "")));
       case "dumps": { const { data } = await supabase.from("dumps").select("id, handle, clean, summary, created_at").eq("tenant_id", c.tid).order("created_at", { ascending: false }).limit(20); return j({ ok: true, dumps: data ?? [] }); }
       case "member_health": return j(await memberHealthList(c.tid, String(p.status ?? "")));
       case "groups_suggest": return j(await groupsSuggest(c.tid));
@@ -1160,11 +1200,11 @@ async function executeRun(tid: string, runId: string) {
     const body: Record<string, unknown> = { locationId: loc, message };
     if (r.contact_id) body.contactId = String(r.contact_id);
 
-    let res = await agentExecute(token, agentId, body, runId);
+    let res = await agentExecute(token, agentId, body, `skill-${tid}-${runId}`);
     if (res.status === 429 || res.status >= 500) {
       const wait = Math.min(20, Number(res.retryAfter) || 8) * 1000;
       await new Promise((ok) => setTimeout(ok, wait));
-      res = await agentExecute(token, agentId, body, runId);
+      res = await agentExecute(token, agentId, body, `skill-${tid}-${runId}-retry`);
     }
     if (res.status === 404) {
       // The cached agent ID is stale (agent replaced or renamed) — forget it so the next run looks it up again
@@ -1218,7 +1258,9 @@ function withRules(body: Record<string, unknown>) {
 
 async function agentExecute(token: string, agentId: string, body: Record<string, unknown>, idem: string) {
   body = withRules(body);
+  const started = Date.now();
   const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 140000);
+  let out: any;
   try {
     const r = await fetch(`${BASE}/agent-studio/managed-agents/${agentId}/execute`, {
       method: "POST", signal: ctrl.signal,
@@ -1226,9 +1268,19 @@ async function agentExecute(token: string, agentId: string, body: Record<string,
       body: JSON.stringify(body),
     });
     const text = await r.text(); let js: any = null; try { js = JSON.parse(text); } catch { js = null; }
-    return { ok: r.ok, status: r.status, json: js, text, retryAfter: r.headers.get("retry-after") };
-  } catch (e) { return { ok: false, status: 0, json: null, text: String(e), retryAfter: null }; }
+    out = { ok: r.ok, status: r.status, json: js, text, retryAfter: r.headers.get("retry-after") };
+  } catch (e) { out = { ok: false, status: 0, json: null, text: String(e), retryAfter: null }; }
   finally { clearTimeout(tm); }
+  // Usage log — every agent run, for cost tracking (tenant and job come from the idempotency key)
+  try {
+    const tid = String(idem).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] ?? null;
+    const job = String(idem).split("-")[0] || "agent";
+    await supabase.from("agent_usage").insert({
+      tenant_id: tid, job, ok: !!out.ok && out.json?.success !== false, status: out.status, ms: Date.now() - started,
+      chars_in: String((body as any)?.message ?? "").length, chars_out: String(out.json?.finalText ?? "").length,
+    });
+  } catch { /* never block a run on logging */ }
+  return out;
 }
 
 // ===================== v2.1: morning brief via the API =====================
@@ -1745,7 +1797,7 @@ async function dispatch(_p: any) {
 async function sendToTeam(tid: string, ownerText: string, teamText: string, label: string) {
   const [{ data: cfg }, { data: team }] = await Promise.all([
     supabase.from("tenant_config").select("ghl_token, brief_channel").eq("tenant_id", tid).single(),
-    supabase.from("team_members").select("handle, gets_financials, ghl_contact_id").eq("tenant_id", tid),
+    supabase.from("team_members").select("handle, gets_financials, ghl_contact_id").eq("tenant_id", tid).neq("active", false),
   ]);
   const token = cfg?.ghl_token || FALLBACK_TOKEN;
   const channel = String(cfg?.brief_channel ?? "sms").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS";
@@ -3645,6 +3697,170 @@ async function askData(tid: string, question: string) {
   const res = await agentExecute(token, agentId, { locationId: loc, message: msg }, `data-${tid}-${Date.now()}`);
   const out = tidy(clean(String(res.json?.finalText ?? ""))).trim();
   return out ? { ok: true, text: `${out}\n\n(From: ${[...new Set(sources)].join(", ") || "Archie's data"})` } : { ok: false, text: "Couldn't work that out just now — try again in a minute." };
+}
+
+// ===================== v6.1: Settings =====================
+// Only these settings can be read/changed from the page. Secrets are never sent back — just whether they're set.
+const SETTINGS_FIELDS: Record<string, "text" | "int" | "bool" | "num" | "time" | "json"> = {
+  timezone: "text", brief_channel: "text", customer_word: "text", sale_word: "text",
+  icp: "text", core_offer: "text", brand_voice: "text", brand_context: "text", content_pillars: "json",
+  booking_link_lead: "text", booking_link_client: "text", referral_link: "text",
+  mrr_target: "num", revenue_target: "num", goal_date: "text", avg_sale_value: "num", show_rate: "num", close_rate: "num",
+  routing_auto: "bool", routing_text: "text", csm_handle: "text", payments_owner: "text", onboarding_owner: "text",
+  schedules_on: "bool",
+  sched_morning: "time", sched_morning_days: "text", sched_evening: "time", sched_evening_days: "text",
+  sched_plan: "time", sched_plan_day: "int", sched_monthly: "time", sched_monthly_day: "int",
+  sched_renewals: "time", sched_report: "time", sched_report_day: "int", sched_report_nightly: "time",
+  sched_recurring: "time", sched_health: "time",
+  won_creates_invoice: "bool", stale_threshold_days: "int", pipeline_name: "text", trial_stage_name: "text",
+};
+const SECRET_FIELDS = ["stripe_key", "fathom_api_key", "ghl_token"];
+
+async function settingsGet(tid: string) {
+  const [{ data: t }, { data: cfg }, { data: team }] = await Promise.all([
+    supabase.from("tenants").select("business_name, status").eq("id", tid).maybeSingle(),
+    supabase.from("tenant_config").select("*").eq("tenant_id", tid).maybeSingle(),
+    supabase.from("team_members").select("*").eq("tenant_id", tid).order("gets_financials", { ascending: false }),
+  ]);
+  const settings: Record<string, unknown> = {};
+  for (const k of Object.keys(SETTINGS_FIELDS)) settings[k] = cfg?.[k] ?? null;
+  const connections: Record<string, boolean> = {};
+  for (const k of SECRET_FIELDS) connections[k] = !!cfg?.[k];
+  return {
+    ok: true, business_name: t?.business_name ?? "", status: t?.status ?? "", settings, connections,
+    team: (team ?? []).filter((m: any) => m.active !== false).map((m: any) => ({
+      handle: m.handle, name: m.name, phone: m.phone, ghl_contact_id: m.ghl_contact_id, ghl_user_id: m.ghl_user_id,
+      personal_calendar_id: m.personal_calendar_id, talk_mode: m.talk_mode, talk_window_minutes: m.talk_window_minutes, gets_financials: !!m.gets_financials,
+    })),
+  };
+}
+
+async function settingsSave(tid: string, p: any) {
+  const patch: Record<string, unknown> = {};
+  const bad: string[] = [];
+  const src = p.settings ?? p;
+  for (const [k, type] of Object.entries(SETTINGS_FIELDS)) {
+    if (!(k in src)) continue;
+    const v = src[k];
+    if (v === null || v === "") { patch[k] = null; continue; }
+    if (type === "bool") patch[k] = v === true || String(v) === "true";
+    else if (type === "int") { const n = parseInt(String(v), 10); Number.isFinite(n) ? patch[k] = n : bad.push(k); }
+    else if (type === "num") { const n = Number(String(v).replace(/[£,%\s]/g, "")); if (!Number.isFinite(n)) bad.push(k); else patch[k] = (k === "show_rate" || k === "close_rate") && n > 1 ? n / 100 : n; }
+    else if (type === "time") /^\d{1,2}:\d{2}$/.test(String(v)) ? patch[k] = String(v).padStart(5, "0") : bad.push(k);
+    else if (type === "json") { try { patch[k] = typeof v === "string" ? JSON.parse(v) : v; } catch { bad.push(k); } }
+    else patch[k] = String(v).slice(0, 4000);
+  }
+  if (patch.goal_date && !/^\d{4}-\d{2}-\d{2}$/.test(String(patch.goal_date))) { bad.push("goal_date"); delete patch.goal_date; }
+  // Secrets: write-only
+  if (String(src.stripe_key ?? "").startsWith("rk_")) patch.stripe_key = String(src.stripe_key).trim();
+  else if (src.stripe_key) bad.push("stripe_key (must be a restricted key starting rk_)");
+  if (String(src.fathom_api_key ?? "").trim().length > 10) patch.fathom_api_key = String(src.fathom_api_key).trim();
+  if (src.business_name) await supabase.from("tenants").update({ business_name: String(src.business_name).slice(0, 120) }).eq("id", tid);
+  if (src.trial_stage_name !== undefined && src.trial_stage_name) { const r: any = await setTrialStage(tid, { stage: src.trial_stage_name }); if (!r.ok) bad.push(`trial stage: ${r.text}`); delete patch.trial_stage_name; }
+  if (Object.keys(patch).length) {
+    const { error } = await supabase.from("tenant_config").update(patch).eq("tenant_id", tid);
+    if (error) return { ok: false, error: error.message };
+  }
+  if (["mrr_target", "revenue_target", "goal_date", "avg_sale_value", "show_rate", "close_rate"].some((k) => k in patch)) await supabase.from("weekly_reports").delete().eq("tenant_id", tid).eq("is_final", false);
+  return { ok: bad.length === 0, saved: Object.keys(patch).filter((k) => !SECRET_FIELDS.includes(k)), secrets_saved: Object.keys(patch).filter((k) => SECRET_FIELDS.includes(k)), problems: bad };
+}
+
+async function teamSave(tid: string, p: any) {
+  const handle = String(p.handle ?? "").toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 30);
+  if (!handle) return { ok: false, error: "handle required (e.g. sara)" };
+  const row: Record<string, unknown> = { tenant_id: tid, handle, active: true };
+  for (const k of ["name", "phone", "ghl_contact_id", "ghl_user_id", "personal_calendar_id", "talk_mode"]) if (p[k] !== undefined) row[k] = p[k] === "" ? null : String(p[k]).slice(0, 200);
+  if (p.talk_window_minutes !== undefined) row.talk_window_minutes = Math.max(1, Math.min(60, parseInt(String(p.talk_window_minutes), 10) || 10));
+  if (p.gets_financials !== undefined) row.gets_financials = p.gets_financials === true || String(p.gets_financials) === "true";
+  if (row.talk_mode && !["all", "wake", "off"].includes(String(row.talk_mode))) return { ok: false, error: "talk_mode must be all, wake or off" };
+  const { error } = await supabase.from("team_members").upsert(row, { onConflict: "tenant_id,handle" });
+  return error ? { ok: false, error: error.message } : { ok: true };
+}
+
+async function teamArchive(tid: string, p: any) {
+  const handle = String(p.handle ?? "").toLowerCase();
+  const { data: m } = await supabase.from("team_members").select("gets_financials").eq("tenant_id", tid).eq("handle", handle).maybeSingle();
+  if (!m) return { ok: false, error: "no such team member" };
+  if (m.gets_financials) return { ok: false, error: "The owner can't be archived." };
+  const { error } = await supabase.from("team_members").update({ active: false, talk_mode: "off" }).eq("tenant_id", tid).eq("handle", handle);
+  return error ? { ok: false, error: error.message } : { ok: true, text: `${handle} archived — kept on file, Archie stops messaging them.` };
+}
+
+async function pickContacts(tid: string, query: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+  if (!query.trim()) return { ok: true, contacts: [] };
+  const r = await ghl(cfg?.ghl_token || FALLBACK_TOKEN, `/contacts/?locationId=${cfg?.ghl_location_id}&query=${encodeURIComponent(query)}&limit=8`, "GET", undefined, "2021-07-28");
+  return { ok: true, contacts: (r.json?.contacts ?? []).map((c: any) => ({ id: c.id, name: [c.firstName, c.lastName].filter(Boolean).join(" ") || c.contactName || "", phone: c.phone ?? "", email: c.email ?? "" })) };
+}
+async function pickUsers(tid: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+  const r = await ghl(cfg?.ghl_token || FALLBACK_TOKEN, `/users/?locationId=${cfg?.ghl_location_id}`, "GET", undefined, "2021-07-28");
+  return { ok: true, users: (r.json?.users ?? []).map((u: any) => ({ id: u.id, name: u.name || [u.firstName, u.lastName].filter(Boolean).join(" "), email: u.email })) };
+}
+async function pickCalendars(tid: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+  const r = await ghl(cfg?.ghl_token || FALLBACK_TOKEN, `/calendars/?locationId=${cfg?.ghl_location_id}`, "GET", undefined, "2021-04-15");
+  return { ok: true, calendars: (r.json?.calendars ?? []).map((c: any) => ({ id: c.id, name: c.name })) };
+}
+async function pickStages(tid: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+  const r = await ghl(cfg?.ghl_token || FALLBACK_TOKEN, `/opportunities/pipelines?locationId=${cfg?.ghl_location_id}`, "GET", undefined, "2021-07-28");
+  return { ok: true, pipelines: (r.json?.pipelines ?? []).map((pp: any) => ({ id: pp.id, name: pp.name, stages: (pp.stages ?? []).map((st: any) => ({ id: st.id, name: st.name })) })) };
+}
+
+// ===================== v6.2: page login =====================
+async function sha256(t: string) {
+  const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t));
+  return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+async function pinLogin(tid: string, sec: any, pin: string, who: string) {
+  if (!sec?.page_pin_hash) return { ok: false, error: "No PIN set for this business yet." };
+  if (sec.pin_locked_until && Date.parse(sec.pin_locked_until) > Date.now()) return { ok: false, error: "Too many wrong tries — locked for a few minutes." };
+  if ((await sha256(`${tid}:${pin.trim()}`)) !== sec.page_pin_hash) {
+    const fails = Number(sec.pin_fails ?? 0) + 1;
+    await supabase.from("tenant_config").update({ pin_fails: fails >= 5 ? 0 : fails, pin_locked_until: fails >= 5 ? new Date(Date.now() + 15 * 60000).toISOString() : null }).eq("tenant_id", tid);
+    return { ok: false, error: fails >= 5 ? "Too many wrong tries — locked for 15 minutes." : "Wrong PIN." };
+  }
+  const token = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, "");
+  await supabase.from("page_sessions").insert({ tenant_id: tid, token, who: who.slice(0, 60) || null, expires_at: new Date(Date.now() + 12 * 3600000).toISOString() });
+  await supabase.from("tenant_config").update({ pin_fails: 0, pin_locked_until: null }).eq("tenant_id", tid);
+  await supabase.from("page_sessions").delete().eq("tenant_id", tid).lt("expires_at", new Date().toISOString());
+  return { ok: true, session: token, expires_in_hours: 12 };
+}
+async function pinSet(tid: string, p: any) {
+  const pin = String(p.pin ?? "").trim();
+  if (!/^\d{4,8}$/.test(pin)) return { ok: false, error: "PIN must be 4–8 digits." };
+  await supabase.from("tenant_config").update({ page_pin_hash: await sha256(`${tid}:${pin}`), page_pin_required: p.required === undefined ? true : (p.required === true || String(p.required) === "true"), pin_fails: 0, pin_locked_until: null }).eq("tenant_id", tid);
+  await supabase.from("page_sessions").delete().eq("tenant_id", tid); // everyone logs in again with the new PIN
+  return { ok: true, text: "PIN saved — everyone will need it next time they open the pages." };
+}
+
+// ===================== v6.3: usage and costs =====================
+// Estimated cost uses your rate per agent run (agency setting: est_cost_per_run_gbp, default 0.03) — update it once you see GHL's real bill.
+async function usage(tid: string, month: string) {
+  const m = /^\d{4}-\d{2}$/.test(month) ? month : new Date().toISOString().slice(0, 7);
+  const from = `${m}-01T00:00:00Z`;
+  const [y, mm] = m.split("-").map(Number);
+  const to = new Date(Date.UTC(y, mm, 1)).toISOString();
+  const { data: rows } = await supabase.from("agent_usage").select("job, ok, ms, chars_in, chars_out").eq("tenant_id", tid).gte("created_at", from).lt("created_at", to).limit(20000);
+  const { data: cfg } = await supabase.from("tenant_config").select("est_cost_per_run_gbp").eq("tenant_id", tid).maybeSingle();
+  const rate = Number(cfg?.est_cost_per_run_gbp ?? 0) || 0.03;
+  const byJob = new Map<string, { runs: number; failed: number; ms: number; chars: number }>();
+  for (const r of rows ?? []) {
+    const k = String(r.job); const v = byJob.get(k) ?? { runs: 0, failed: 0, ms: 0, chars: 0 };
+    v.runs++; if (!r.ok) v.failed++; v.ms += Number(r.ms) || 0; v.chars += (Number(r.chars_in) || 0) + (Number(r.chars_out) || 0);
+    byJob.set(k, v);
+  }
+  const runs = (rows ?? []).length;
+  const jobs = [...byJob.entries()].sort((a, b) => b[1].runs - a[1].runs).map(([job, v]) => ({ job, runs: v.runs, failed: v.failed, avg_seconds: Math.round(v.ms / Math.max(1, v.runs) / 1000), chars: v.chars }));
+  const est = Math.round(runs * rate * 100) / 100;
+  const daysSoFar = m === new Date().toISOString().slice(0, 7) ? new Date().getUTCDate() : new Date(Date.UTC(y, mm, 0)).getUTCDate();
+  const daysInMonth = new Date(Date.UTC(y, mm, 0)).getUTCDate();
+  const projected = Math.round((est / Math.max(1, daysSoFar)) * daysInMonth * 100) / 100;
+  return {
+    ok: true, month: m, runs, est_cost_gbp: est, projected_month_gbp: projected, rate_per_run_gbp: rate, jobs,
+    text: `Agent runs in ${m}: ${runs} (estimate £${est.toFixed(2)} so far, about £${projected.toFixed(2)} for the month at £${rate} a run).\n${jobs.slice(0, 10).map((j) => `${j.job}: ${j.runs} runs${j.failed ? `, ${j.failed} failed` : ""}, ~${j.avg_seconds}s each`).join("\n")}\n(Estimate — the real figure is on GHL's Agent Studio billing.)`,
+  };
 }
 
 // ===================== workflow side =====================

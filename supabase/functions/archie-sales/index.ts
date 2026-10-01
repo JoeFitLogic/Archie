@@ -1,4 +1,6 @@
-// archie-sales v2.4.1 — after-call scoring, quotes and won → invoice. API-first: one webhook in, everything else here.
+// archie-sales v2.6 — after-call scoring, quotes and won → invoice. API-first: one webhook in, everything else here.
+// v2.6: every agent run logged to agent_usage for cost tracking.
+// archie-sales v2.5: accepts each client's own workflow secret as well as the master secret.
 // v2.4.1: Joe's full ARCHIE RULES on every agent run.
 // v2.4: Archie rules added to every agent run (no made-up numbers — [NEED: …], flag bad data, label the source, archive never delete, answer first).
 // POST /functions/v1/archie-sales   header x-archie-secret   { action, tenant_id, ... }
@@ -18,13 +20,22 @@ function startInBackground(p: Promise<unknown>) {
   p.catch((e) => console.error("background failed", e));
 }
 
+// Master secret (you, the scheduler) or this client's own workflow secret
+async function secretOk(header: string | null, tenantId: string): Promise<boolean> {
+  if (!header) return false;
+  if (header === SECRET) return true;
+  if (!tenantId) return false;
+  const { data } = await supabase.from("tenant_config").select("workflow_secret").eq("tenant_id", tenantId).maybeSingle();
+  return !!data?.workflow_secret && data.workflow_secret === header;
+}
+
 Deno.serve(async (req) => {
   try {
-    if (req.headers.get("x-archie-secret") !== SECRET) return j({ error: "unauthorized" }, 401);
     let raw: any = {};
     try { raw = await req.json(); } catch { return j({ error: "invalid JSON" }, 400); }
     const p = { ...raw, ...(raw.customData ?? {}) };
     const tenant_id = str(p.tenant_id);
+    if (!(await secretOk(req.headers.get("x-archie-secret"), tenant_id))) return j({ error: "unauthorized" }, 401);
     if (!tenant_id) return j({ error: "tenant_id required" }, 400);
     const c = await context(tenant_id);
     if (!c) return j({ ok: true, skipped: "tenant not active" });
@@ -306,10 +317,10 @@ async function afterCall(c: any, p: any) {
   const agentId = await afterCallAgentId(c);
   if (!agentId) return log("failed", "", "couldn't find the Archie After Call agent — check it's published with that exact name");
 
-  let res = await agentExecute(c.token, agentId, { locationId: c.loc, message: String(ctx.message).slice(0, 9900), contactId }, `aftercall-${contactId}-${Date.now()}`);
+  let res = await agentExecute(c.token, agentId, { locationId: c.loc, message: String(ctx.message).slice(0, 9900), contactId }, `aftercall-${c.tid}-${contactId}-${Date.now()}`);
   if (res.status === 429 || res.status >= 500) {
     await new Promise((ok) => setTimeout(ok, Math.min(20, Number(res.retryAfter) || 8) * 1000));
-    res = await agentExecute(c.token, agentId, { locationId: c.loc, message: String(ctx.message).slice(0, 9900), contactId }, `aftercall-${contactId}-${Date.now()}`);
+    res = await agentExecute(c.token, agentId, { locationId: c.loc, message: String(ctx.message).slice(0, 9900), contactId }, `aftercall-${c.tid}-${contactId}-${Date.now()}`);
   }
   if (!res.ok || res.json?.success === false) return log("failed", "", `After Call agent error ${res.status}: ${String(res.text).slice(0, 200)}`);
 
@@ -368,7 +379,9 @@ function withRules(body: Record<string, unknown>) {
 
 async function agentExecute(token: string, agentId: string, body: Record<string, unknown>, idem: string) {
   body = withRules(body);
+  const started = Date.now();
   const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 140000);
+  let out: any;
   try {
     const r = await fetch(`${BASE}/agent-studio/managed-agents/${agentId}/execute`, {
       method: "POST", signal: ctrl.signal,
@@ -376,9 +389,19 @@ async function agentExecute(token: string, agentId: string, body: Record<string,
       body: JSON.stringify(body),
     });
     const text = await r.text(); let js: any = null; try { js = JSON.parse(text); } catch { js = null; }
-    return { ok: r.ok, status: r.status, json: js, text, retryAfter: r.headers.get("retry-after") };
-  } catch (e) { return { ok: false, status: 0, json: null, text: String(e), retryAfter: null }; }
+    out = { ok: r.ok, status: r.status, json: js, text, retryAfter: r.headers.get("retry-after") };
+  } catch (e) { out = { ok: false, status: 0, json: null, text: String(e), retryAfter: null }; }
   finally { clearTimeout(tm); }
+  // Usage log — every agent run, for cost tracking (tenant and job come from the idempotency key)
+  try {
+    const tid = String(idem).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] ?? null;
+    const job = String(idem).split("-")[0] || "agent";
+    await supabase.from("agent_usage").insert({
+      tenant_id: tid, job, ok: !!out.ok && out.json?.success !== false, status: out.status, ms: Date.now() - started,
+      chars_in: String((body as any)?.message ?? "").length, chars_out: String(out.json?.finalText ?? "").length,
+    });
+  } catch { /* never block a run on logging */ }
+  return out;
 }
 
 // ===================== helpers =====================
