@@ -1,4 +1,6 @@
-// archie-screens v5.9 — data and actions for the Archie AI Studio pages.
+// archie-screens v6.0 — data and actions for the Archie AI Studio pages.
+// v6.0: ad-hoc data questions — "top 20 clients", "how did last week compare to the month before", "who paid the most this
+//       year" → Archie pulls the relevant live data (Stripe, GHL, weekly history, clients, health, pipeline) and answers from it.
 // v5.9: dump anything — "dump: …", "brain dump …" or a long rambling voice note becomes a clean note, tasks (for the right
 //       person), notes on the right contacts, and things to remember. Saved in Archie; the page shows recent dumps.
 // v5.8: call prep — "I've got Sarah at 10" → who they are, the last thing they asked, what's open (deal, tasks, drafts),
@@ -193,6 +195,7 @@ Deno.serve(async (req) => {
       case "checkup": return j(await checkup(c.tid));
       case "council": return j(await councilRun(c.tid, p));
       case "call_prep": return j(await callPrep(c.tid, p));
+      case "ask_data": return j(await askData(c.tid, String(p.question ?? "")));
       case "dump": return j(await dumpAnything(c.tid, { handle: c.owner?.handle ?? "owner", gets_financials: true }, String(p.text ?? "")));
       case "dumps": { const { data } = await supabase.from("dumps").select("id, handle, clean, summary, created_at").eq("tenant_id", c.tid).order("created_at", { ascending: false }).limit(20); return j({ ok: true, dumps: data ?? [] }); }
       case "member_health": return j(await memberHealthList(c.tid, String(p.status ?? "")));
@@ -1867,6 +1870,7 @@ const TALK_RULES = [
   "- archie_memory {action save|list|archive, kind definition|voice|worked|service|fact, key, value} — 'remember…', 'a client means…', 'that doesn't sound like me…', 'forget the … one'. archie_remember also works for plain facts.",
   "- archie_checkup — 'is everything working?'; give the report as it is.",
   "- 'Show my last dump' → the LAST DUMP in the CONTEXT (give the clean note as it is). Dumps themselves are handled before you see them.",
+  "- archie_data {question} — any question about their numbers or lists that isn't covered above: 'top 20 clients', 'who paid the most this year', 'how did last week compare to the month before', 'which clients joined in January', 'how many leads came from Instagram'. Pass their question as it is; give the answer as it is.",
   "- archie_call_prep {name, time} — 'I've got Sarah at 10', 'prep me for my 2pm', 'what do I need to know before the Martin call?'. Give the result as it is.",
   "- archie_council {question, answers, lens} — big decisions ('second opinion: should I raise prices to £75?', 'should I hire a coach?'). If it comes back with QUESTIONS, ask them and, when they answer, run archie_council again with the same question + answers. 'Ask Money more about that' → {lens:'Money', question: what they want to know}. Give the result as it is.",
   "RULES: Only send to customers what exists as a waiting draft — never freehand. New customer messages: draft in REPLY and ask 'Send it?'. Team members never get money figures and only see their own list. Unclear which item? Ask one short question with ACTIONS_JSON: []. Never invent tasks, names, numbers, dates or results.",
@@ -2058,10 +2062,10 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep", "archie_data"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
-      const OWNER_ONLY = ["archie_call_prep", "archie_council", "archie_set_trial", "archie_groups", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
+      const OWNER_ONLY = ["archie_data", "archie_call_prep", "archie_council", "archie_set_trial", "archie_groups", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
       // The CSM can draft, send and bin their OWN client check-ins and chases
       const isCsm = !member.gets_financials && String(cfg?.csm_handle ?? "").toLowerCase() === String(member.handle).toLowerCase();
       if (isCsm && ["archie_draft_followups", "archie_send_draft", "archie_skip_draft", "archie_drafts"].includes(act.tool)) {
@@ -2071,7 +2075,9 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
         continue;
       }
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_call_prep"
+      const r = act.tool === "archie_data"
+        ? await (async () => { const x: any = await askData(tid, String(args.question ?? text)); return { ok: !!x.ok, text: x.text }; })()
+        : act.tool === "archie_call_prep"
         ? await (async () => { const x: any = await callPrep(tid, args); return { ok: !!x.ok, text: x.text }; })()
         : act.tool === "archie_council"
         ? await (async () => { const x: any = await councilRun(tid, args); return { ok: !!x.ok, text: x.text }; })()
@@ -2112,7 +2118,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     }
 
     // Some results go straight back as they are (no rewrite): the council and the checkup
-    if (plan.actions.length === 1 && ["archie_council", "archie_checkup", "archie_call_prep"].includes(plan.actions[0].tool) && results[0]) {
+    if (plan.actions.length === 1 && ["archie_council", "archie_checkup", "archie_call_prep", "archie_data"].includes(plan.actions[0].tool) && results[0]) {
       const direct = results[0].replace(/^archie_\w+ \{[^\n]*?\} → (OK|FAILED): /, "").trim();
       const sentD = await reply(direct);
       return log(sentD.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${direct.slice(0, 80)} | actions: ${ran.join(", ")}`, sentD.ok ? null : `reply not sent (${sentD.status})`);
@@ -3537,6 +3543,108 @@ async function dumpAnything(tid: string, member: any, raw: string) {
       `Say "show my last dump" for the clean note.`,
     ].filter(Boolean).join("\n"),
   };
+}
+
+// ===================== v6.0: ad-hoc data questions =====================
+async function stripeGet(key: string, path: string) {
+  const r = await fetch(`https://api.stripe.com/v1/${path}`, { headers: { Authorization: `Bearer ${key}` } });
+  return r.ok ? await r.json() : null;
+}
+
+async function askData(tid: string, question: string) {
+  const q = question.trim().slice(0, 500);
+  if (!q) return { ok: false, text: "What do you want to know?" };
+  const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).single();
+  const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
+  const tz = cfg?.timezone || "Europe/London";
+  const today = localDate(Date.now(), tz);
+  const want = (re: RegExp) => re.test(q);
+  const sections: string[] = [];
+  const sources: string[] = [];
+
+  // Money: Stripe customers, charges, subscriptions
+  if (want(/paid|pay|revenue|income|money|spend|top|biggest|best|mrr|subscri|plan|price|charge|refund|£|customer|client/i) && cfg?.stripe_key) {
+    const since = Math.floor(Date.parse(`${today.slice(0, 4)}-01-01T00:00:00Z`) / 1000) - (want(/last year|12 months|year/i) ? 365 * 86400 : 0);
+    const totals = new Map<string, { name: string; email: string; paid: number; count: number; last: number }>();
+    let starting = "";
+    for (let i = 0; i < 6; i++) {
+      const page: any = await stripeGet(cfg.stripe_key, `charges?limit=100&created[gte]=${since}${starting ? `&starting_after=${starting}` : ""}`);
+      const list: any[] = page?.data ?? [];
+      for (const ch of list) {
+        if (!ch.paid || ch.refunded) continue;
+        const email = String(ch.billing_details?.email ?? ch.receipt_email ?? ch.customer ?? "unknown").toLowerCase();
+        const t = totals.get(email) ?? { name: String(ch.billing_details?.name ?? ""), email, paid: 0, count: 0, last: 0 };
+        t.paid += (Number(ch.amount) - Number(ch.amount_refunded ?? 0)) / 100; t.count++; t.last = Math.max(t.last, Number(ch.created));
+        if (!t.name && ch.billing_details?.name) t.name = ch.billing_details.name;
+        totals.set(email, t);
+      }
+      if (!page?.has_more || !list.length) break;
+      starting = list[list.length - 1].id;
+    }
+    const ranked = [...totals.values()].sort((a, b) => b.paid - a.paid);
+    if (ranked.length) {
+      sections.push(`STRIPE — paid by customer since ${new Date(since * 1000).toISOString().slice(0, 10)} (paid charges, refunds removed), highest first:\n${ranked.slice(0, 40).map((t, i) => `${i + 1}. ${t.name || t.email} (${t.email}) — £${t.paid.toFixed(0)} across ${t.count} payment${t.count === 1 ? "" : "s"}, last ${new Date(t.last * 1000).toISOString().slice(0, 10)}`).join("\n")}\nTotal: £${ranked.reduce((a, t) => a + t.paid, 0).toFixed(0)} from ${ranked.length} customers.`);
+      sources.push("Stripe");
+    }
+    const subs: any = await stripeGet(cfg.stripe_key, `subscriptions?status=active&limit=100&expand[]=data.customer`);
+    const sl: any[] = subs?.data ?? [];
+    if (sl.length) {
+      const rows = sl.map((sb: any) => {
+        const amt = (sb.items?.data ?? []).reduce((a: number, it: any) => a + (Number(it.price?.unit_amount ?? 0) * Number(it.quantity ?? 1)) / 100 * (it.price?.recurring?.interval === "year" ? 1 / 12 : 1), 0);
+        return { who: String(sb.customer?.name ?? sb.customer?.email ?? "customer"), amt, since: new Date(Number(sb.start_date) * 1000).toISOString().slice(0, 10) };
+      }).sort((a, b) => b.amt - a.amt);
+      sections.push(`STRIPE — active subscriptions (monthly value), highest first:\n${rows.slice(0, 40).map((r, i) => `${i + 1}. ${r.who} — £${r.amt.toFixed(0)}/month since ${r.since}`).join("\n")}`);
+    }
+  }
+  // Trends: weekly history + daily metrics
+  if (want(/week|month|compare|trend|last|before|since|up|down|growth|pace|calls|sales|messages|booked|show/i)) {
+    const { data: weeks } = await supabase.from("weekly_reports").select("week_start, data").eq("tenant_id", tid).order("week_start", { ascending: false }).limit(12);
+    if (weeks?.length) {
+      sections.push(`WEEKLY HISTORY (Archie's weekly reports, newest first):\n${weeks.map((w: any) => { const d = w.data ?? {}; return `${w.week_start}: messages ${d.messages_sent ?? "?"}, booked ${d.calls_booked ?? "?"}, held ${d.calls_held ?? "?"}, sales ${d.sales_count ?? "?"} (£${d.sales_value ?? "?"}), new income £${d.new_income ?? "?"}, MRR £${d.mrr ?? "?"}, new MRR £${d.new_mrr ?? "?"}${d.enquiries !== undefined ? `, enquiries ${d.enquiries}, slow replies ${d.reply_slow}` : ""}`; }).join("\n")}`);
+      sources.push("weekly reports");
+    }
+    const { data: dm } = await supabase.from("daily_metrics").select("metric_date, mrr, revenue_mtd, cash_24h").eq("tenant_id", tid).order("metric_date", { ascending: false }).limit(90);
+    if (dm?.length) {
+      const monthly = new Map<string, { rev: number; mrr: number }>();
+      for (const r of dm) { const m = String(r.metric_date).slice(0, 7); const cur = monthly.get(m); if (!cur) monthly.set(m, { rev: Number(r.revenue_mtd ?? 0), mrr: Number(r.mrr ?? 0) }); }
+      sections.push(`MONTHS (Stripe daily snapshots — revenue to date as of the latest day we have in each month, and MRR then):\n${[...monthly.entries()].map(([m, v]) => `${m}: revenue £${Math.round(v.rev)}, MRR £${Math.round(v.mrr)}`).join("\n")}`);
+      sources.push("Stripe daily snapshots");
+    }
+  }
+  // Clients
+  if (want(/client|member|joined|started|churn|left|cancel|health|risk|red|yellow|active|top|longest/i)) {
+    const { data: cl } = await supabase.from("clients").select("name, status, started_at, ended_at, last_contact_at").eq("tenant_id", tid).order("started_at", { ascending: true }).limit(300);
+    if (cl?.length) {
+      sections.push(`CLIENTS (Archie's client list, oldest first):\n${cl.map((c: any) => `${c.name ?? "?"} — ${c.status}, started ${String(c.started_at ?? "?").slice(0, 10)}${c.ended_at ? `, ended ${String(c.ended_at).slice(0, 10)}` : ""}`).join("\n")}`);
+      sources.push("Archie clients");
+    }
+    const { data: mh } = await supabase.from("member_health").select("name, status, reasons").eq("tenant_id", tid);
+    if (mh?.length) sections.push(`CLIENT HEALTH (Archie's scoring):\n${mh.map((m: any) => `${m.name}: ${m.status} — ${(m.reasons ?? []).join("; ")}`).join("\n")}`);
+  }
+  // Pipeline and leads
+  if (want(/lead|pipeline|deal|proposal|prospect|source|instagram|facebook|referral|won|lost|open|stage/i)) {
+    const pl: any = await pipelineList({ tid, ghlToken: token });
+    const items: any[] = pl?.items ?? [];
+    if (items.length) { sections.push(`OPEN PIPELINE (GHL):\n${items.slice(0, 50).map((x) => `${x.name} — ${x.stage}${x.value ? `, £${x.value}` : ""}, quiet ${x.days} days${x.real ? "" : " (not real yet)"}`).join("\n")}`); sources.push("GHL pipeline"); }
+    const won = await ghl(token, `/opportunities/search?location_id=${loc}&status=won&limit=50`, "GET", undefined, "2021-07-28");
+    const wl: any[] = won.json?.opportunities ?? [];
+    if (wl.length) sections.push(`WON DEALS (GHL, latest 50):\n${wl.map((o: any) => `${o.name} — £${o.monetaryValue ?? 0}, won ${String(o.lastStatusChangeAt ?? o.updatedAt ?? "").slice(0, 10)}${o.source ? `, source ${o.source}` : ""}`).join("\n")}`);
+    if (want(/source|instagram|facebook|referral|google|where.*from/i)) {
+      const cs = await ghl(token, `/contacts/?locationId=${loc}&limit=100`, "GET", undefined, "2021-07-28");
+      const bySource = new Map<string, number>();
+      for (const c of cs.json?.contacts ?? []) { const k = String(c.source ?? "unknown").toLowerCase() || "unknown"; bySource.set(k, (bySource.get(k) ?? 0) + 1); }
+      sections.push(`LEAD SOURCES (GHL, latest 100 contacts):\n${[...bySource.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}: ${v}`).join("\n")}`);
+    }
+  }
+  if (!sections.length) return { ok: true, text: `I don't have data that answers that yet. I can see: Stripe payments and subscriptions, weekly numbers, clients and their health, the pipeline and won deals, lead sources. [NEED: tell me which of those it's about, or what's missing.]` };
+
+  const agentId = await agentIdFor(tid, "ops", token, loc) || await agentIdFor(tid, "sales", token, loc);
+  if (!agentId) return { ok: false, text: "I can't find an agent to answer that." };
+  const pack = sections.join("\n\n").slice(0, 8200);
+  const msg = `Answer the owner's question using ONLY the data below. Answer first (the number or the list), then one line on what stands out. Show your working briefly if you calculated anything. If the data can't answer it, say exactly what's missing. Plain English, no markdown symbols. Lists as numbered lines. Today is ${today}.\n\nQUESTION: ${q}\n\nDATA\n${pack}`;
+  const res = await agentExecute(token, agentId, { locationId: loc, message: msg }, `data-${tid}-${Date.now()}`);
+  const out = tidy(clean(String(res.json?.finalText ?? ""))).trim();
+  return out ? { ok: true, text: `${out}\n\n(From: ${[...new Set(sources)].join(", ") || "Archie's data"})` } : { ok: false, text: "Couldn't work that out just now — try again in a minute." };
 }
 
 // ===================== workflow side =====================
