@@ -1,4 +1,6 @@
-// archie-screens v4.9.1 — data and actions for the Archie AI Studio pages.
+// archie-screens v4.9.2 — data and actions for the Archie AI Studio pages.
+// v4.9.2: Scraper/Pipeline timeouts (524) — smaller context by default for the Scraper, and a retry with a trimmed context
+//         if GHL's agent times out, so the morning run finishes instead of failing.
 // v4.9.1: Joe's full ARCHIE RULES on every agent run (short version when the message is long; exact output formats kept).
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
@@ -1466,13 +1468,20 @@ async function runAgentJob(tid: string, job: "pipeline" | "scraper", contextText
   const head = job === "pipeline"
     ? `Execute your instructions now. Return only the output format. Customer word: ${cw} Sale word: ${sw}\n\n${rules}\n\nPIPELINE CONTEXT:\n`
     : `Execute your instructions now. Return only the output format. Customer word: ${cw}\n\n${rules}\n\nSCRAPER CONTEXT:\n`;
-  const room = 9900 - head.length;
-  const message = head + (ctx.length > room ? ctx.slice(0, room - 60) + "\n[trimmed — more activity than fits]" : ctx);
+  // Keep the job small enough to finish inside GHL's time limit (long contexts → 524 timeouts)
+  const build = (limit: number) => {
+    const room = Math.min(limit, 9900) - head.length;
+    return head + (ctx.length > room ? ctx.slice(0, room - 60) + "\n[trimmed — more activity than fits]" : ctx);
+  };
+  const message = build(job === "scraper" ? 7500 : 9900);
 
   let res = await agentExecute(token, agentId, { locationId: loc, message }, `${job}-${tid}-${Date.now()}`);
   if (res.status === 429 || res.status >= 500) {
+    const timedOut = res.status === 524 || res.status === 504 || res.status === 0;
     await new Promise((ok) => setTimeout(ok, Math.min(20, Number(res.retryAfter) || 8) * 1000));
-    res = await agentExecute(token, agentId, { locationId: loc, message }, `${job}-${tid}-${Date.now()}`);
+    // A timeout means too much to get through — retry with about half the context
+    const retryMsg = timedOut ? build(job === "scraper" ? 5000 : 6500) : message;
+    res = await agentExecute(token, agentId, { locationId: loc, message: retryMsg }, `${job}-${tid}-${Date.now()}`);
   }
   if (!res.ok || res.json?.success === false) return { ok: false, summary: "", error: `${job} agent error ${res.status}: ${String(res.text).slice(0, 160)}` };
   const text = tidy(clean(String(res.json?.finalText ?? "")));
