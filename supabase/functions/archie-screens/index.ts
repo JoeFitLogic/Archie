@@ -1,4 +1,5 @@
-// archie-screens v4.8 — data and actions for the Archie AI Studio pages.
+// archie-screens v4.9.1 — data and actions for the Archie AI Studio pages.
+// v4.9.1: Joe's full ARCHIE RULES on every agent run (short version when the message is long; exact output formats kept).
 // Pages:     POST /functions/v1/archie-screens/<tenant access_token>   { action, ... }
 // Workflows: POST /functions/v1/archie-screens   header x-archie-secret   { action: run_next | run_finish, tenant_id, ... }
 // v1.1: brain dump reads trailing tier/time/day in any order; run_next returns the skill's agent.
@@ -22,6 +23,8 @@
 // v2.7: 7D part 3 — Pipeline/Scraper format rules sent by the backend, every answer checked before saving, owner told when something's off; Agents health dot.
 // v2.8: media_videos looks through the whole library (all pages and folders), newest first, grouped by month.
 // v2.9: brain dump splits one line into several tasks at commas/semicolons when it's clearly a list ("A must 45m, B 15m, C").
+// v4.9: Archie rules on every agent run (no made-up numbers — [NEED: …], flag bad data, label the source, archive never delete,
+//       answer first); /checkup — one plain report on everything Archie depends on, for you, clients and the agency view.
 // v4.8: Archie spots email gaps — no nurture for new leads, lots of quiet leads, past clients with no win-back — and offers
 //       the right sequence in 'where to focus'; 'do N' writes it and asks to save it to GHL.
 // v4.7.2: skills know the owner's first name and the booking links (lead / client), so emails and posts don't need [CHECK] for them.
@@ -101,6 +104,13 @@ Deno.serve(async (req) => {
       if (action === "plan_context") return j(await planContext(tenant_id));
       if (action === "plan_save") return j(await planSave(tenant_id, p));
       if (action === "talk") { startInBackground(talk(tenant_id, p)); return j({ ok: true, started: true }); }
+      if (action === "checkup") return j(await checkup(tenant_id));
+      if (action === "checkup_all") {
+        const { data: ts } = await supabase.from("tenants").select("id, business_name").eq("status", "active");
+        const out: any[] = [];
+        for (const t of ts ?? []) { const r: any = await checkup(t.id); out.push({ tenant_id: t.id, business: t.business_name, status: r.status, problems: r.problems }); }
+        return j({ ok: true, tenants: out });
+      }
       if (action === "recurring_run") { const r = await recurringRun(tenant_id); return j({ ok: true, ...r }); }
       if (action === "report_nightly_run") { startInBackground(weeklyReport(tenant_id, { week: "this", refresh: "yes" })); return j({ ok: true, started: true }); }
       if (action === "report_weekly_run") { startInBackground(reportWeeklyRun(tenant_id)); return j({ ok: true, started: true }); }
@@ -154,6 +164,7 @@ Deno.serve(async (req) => {
       case "fathom_calls": return j(await fathomCalls(c));
       case "report": return j(await weeklyReport(c.tid, p));
       case "goals": return j(await getGoals(c.tid));
+      case "checkup": return j(await checkup(c.tid));
       case "save_sequence": return j(await saveSequence(c.tid, p));
       case "recurring_list": return j(await recurringList(c.tid, p.handle ? c.resolve(p.handle) : ""));
       case "recurring_add": return j(await recurringAdd(c.tid, { ...p, handle: c.resolve(p.handle) }));
@@ -1129,7 +1140,40 @@ async function executeRun(tid: string, runId: string) {
   }
 }
 
+// Rules every agent follows — added to every message Archie sends to an agent (backend-owned, clients can't edit them out)
+const ARCHIE_RULES = [
+  "ARCHIE RULES — these override everything else in these instructions",
+  "",
+  "1. NEVER MAKE ANYTHING UP",
+  "Only use numbers, names, dates and facts that appear in the context you were given. If something you need is missing, write [NEED: what's missing] or say plainly \"I don't have that\" and name what would answer it (e.g. \"I can't see attendance — that would need your booking system connected\"). Never estimate, round up, or fill a gap with a typical figure. A wrong number is worse than no number.",
+  "",
+  "2. FLAG BAD DATA",
+  "If the data looks wrong — duplicates, missing days or weeks, totals that don't add up, a contact with no name, a payment with no amount — say so in one short line and name the record. Do not quietly drop it, average around it or work past it.",
+  "",
+  "3. LABEL THE SOURCE",
+  "Make it clear what comes from their data and what is your judgement. Facts: state them with where they came from (\"Stripe shows 3 failed payments this week\"). Judgement: say it's your view (\"My read: Sarah is at risk\"). Never present an opinion as a fact.",
+  "",
+  "4. ARCHIVE, NEVER DELETE",
+  "Never recommend deleting a contact, lead, member, task or document. Anything finished, lost or no longer used gets archived or marked with a reason (e.g. \"lost – price\", \"retired – replaced by new SOP\"). Old records are future reactivation and learning.",
+  "",
+  "5. ANSWER FIRST, PLAIN ENGLISH",
+  "Lead with the answer or the action, then the reason, then any detail. Write like a sharp business friend texting: short sentences, no jargon, no filler, no motivational fluff. No markdown — no asterisks, no hashes, no bold. Use line breaks and numbers only.",
+  "",
+  "If the task below asks for an exact output format (markers, labels, JSON, sections), keep that format exactly — these rules govern the words inside it.",
+].join("\n");
+const ARCHIE_RULES_SHORT = "ARCHIE RULES (override everything): 1) Never make anything up — only facts in the context; missing → [NEED: what's missing]; no estimates. 2) Flag bad data in one line, naming the record. 3) Label the source: their data vs \"My read:\". 4) Archive, never delete — mark with a reason. 5) Answer first, plain English, short sentences, no markdown (no asterisks, hashes or bold). Keep any exact output format the task asks for.";
+function withRules(body: Record<string, unknown>) {
+  const m = body?.message;
+  if (typeof m !== "string" || m.includes("ARCHIE RULES")) return body;
+  // Full rules when there's room; the short version when the message is already long (never cut the task or its data)
+  const full = `${ARCHIE_RULES}\n\n${m}`;
+  if (full.length <= 9990) return { ...body, message: full };
+  const short = `${ARCHIE_RULES_SHORT}\n\n${m}`;
+  return { ...body, message: short.length <= 9990 ? short : m };
+}
+
 async function agentExecute(token: string, agentId: string, body: Record<string, unknown>, idem: string) {
+  body = withRules(body);
   const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 140000);
   try {
     const r = await fetch(`${BASE}/agent-studio/managed-agents/${agentId}/execute`, {
@@ -1686,6 +1730,7 @@ const TALK_RULES = [
   "- Where to focus: 'what should I focus on?' → read the FOCUS list in the CONTEXT. 'Do 1' / 'do the first one' → carry out that focus item: if it says draft → archie_draft_followups with its names and purpose (then show the drafts and ask 'Send them?'); if it says skill → archie_run_skill; if it says task → archie_add_task.",
   "- Numbers or money → archie_numbers (never guess). Calls on a day → archie_calls. Writing (posts, reels, carousels, stories, proposals, objection replies, SOPs, briefs) → archie_run_skill.",
   "- 'Remember that…' → archie_remember.",
+  "- 'Checkup' / 'is everything working?' / 'something's not right with Archie' → archie_checkup, and give them the report as it is.",
   "- Email sequences: 'write me a nurture sequence for new leads' / 'a launch sequence for the November intake' → archie_run_skill with skill email-sequence and an input that starts 'Type: Nurture.' (or Launch, Re-engagement, Onboarding, Win-back) then who it's for and what it's about. Give them the emails (not the EMAILS_JSON line) and ask 'Save them to GHL as templates?'. On yes, or 'save that sequence to GHL' → archie_save_sequence (no args = the latest sequence).",
   "- Repeating tasks: 'every Monday, content filming, 2 hours, must' / 'every weekday Sara checks the support inbox' / 'on the 1st of every month, send invoices' → archie_add_recurring {title, pattern: daily|weekdays|weekly|fortnightly|monthly|monthly_last, days: [\"mon\",…] for weekly/fortnightly/monthly_last, month_day for monthly, tier, effort_minutes, handle}. 'What's on repeat?' → archie_recurring. 'Pause the Monday filming for 2 weeks' → archie_pause_recurring {title, until: YYYY-MM-DD}; 'stop the Friday check-in one' → archie_pause_recurring {title, stop: true}; 'restart it' → {title, resume: true}.",
   "- Booking calls: 'book Martin a diagnostic call Thursday at 2' → ask 'Book Martin, diagnostic call, Thursday 1 Oct at 14:00? Yes?' and only on yes → archie_book_call {name, calendar, date, time}. No time given ('get Steph in for a support call next week') → archie_free_slots {calendar, date} and offer 3 times; then book the one they pick (after a yes). 'What calendars have I got?' → archie_calendars.",
@@ -1869,12 +1914,14 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
       const OWNER_ONLY = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_save_sequence"
+      const r = act.tool === "archie_checkup"
+        ? await (async () => { const x: any = await checkup(tid); return { ok: true, text: x.text }; })()
+        : act.tool === "archie_save_sequence"
         ? await (async () => { const x: any = await saveSequence(tid, args); return { ok: !!x.ok, text: x.ok ? x.text : String(x.error) }; })()
         : act.tool === "archie_add_recurring"
         ? await (async () => { const x: any = await recurringAdd(tid, { ...args, handle: args.handle || member.handle }); return { ok: !!x.ok, text: x.ok ? x.text : String(x.error) }; })()
@@ -2607,6 +2654,75 @@ function parseEmailsFromText(out: string): any[] {
     if (body) emails.push({ day: Number(heads[i][2] ?? 0) || 0, subject, preview, body });
   }
   return emails.slice(0, 12);
+}
+
+// ===================== v4.9: /checkup — everything Archie depends on, in one plain report =====================
+async function checkup(tid: string) {
+  const lines: string[] = [];
+  const problems: string[] = [];
+  const ok = (m: string) => lines.push(`✅ ${m}`);
+  const warn = (m: string) => { lines.push(`⚠️ ${m}`); problems.push(m); };
+  const bad = (m: string) => { lines.push(`❌ ${m}`); problems.push(m); };
+  const { data: t } = await supabase.from("tenants").select("business_name, status, access_token").eq("id", tid).maybeSingle();
+  const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).maybeSingle();
+  const tz = cfg?.timezone || "Europe/London";
+  const today = localDate(Date.now(), tz);
+  const yesterday = addDays(today, -1);
+  const token = cfg?.ghl_token || FALLBACK_TOKEN;
+  const loc = cfg?.ghl_location_id;
+  if (!t) return { ok: false, status: "red", problems: ["tenant not found"], text: "❌ This business isn't set up in Archie." };
+  t.status === "active" ? ok("Archie is switched on") : bad(`Archie is ${t.status}`);
+
+  // GHL connection
+  const g = await ghl(token, `/locations/${loc}`, "GET", undefined, "2021-07-28");
+  g.ok ? ok("GHL connected") : bad(`GHL connection failing (${g.status}) — the token may have expired or lost access`);
+
+  // Archie toolbox (MCP)
+  try {
+    const m = await fetch(`${SUPA_URL}/functions/v1/archie-mcp/${t.access_token}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+    const mj: any = await m.json().catch(() => null);
+    const n = mj?.result?.tools?.length ?? 0;
+    n ? ok(`Archie toolbox reachable (${n} tools)`) : bad("Archie toolbox not answering");
+  } catch { bad("Archie toolbox not answering"); }
+
+  // Agents
+  const jobs = ["brief", "pipeline", "scraper", "content", "sales", "assistant"];
+  const missing: string[] = [];
+  for (const job of jobs) { const id = await agentIdFor(tid, job, token, loc); if (!id) missing.push(job); }
+  missing.length ? bad(`Agents not found: ${missing.join(", ")} — check they're published with the right names`) : ok("All agents found");
+
+  // Morning brief
+  const { data: brief } = await supabase.from("briefs").select("brief_date").eq("tenant_id", tid).order("brief_date", { ascending: false }).limit(1).maybeSingle();
+  const bd = String(brief?.brief_date ?? "");
+  bd === today ? ok("Today's brief sent") : bd === yesterday ? warn(`Last brief was yesterday (${bd}) — today's may not have run yet`) : bad(`No brief since ${bd || "ever"}`);
+
+  // Schedules
+  if (cfg?.schedules_on) {
+    const { data: logs } = await supabase.from("schedule_log").select("job, created_at").eq("tenant_id", tid).gte("created_at", new Date(Date.now() - 36 * 3600000).toISOString());
+    const ran = new Set((logs ?? []).map((l: any) => l.job));
+    ran.size ? ok(`Schedules running (last 36h: ${[...ran].join(", ")})`) : bad("No scheduled jobs have run in the last 36 hours");
+  } else warn("Schedules are switched off for this business");
+
+  // Money (Stripe)
+  const { data: dm } = await supabase.from("daily_metrics").select("metric_date, mrr").eq("tenant_id", tid).not("mrr", "is", null).order("metric_date", { ascending: false }).limit(1).maybeSingle();
+  dm?.metric_date && String(dm.metric_date) >= yesterday ? ok(`Stripe numbers fresh (MRR £${Math.round(Number(dm.mrr)).toLocaleString("en-GB")})`) : warn(`Stripe numbers not updated since ${dm?.metric_date ?? "ever"}`);
+
+  // Failed agent runs
+  const { data: fails } = await supabase.from("agent_runs").select("agent, error").eq("tenant_id", tid).eq("status", "failed").gte("finished_at", new Date(Date.now() - 24 * 3600000).toISOString()).limit(20);
+  (fails ?? []).length ? warn(`${fails!.length} failed run${fails!.length === 1 ? "" : "s"} in the last 24h (${[...new Set(fails!.map((f: any) => f.agent))].join(", ")})`) : ok("No failed runs in the last 24h");
+
+  // Team & channels
+  const { data: team } = await supabase.from("team_members").select("handle, ghl_contact_id, ghl_user_id, personal_calendar_id").eq("tenant_id", tid);
+  const noContact = (team ?? []).filter((m: any) => !m.ghl_contact_id).map((m: any) => m.handle);
+  noContact.length ? warn(`No WhatsApp contact linked for: ${noContact.join(", ")}`) : ok(`Team linked (${(team ?? []).length})`);
+  const noCal = (team ?? []).filter((m: any) => !m.ghl_user_id).map((m: any) => m.handle);
+  if (noCal.length) warn(`No GHL user (calendar) for: ${noCal.join(", ")} — days off can't block their calendar`);
+  if (!cfg?.fathom_api_key) warn("Fathom not connected — call scoring and the call picker won't work");
+  if (!cfg?.booking_link_lead && !cfg?.booking_link) warn("No booking link set — messages will say [CHECK: booking link]");
+
+  const status = problems.some((p) => lines.find((l) => l.startsWith("❌") && l.includes(p))) ? "red" : problems.length ? "amber" : "green";
+  const head = status === "green" ? "🟢 Everything's working." : status === "amber" ? "🟡 Working, with a few things to look at." : "🔴 Something needs fixing.";
+  return { ok: true, status, problems, text: `Archie checkup — ${t.business_name ?? "this business"} · ${today}\n${head}\n\n${lines.join("\n")}` };
 }
 
 // ===================== workflow side =====================

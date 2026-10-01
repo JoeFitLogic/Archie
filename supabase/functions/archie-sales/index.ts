@@ -1,4 +1,6 @@
-// archie-sales v2.2 — after-call scoring, quotes and won → invoice. API-first: one webhook in, everything else here.
+// archie-sales v2.4.1 — after-call scoring, quotes and won → invoice. API-first: one webhook in, everything else here.
+// v2.4.1: Joe's full ARCHIE RULES on every agent run.
+// v2.4: Archie rules added to every agent run (no made-up numbers — [NEED: …], flag bad data, label the source, archive never delete, answer first).
 // POST /functions/v1/archie-sales   header x-archie-secret   { action, tenant_id, ... }
 //   after_call { contact_id, hint?, any_date? }  → (background) open deal? → After Call agent via API → score, note, tasks, draft estimate
 //   won        { contact_id, opportunity_id? }   → (background) draft invoice, onboarding tasks, client tag, notify
@@ -259,7 +261,7 @@ async function won(c: any, p: any) {
   if (!(existing ?? []).length) {
     await supabase.from("tasks").insert(steps.slice(0, 8).map((s, i) => ({
       tenant_id: c.tid, title: s.replace(/\{name\}/g, who.name).slice(0, 200), detail: `Onboarding — won ${c.today}`,
-      tier: i === 0 ? "must" : "high", kind: "shallow", effort_minutes: 30, status: "open", owner: c.owner?.handle ?? null,
+      tier: i === 0 ? "must" : "high", kind: "shallow", effort_minutes: 30, status: "open", owner: c.cfg.onboarding_owner || c.owner?.handle || null,
       source: "won", source_ref: `onboard:${contactId}:${i}`, due_date: addDays(c.today, i),
     })));
     done.push(`${steps.length} onboarding tasks`);
@@ -332,7 +334,40 @@ async function afterCallAgentId(c: any): Promise<string | null> {
   return found.id;
 }
 
+// Rules every agent follows — added to every message Archie sends to an agent (backend-owned, clients can't edit them out)
+const ARCHIE_RULES = [
+  "ARCHIE RULES — these override everything else in these instructions",
+  "",
+  "1. NEVER MAKE ANYTHING UP",
+  "Only use numbers, names, dates and facts that appear in the context you were given. If something you need is missing, write [NEED: what's missing] or say plainly \"I don't have that\" and name what would answer it (e.g. \"I can't see attendance — that would need your booking system connected\"). Never estimate, round up, or fill a gap with a typical figure. A wrong number is worse than no number.",
+  "",
+  "2. FLAG BAD DATA",
+  "If the data looks wrong — duplicates, missing days or weeks, totals that don't add up, a contact with no name, a payment with no amount — say so in one short line and name the record. Do not quietly drop it, average around it or work past it.",
+  "",
+  "3. LABEL THE SOURCE",
+  "Make it clear what comes from their data and what is your judgement. Facts: state them with where they came from (\"Stripe shows 3 failed payments this week\"). Judgement: say it's your view (\"My read: Sarah is at risk\"). Never present an opinion as a fact.",
+  "",
+  "4. ARCHIVE, NEVER DELETE",
+  "Never recommend deleting a contact, lead, member, task or document. Anything finished, lost or no longer used gets archived or marked with a reason (e.g. \"lost – price\", \"retired – replaced by new SOP\"). Old records are future reactivation and learning.",
+  "",
+  "5. ANSWER FIRST, PLAIN ENGLISH",
+  "Lead with the answer or the action, then the reason, then any detail. Write like a sharp business friend texting: short sentences, no jargon, no filler, no motivational fluff. No markdown — no asterisks, no hashes, no bold. Use line breaks and numbers only.",
+  "",
+  "If the task below asks for an exact output format (markers, labels, JSON, sections), keep that format exactly — these rules govern the words inside it.",
+].join("\n");
+const ARCHIE_RULES_SHORT = "ARCHIE RULES (override everything): 1) Never make anything up — only facts in the context; missing → [NEED: what's missing]; no estimates. 2) Flag bad data in one line, naming the record. 3) Label the source: their data vs \"My read:\". 4) Archive, never delete — mark with a reason. 5) Answer first, plain English, short sentences, no markdown (no asterisks, hashes or bold). Keep any exact output format the task asks for.";
+function withRules(body: Record<string, unknown>) {
+  const m = body?.message;
+  if (typeof m !== "string" || m.includes("ARCHIE RULES")) return body;
+  // Full rules when there's room; the short version when the message is already long (never cut the task or its data)
+  const full = `${ARCHIE_RULES}\n\n${m}`;
+  if (full.length <= 9990) return { ...body, message: full };
+  const short = `${ARCHIE_RULES_SHORT}\n\n${m}`;
+  return { ...body, message: short.length <= 9990 ? short : m };
+}
+
 async function agentExecute(token: string, agentId: string, body: Record<string, unknown>, idem: string) {
+  body = withRules(body);
   const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 140000);
   try {
     const r = await fetch(`${BASE}/agent-studio/managed-agents/${agentId}/execute`, {
