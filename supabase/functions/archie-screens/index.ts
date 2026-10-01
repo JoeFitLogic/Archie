@@ -1,4 +1,7 @@
-// archie-screens v4.9.2 — data and actions for the Archie AI Studio pages.
+// archie-screens v5.0 — data and actions for the Archie AI Studio pages.
+// v5.0: business memory — definitions, voice rules and corrections, what worked, services, facts, baselines ("normal week"),
+//       and findings history ("third week in a row"). Fed to skills, Talk to Archie, the brief and the weekly focus;
+//       set by voice ("remember…", "a member means…", "that doesn't sound like me…") or the pages.
 // v4.9.2: Scraper/Pipeline timeouts (524) — smaller context by default for the Scraper, and a retry with a trimmed context
 //         if GHL's agent times out, so the morning run finishes instead of failing.
 // v4.9.1: Joe's full ARCHIE RULES on every agent run (short version when the message is long; exact output formats kept).
@@ -167,6 +170,9 @@ Deno.serve(async (req) => {
       case "report": return j(await weeklyReport(c.tid, p));
       case "goals": return j(await getGoals(c.tid));
       case "checkup": return j(await checkup(c.tid));
+      case "memory_list": return j(await memoryList(c.tid, String(p.kind ?? "")));
+      case "memory_save": return j(await memoryAction(c.tid, { handle: c.owner?.handle ?? "owner", gets_financials: true }, { ...p, action: "save" }));
+      case "memory_archive": return j(await memoryAction(c.tid, { handle: c.owner?.handle ?? "owner", gets_financials: true }, { ...p, action: "archive" }));
       case "save_sequence": return j(await saveSequence(c.tid, p));
       case "recurring_list": return j(await recurringList(c.tid, p.handle ? c.resolve(p.handle) : ""));
       case "recurring_add": return j(await recurringAdd(c.tid, { ...p, handle: c.resolve(p.handle) }));
@@ -642,6 +648,7 @@ async function businessContext(tid: string) {
     ownerFirst ? `Owner's first name (for sign-offs): ${ownerFirst}` : "",
     leadLink ? `Booking link for leads / new people: ${leadLink}` : "",
     clientLink ? `Booking link for existing clients: ${clientLink}` : "",
+    await memoryText(tid, ["definition", "voice", "worked", "service", "fact"], 1800),
   ].filter(Boolean).join("\n");
 }
 
@@ -1266,12 +1273,16 @@ async function briefRun(tid: string, p: any) {
         ? `Week so far: ${n.calls_booked ?? 0} booked · ${n.calls_held ?? 0} held · ${n.sales_count ?? 0} sale${(n.sales_count ?? 0) === 1 ? "" : "s"} — ${wr.pace?.on_pace ? "on pace" : "behind pace"} (need ~${wr.pace?.calls_booked_per_week ?? "?"} booked a week)`
         : `This week's pace: ~${wr.pace?.calls_booked_per_week ?? "?"} calls booked, ${wr.pace?.sales_per_week ?? "?"} sales, £${wr.pace?.new_mrr_per_week ?? "?"} new MRR`;
     } catch { weekLine = ""; }
+    // Findings that keep coming back → one "Nth week in a row" line
+    const { data: reps } = await supabase.from("business_memory").select("value, weeks_seen").eq("tenant_id", tid).eq("kind", "finding").eq("status", "active").gte("weeks_seen", 2).order("weeks_seen", { ascending: false }).limit(1);
+    const repeatLine = reps?.[0] ? `${["", "", "Second", "Third", "Fourth", "Fifth"][Math.min(5, Number(reps[0].weeks_seen))] || `${reps[0].weeks_seen}th`} week running — ${String(reps[0].value).slice(0, 160)}` : "";
     const message = [
       "Execute your instructions now. Use ONLY the data below. It is today's data. Ignore anything from earlier runs or conversations.",
       `The header date must be exactly: ${expected}.`,
       "Capacity comes from the OWNER CAPACITY line. The Today list is exactly the LINEUP lines, with their numbers. Never add a task that is not listed there. At risk comes only from the AT_RISK line.",
       "Voice-first footer (overrides your instructions): do NOT include the command lines 'add P1 · wait P1 · drop P1', 'Reply SEND 1 · SKIP 1' or 'done 1 · move 2 fri · 👍/👎'. Keep the numbers on the lists (1, 2… and P1, P2…) so people can refer to them. End the OWNER brief with exactly one line: 🎙️ Just reply or send a voice note — e.g. \"done the first one\", \"send Jase's message\", \"give P2 to Sara\". End the TEAM brief with exactly one line: 🎙️ Just reply starting with \"Archie\" — e.g. \"Archie, done the first one\".",
       weekLine ? `Weekly pace (OWNER brief only, never the TEAM brief): add this as one line under Money, exactly: 📊 ${weekLine}` : "",
+      repeatLine ? `Repeating issue (OWNER brief only): mention this in one short line near the Focus, e.g. "Third week in a row: …": ${repeatLine}` : "",
       "Return only the two briefs in the marker format.",
       "", "BRIEF CONTEXT:", ctx.slice(0, 6000),
       "", "FINANCIALS OUTPUT:", moneyTxt,
@@ -1739,6 +1750,7 @@ const TALK_RULES = [
   "- Where to focus: 'what should I focus on?' → read the FOCUS list in the CONTEXT. 'Do 1' / 'do the first one' → carry out that focus item: if it says draft → archie_draft_followups with its names and purpose (then show the drafts and ask 'Send them?'); if it says skill → archie_run_skill; if it says task → archie_add_task.",
   "- Numbers or money → archie_numbers (never guess). Calls on a day → archie_calls. Writing (posts, reels, carousels, stories, proposals, objection replies, SOPs, briefs) → archie_run_skill.",
   "- 'Remember that…' → archie_remember.",
+  "- Business memory → archie_memory. 'Remember we don't do refunds after 14 days' → {action:\"save\", kind:\"fact\", key, value}. 'A member means anyone on a paid plan' / 'a trial is the £30 intro' → kind \"definition\" (key: member, trial, paused, refund…). 'That doesn't sound like me — I'd never say crush it' → kind \"voice\" (a rule for how they write). 'The free workshop worked really well' → kind \"worked\". 'We offer 1:1 PT, small group and online' → kind \"service\". 'What do you know about my business?' → {action:\"list\"}. 'Forget the refund one' → {action:\"archive\", key, reason}. Keys short and lower-case (e.g. member, refunds, tone-hype). Never save money figures for team members.",
   "- 'Checkup' / 'is everything working?' / 'something's not right with Archie' → archie_checkup, and give them the report as it is.",
   "- Email sequences: 'write me a nurture sequence for new leads' / 'a launch sequence for the November intake' → archie_run_skill with skill email-sequence and an input that starts 'Type: Nurture.' (or Launch, Re-engagement, Onboarding, Win-back) then who it's for and what it's about. Give them the emails (not the EMAILS_JSON line) and ask 'Save them to GHL as templates?'. On yes, or 'save that sequence to GHL' → archie_save_sequence (no args = the latest sequence).",
   "- Repeating tasks: 'every Monday, content filming, 2 hours, must' / 'every weekday Sara checks the support inbox' / 'on the 1st of every month, send invoices' → archie_add_recurring {title, pattern: daily|weekdays|weekly|fortnightly|monthly|monthly_last, days: [\"mon\",…] for weekly/fortnightly/monthly_last, month_day for monthly, tier, effort_minutes, handle}. 'What's on repeat?' → archie_recurring. 'Pause the Monday filming for 2 weeks' → archie_pause_recurring {title, until: YYYY-MM-DD}; 'stop the Friday check-in one' → archie_pause_recurring {title, stop: true}; 'restart it' → {title, resume: true}.",
@@ -1840,6 +1852,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
         : Promise.resolve({ data: [] as any[] }),
       supabase.from("memories").select("fact").eq("tenant_id", tid).order("created_at", { ascending: false }).limit(20),
     ]);
+    const bizMemory = await memoryText(tid, ["definition", "voice", "worked", "service", "fact", "baseline", "finding"], 2200);
     const ctx = [
       `Today: ${dayName}, ${timeNow} (${today}). Business: ${t?.business_name ?? ""}.`,
       `You're talking to ${member.name ?? member.handle} (handle: ${member.handle}${member.gets_financials ? ", the owner" : ", a team member — no money figures"}).`,
@@ -1848,6 +1861,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
       focusLine,
       drafts.length ? `Drafts waiting to send: ${drafts.map((d: any) => `${d.rank}. ${d.name} (${d.channel}): "${String(d.body ?? "").slice(0, 80)}…"`).join("; ")}.` : "",
       (memories ?? []).length ? `Things to remember: ${(memories ?? []).map((m: any) => m.fact).join(" | ")}` : "",
+      bizMemory,
     ].filter(Boolean).join("\n");
 
     // One conversation per person per day
@@ -1923,12 +1937,14 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
       const OWNER_ONLY = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_checkup"
+      const r = act.tool === "archie_memory"
+        ? await (async () => { const x: any = await memoryAction(tid, member, args); return { ok: !!x.ok, text: x.text }; })()
+        : act.tool === "archie_checkup"
         ? await (async () => { const x: any = await checkup(tid); return { ok: true, text: x.text }; })()
         : act.tool === "archie_save_sequence"
         ? await (async () => { const x: any = await saveSequence(tid, args); return { ok: !!x.ok, text: x.ok ? x.text : String(x.error) }; })()
@@ -2265,6 +2281,7 @@ async function reportWeeklyRun(tid: string) {
   const now = new Date().toISOString();
   try {
     const r: any = await weeklyReport(tid, { week: "last", refresh: "yes" });
+    await updateBaselines(tid);
     let msg = reportMessage(r);
     try {
       const f: any = await getFocus(tid, true);
@@ -2353,11 +2370,12 @@ async function getFocus(tid: string, refresh: boolean) {
     `No-shows (this week and last): ${noShows.join(", ") || "none"}`,
     `Email sequences saved to GHL: ${savedTypes.size ? [...savedTypes].join(", ") : "none"}. Leads quiet 30+ days: ${quietLong}. Past clients: ${pastClients ?? 0}. Open leads in early stages: ${early.length}.`,
     (memories ?? []).length ? `Things to remember: ${(memories ?? []).map((m: any) => m.fact).join(" | ")}` : "",
+    await memoryText(tid, ["baseline", "finding", "definition", "worked"], 1500),
   ].filter(Boolean).join("\n");
 
   const rules = [
     "You are a sales coach for this business. From the FACTS, find the weakest link against the weekly pace (not enough leads / not enough calls booked / people not showing / calls not closing / sales but low new MRR) and pick exactly 3 actions for this week that would move it most.",
-    "Use real names from the FACTS. Never invent people, numbers or results. Prefer actions Archie can start:",
+    "Use real names from the FACTS. Never invent people, numbers or results. If a FINDING has come up 2+ weeks running, say so in the why (e.g. \"third week in a row\") — and prefer fixing the cause. Compare with the baselines (normal week) where it helps. Prefer actions Archie can start:",
     "- do: \"draft\" — Archie drafts a short message to each named person (names from the FACTS; purpose: follow up on proposal / re-open quiet lead / rebook no-show / ask for referral / check in).",
     "- do: \"skill\" — Archie runs one of: write-post, create-reel-script, create-carousel, stories, reply-to-objection, email-sequence (skill + input).",
     "Email gaps: if there's no nurture sequence and new leads keep coming in, or lots of leads are quiet 30+ days with no re-engagement sequence, or there are past clients and no win-back sequence, one of the 3 actions can be to write that sequence: do \"skill\", skill \"email-sequence\", input starting \"Type: Nurture.\" (or Re-engagement, Win-back, Onboarding) then who it's for. Only suggest a type that isn't already saved.",
@@ -2389,6 +2407,7 @@ async function getFocus(tid: string, refresh: boolean) {
     focus = focus.slice(0, 3);
   }
   await supabase.from("weekly_focus").upsert({ tenant_id: tid, week_start: weekStart, items: focus, created_at: new Date().toISOString() }, { onConflict: "tenant_id,week_start" });
+  for (const f of focus) await recordFinding(tid, weekStart, f.title, f.why);
   return { ok: true, week_start: weekStart, items: focus };
 }
 
@@ -2732,6 +2751,104 @@ async function checkup(tid: string) {
   const status = problems.some((p) => lines.find((l) => l.startsWith("❌") && l.includes(p))) ? "red" : problems.length ? "amber" : "green";
   const head = status === "green" ? "🟢 Everything's working." : status === "amber" ? "🟡 Working, with a few things to look at." : "🔴 Something needs fixing.";
   return { ok: true, status, problems, text: `Archie checkup — ${t.business_name ?? "this business"} · ${today}\n${head}\n\n${lines.join("\n")}` };
+}
+
+// ===================== v5.0: business memory =====================
+const MEMORY_KINDS = ["definition", "voice", "worked", "service", "fact", "baseline", "finding"];
+const KIND_LABEL: Record<string, string> = {
+  definition: "Definitions (use these meanings)", voice: "Voice rules and corrections (follow these when writing)", worked: "What's worked before",
+  service: "Services they offer", fact: "Facts about the business", baseline: "Normal week (baselines)", finding: "Things Archie keeps noticing",
+};
+
+async function memoryText(tid: string, kinds: string[], max: number): Promise<string> {
+  const { data } = await supabase.from("business_memory").select("kind, key, value, weeks_seen, last_seen")
+    .eq("tenant_id", tid).eq("status", "active").in("kind", kinds).order("updated_at", { ascending: false }).limit(80);
+  if (!data?.length) return "";
+  const parts: string[] = [];
+  for (const k of kinds) {
+    const rows = data.filter((r: any) => r.kind === k);
+    if (!rows.length) continue;
+    const lines = rows.slice(0, k === "finding" ? 8 : 15).map((r: any) => k === "finding"
+      ? `- ${r.value}${Number(r.weeks_seen) > 1 ? ` (${Number(r.weeks_seen)} weeks running)` : ""}`
+      : `- ${r.key}: ${r.value}`);
+    parts.push(`${KIND_LABEL[k] ?? k}:\n${lines.join("\n")}`);
+  }
+  const txt = `BUSINESS MEMORY\n${parts.join("\n")}`;
+  return txt.length > max ? txt.slice(0, max - 20) + "\n[more in memory]" : txt;
+}
+
+function memKey(v: unknown) { return String(v ?? "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60); }
+
+async function memoryAction(tid: string, member: any, a: any) {
+  const action = String(a.action ?? "save").toLowerCase();
+  if (action === "list") {
+    const r = await memoryList(tid, String(a.kind ?? ""));
+    return { ok: true, text: r.text };
+  }
+  const kind = MEMORY_KINDS.includes(String(a.kind)) ? String(a.kind) : "fact";
+  const key = memKey(a.key || a.value);
+  if (!key) return { ok: false, text: "What should I remember?" };
+  if (action === "archive" || action === "forget") {
+    let q = supabase.from("business_memory").update({ status: "archived", reason: String(a.reason ?? "archived by owner").slice(0, 200), updated_at: new Date().toISOString() })
+      .eq("tenant_id", tid).eq("status", "active");
+    q = a.kind ? q.eq("kind", kind).eq("key", key) : q.ilike("key", `%${key}%`);
+    const { data } = await q.select("key");
+    return data?.length ? { ok: true, text: `Archived: ${data.map((d: any) => d.key).join(", ")} (kept on file, not used any more).` } : { ok: false, text: `Nothing in memory matches "${a.key}".` };
+  }
+  const value = String(a.value ?? "").trim().slice(0, 600);
+  if (!value) return { ok: false, text: "What's the detail to remember?" };
+  if (!member.gets_financials && /£|\$|€|\b(mrr|revenue|profit|margin|income|salary)\b/i.test(value)) return { ok: false, text: "Money details can only be saved by the owner." };
+  const now = new Date().toISOString();
+  const { error } = await supabase.from("business_memory").upsert({
+    tenant_id: tid, kind, key, value, source: member.handle ? `said by ${member.handle}` : "owner", status: "active", updated_at: now,
+  }, { onConflict: "tenant_id,kind,key" });
+  if (error) return { ok: false, text: `Couldn't save that: ${error.message}` };
+  const label = { definition: "Definition saved", voice: "Voice note saved — I'll write that way from now on", worked: "Noted as something that worked", service: "Service saved", fact: "Remembered" }[kind] ?? "Saved";
+  return { ok: true, text: `${label}: ${key} — ${value}` };
+}
+
+async function memoryList(tid: string, kind: string) {
+  let q = supabase.from("business_memory").select("id, kind, key, value, source, weeks_seen, updated_at").eq("tenant_id", tid).eq("status", "active");
+  if (MEMORY_KINDS.includes(kind)) q = q.eq("kind", kind);
+  const { data } = await q.order("kind").order("updated_at", { ascending: false }).limit(150);
+  const items = data ?? [];
+  const text = items.length
+    ? MEMORY_KINDS.filter((k) => items.some((r: any) => r.kind === k)).map((k) => `${KIND_LABEL[k]}\n${items.filter((r: any) => r.kind === k).slice(0, 12).map((r: any) => `- ${r.kind === "finding" ? r.value : `${r.key}: ${r.value}`}${Number(r.weeks_seen) > 1 ? ` (${r.weeks_seen} weeks)` : ""}`).join("\n")}`).join("\n\n")
+    : "Nothing saved yet. Tell me things like \"a member means anyone on a paid plan\" or \"remember we don't do refunds after 14 days\".";
+  return { ok: true, items, text };
+}
+
+// Findings: things Archie flags; seen again in a later week → weeks_seen goes up ("third week in a row")
+async function recordFinding(tid: string, weekStart: string, title: string, why: string) {
+  const key = memKey(String(title).replace(/\b\d+\b/g, "").replace(/\b(chase|re-?open|re-?engage|follow up|rebook)\b/gi, (m) => m.toLowerCase())).slice(0, 50);
+  if (!key) return;
+  const { data: ex } = await supabase.from("business_memory").select("id, weeks_seen, last_seen").eq("tenant_id", tid).eq("kind", "finding").eq("key", key).maybeSingle();
+  const value = `${title}${why ? ` — ${why}` : ""}`.slice(0, 400);
+  if (!ex) {
+    await supabase.from("business_memory").insert({ tenant_id: tid, kind: "finding", key, value, source: "archie", status: "active", weeks_seen: 1, last_seen: weekStart, updated_at: new Date().toISOString() });
+    return;
+  }
+  if (String(ex.last_seen) === weekStart) return; // already counted this week
+  const consecutive = ex.last_seen && addDays(String(ex.last_seen), 7) === weekStart;
+  await supabase.from("business_memory").update({ value, status: "active", weeks_seen: consecutive ? Number(ex.weeks_seen || 1) + 1 : 1, last_seen: weekStart, updated_at: new Date().toISOString() }).eq("id", ex.id);
+}
+
+// Baselines: what a normal week looks like, from the last 8 finished weeks
+async function updateBaselines(tid: string) {
+  const { data: weeks } = await supabase.from("weekly_reports").select("data").eq("tenant_id", tid).eq("is_final", true).order("week_start", { ascending: false }).limit(8);
+  const rows = (weeks ?? []).map((w: any) => w.data ?? {});
+  if (rows.length < 2) return;
+  const avg = (k: string) => { const v = rows.map((r: any) => Number(r[k])).filter((n: number) => Number.isFinite(n)); return v.length ? Math.round(v.reduce((a: number, b: number) => a + b, 0) / v.length) : null; };
+  const set: [string, string][] = [];
+  const add = (key: string, label: string, v: number | null, money = false) => { if (v !== null) set.push([key, `${label}: about ${money ? "£" : ""}${v.toLocaleString("en-GB")} a week (average of the last ${rows.length} weeks)`]); };
+  add("messages-sent", "Messages sent", avg("messages_sent"));
+  add("calls-booked", "Calls booked", avg("calls_booked"));
+  add("calls-held", "Calls held", avg("calls_held"));
+  add("sales", "Sales", avg("sales_count"));
+  add("new-income", "New income", avg("new_income"), true);
+  for (const [key, value] of set) {
+    await supabase.from("business_memory").upsert({ tenant_id: tid, kind: "baseline", key, value, source: "data (weekly reports)", status: "active", updated_at: new Date().toISOString() }, { onConflict: "tenant_id,kind,key" });
+  }
 }
 
 // ===================== workflow side =====================
