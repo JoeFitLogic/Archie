@@ -1,4 +1,6 @@
-// archie-screens v5.4.1 — data and actions for the Archie AI Studio pages.
+// archie-screens v5.5 — data and actions for the Archie AI Studio pages.
+// v5.5: task upgrades — slip counter ("third move"), stalled tasks, waiting-on items with day counts and a drafted chase,
+//       and "you're the blocker" when a team member is waiting on you; in each person's brief and by voice.
 // v5.4.1: Talk to Archie fix — their message now goes first and the context is trimmed to fit (it was being cut off the
 //         end of long prompts, so Archie replied "your message didn't come through"); talk rules tightened.
 // v5.4: trial-to-member — set which pipeline stage means "trial / intro offer"; the weekly report counts trials started,
@@ -1320,6 +1322,35 @@ async function briefRun(tid: string, p: any) {
       if (reds.length || yellows.length) healthLine = `Client health (Archie's scoring): ${reds.length} red, ${yellows.length} yellow.${reds.length ? ` Red: ${reds.slice(0, 3).map((m: any) => `${m.name} (${(m.reasons ?? [])[0] ?? ""})`).join("; ")}.` : ""}`;
     } catch { /* bonus */ }
 
+    // Task upgrades: slips, stalled, waiting-on, blockers — per person
+    let taskLinesOwner = "", taskLinesTeam = "";
+    try {
+      const { data: open } = await supabase.from("tasks").select("title, owner, status, move_count, created_at, waiting_for, waiting_since")
+        .eq("tenant_id", tid).in("status", ["open", "doing", "waiting"]).limit(400);
+      const { data: tm } = await supabase.from("team_members").select("handle, name, gets_financials").eq("tenant_id", tid);
+      const ownerH = String((tm ?? []).find((m: any) => m.gets_financials)?.handle ?? "");
+      const ownerNames = new Set([ownerH, ...String((tm ?? []).find((m: any) => m.gets_financials)?.name ?? "").toLowerCase().split(/\s+/)].filter(Boolean).map((x) => x.toLowerCase()));
+      const today0 = Date.parse(today);
+      const daysSince = (d: unknown) => Math.max(0, Math.floor((today0 - Date.parse(String(d ?? "").slice(0, 10))) / 86400000));
+      const linesFor = (h: string) => {
+        const mine = (open ?? []).filter((t: any) => String(t.owner ?? ownerH) === h);
+        const out: string[] = [];
+        const slips = mine.filter((t: any) => Number(t.move_count) >= 3 && t.status !== "waiting").sort((a: any, b: any) => b.move_count - a.move_count).slice(0, 2);
+        for (const t of slips) out.push(`Moved ${t.move_count} times: "${t.title}" — do it today, give it to someone, or drop it?`);
+        const stalled = mine.filter((t: any) => t.status !== "waiting" && daysSince(t.created_at) >= 14);
+        if (stalled.length >= 3) out.push(`${stalled.length} tasks have been open 14+ days — worth a 10-minute clear-out.`);
+        const waiting = mine.filter((t: any) => t.status === "waiting").map((t: any) => ({ who: String(t.waiting_for ?? "them"), what: t.title, d: daysSince(t.waiting_since ?? t.created_at) })).filter((w: any) => w.d >= 3).sort((a: any, b: any) => b.d - a.d).slice(0, 3);
+        if (waiting.length) out.push(`Waiting on: ${waiting.map((w: any) => `${w.who} (${w.d} days — ${String(w.what).slice(0, 40)})`).join("; ")}. Say "chase ${waiting[0].who.split(" ")[0]}" for a drafted chase.`);
+        // Someone on the team waiting on this person
+        const blocked = (open ?? []).filter((t: any) => t.status === "waiting" && String(t.owner ?? "") !== h && (h === ownerH ? ownerNames.has(String(t.waiting_for ?? "").toLowerCase().split(/\s+/)[0]) : String(t.waiting_for ?? "").toLowerCase().startsWith(h)));
+        if (blocked.length) out.push(`You're the blocker: ${blocked.slice(0, 3).map((t: any) => `${t.owner} is waiting on you for "${String(t.title).slice(0, 40)}" (${daysSince(t.waiting_since ?? t.created_at)} days)`).join("; ")}.`);
+        return out.join(" ");
+      };
+      taskLinesOwner = linesFor(ownerH);
+      const teamH = (tm ?? []).filter((m: any) => !m.gets_financials).map((m: any) => m.handle);
+      taskLinesTeam = teamH.map((h: string) => { const l = linesFor(h); return l ? `${h}: ${l}` : ""; }).filter(Boolean).join(" ");
+    } catch { /* bonus */ }
+
     // Findings that keep coming back → one "Nth week in a row" line
     const { data: reps } = await supabase.from("business_memory").select("value, weeks_seen").eq("tenant_id", tid).eq("kind", "finding").eq("status", "active").gte("weeks_seen", 2).order("weeks_seen", { ascending: false }).limit(1);
     const repeatLine = reps?.[0] ? `${["", "", "Second", "Third", "Fourth", "Fifth"][Math.min(5, Number(reps[0].weeks_seen))] || `${reps[0].weeks_seen}th`} week running — ${String(reps[0].value).slice(0, 160)}` : "";
@@ -1331,6 +1362,8 @@ async function briefRun(tid: string, p: any) {
       weekLine ? `Weekly pace (OWNER brief only, never the TEAM brief): add this as one line under Money, exactly: 📊 ${weekLine}` : "",
       [speedLine, waitingLine, pipeLine, healthLine].filter(Boolean).length ? `OWNER brief only — add these under Money/Pipeline as short lines, exactly as facts are given: ${[speedLine, waitingLine, pipeLine, healthLine].filter(Boolean).join(" ")}` : "",
       "FOCUS LINE (owner brief): one action, one name, the highest value first — someone waiting on a reply right now beats a proposal waiting, which beats the top must task. E.g. \"Reply to Steph — she's waited 6 hours.\" Never a generic focus.",
+      taskLinesOwner ? `Task check (OWNER brief, short lines near the task list, exactly these facts): ${taskLinesOwner}` : "",
+      taskLinesTeam ? `Task check (TEAM brief — each line only in that person's brief): ${taskLinesTeam}` : "",
       repeatLine ? `Repeating issue (OWNER brief only): mention this in one short line near the Focus, e.g. "Third week in a row: …": ${repeatLine}` : "",
       "Return only the two briefs in the marker format.",
       "", "BRIEF CONTEXT:", ctx.slice(0, 6000),
@@ -1798,6 +1831,7 @@ const TALK_RULES = [
   "- archie_book_call {name, calendar, date, time} — confirm first ('Book Martin, diagnostic call, Thu 1 Oct 14:00? Yes?'). No time → archie_free_slots {calendar, date}, offer 3. archie_calendars. archie_personal_event {title, date, from, to} — personal plans, just do it. archie_calls — calls on a day.",
   "- archie_move_deal {name, stage | status won|lost|abandoned, reason} — stage moves just happen; won/lost/abandoned: ask 'Mark Jase as abandoned? Yes?' first.",
   "- archie_add_recurring {title, pattern daily|weekdays|weekly|fortnightly|monthly|monthly_last, days [\"mon\",…], month_day, tier, effort_minutes, handle} · archie_recurring · archie_pause_recurring {title, until | stop | resume}.",
+  "- Chasing: 'chase Seve' / 'nudge Jacob about the logo' → archie_draft_followups {names:[who], purpose:'chase — we're waiting on <what>'} (the CONTEXT/brief says what we're waiting on), then 'Send it?'. A task moved 3+ times: offer do it today / give it to someone / drop it.",
   "- archie_member_health {status red|yellow|green|''} — 'who's at risk?'. Check-ins → archie_draft_followups {names, purpose:'check in with a client'}, then 'Send them?'.",
   "- archie_groups {action suggest | link (numbers / all / group+client) | list} — link client WhatsApp groups.",
   "- archie_set_trial {stage} — 'our trial stage is X'.",
