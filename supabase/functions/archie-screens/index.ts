@@ -1,4 +1,6 @@
-// archie-screens v5.0 — data and actions for the Archie AI Studio pages.
+// archie-screens v5.1 — data and actions for the Archie AI Studio pages.
+// v5.1: speed-to-lead (enquiries, slow replies, median first reply, who's waiting now), honest pipeline check
+//       ("14 open, 3 real"), and a sharper Focus line in the brief (one action, one name, highest value first).
 // v5.0: business memory — definitions, voice rules and corrections, what worked, services, facts, baselines ("normal week"),
 //       and findings history ("third week in a row"). Fed to skills, Talk to Archie, the brief and the weekly focus;
 //       set by voice ("remember…", "a member means…", "that doesn't sound like me…") or the pages.
@@ -945,6 +947,7 @@ async function pipelineList(c: any) {
   const r = await ghl(c.ghlToken, `/opportunities/search?location_id=${loc}&pipeline_id=${pipelineId}&status=open&limit=100`, "GET", undefined, "2021-07-28");
   if (!r.ok) return { ok: false, error: `opportunities ${r.status}`, items: [], open: null, need_action: null, urgent: null };
   const staleAfter = Number(cfg?.stale_threshold_days ?? 7) || 7;
+  const stageOrder = new Map((pipe.stages ?? []).map((s: any, i: number) => [s.id, i]));
   const now = Date.now();
   const opps: any[] = r.json?.opportunities ?? [];
   // Days since the last message with that contact (same measure as the brief); falls back to the deal's last change
@@ -966,7 +969,9 @@ async function pipelineList(c: any) {
     const days = last ? Math.floor((now - last) / 86400000) : 0;
     const urgent = days >= staleAfter;
     const needsAction = urgent || days >= 2;
-    return { id: o.id, name: String(o.contact?.name ?? o.name ?? "Unknown"), contact_id: o.contactId ?? o.contact?.id ?? null, stage: String(stageName.get(o.pipelineStageId) ?? ""), value: Number(o.monetaryValue ?? 0) || 0, days, urgent, needs_action: needsAction };
+    // "Real" = touched in the last 14 days and past the first stage (my read, not a GHL field)
+    const real = days < 14 && Number(stageOrder.get(o.pipelineStageId) ?? 0) > 0;
+    return { id: o.id, name: String(o.contact?.name ?? o.name ?? "Unknown"), contact_id: o.contactId ?? o.contact?.id ?? null, stage: String(stageName.get(o.pipelineStageId) ?? ""), value: Number(o.monetaryValue ?? 0) || 0, days, urgent, needs_action: needsAction, real };
   }).sort((a: any, b: any) => Number(b.urgent) - Number(a.urgent) || Number(b.needs_action) - Number(a.needs_action) || b.days - a.days);
   return {
     ok: true, items: items.slice(0, 12),
@@ -1273,6 +1278,27 @@ async function briefRun(tid: string, p: any) {
         ? `Week so far: ${n.calls_booked ?? 0} booked · ${n.calls_held ?? 0} held · ${n.sales_count ?? 0} sale${(n.sales_count ?? 0) === 1 ? "" : "s"} — ${wr.pace?.on_pace ? "on pace" : "behind pace"} (need ~${wr.pace?.calls_booked_per_week ?? "?"} booked a week)`
         : `This week's pace: ~${wr.pace?.calls_booked_per_week ?? "?"} calls booked, ${wr.pace?.sales_per_week ?? "?"} sales, £${wr.pace?.new_mrr_per_week ?? "?"} new MRR`;
     } catch { weekLine = ""; }
+    // Speed-to-lead, who's waiting now, and an honest pipeline count → one Focus that matters most
+    let speedLine = "", waitingLine = "", pipeLine = "";
+    try {
+      const wr: any = await weeklyReport(tid, { week: "this" });
+      const n = wr.numbers ?? {};
+      if (n.enquiries) speedLine = `Speed to lead this week (from your messages): ${n.enquiries} new enquir${n.enquiries === 1 ? "y" : "ies"}, ${n.reply_slow ?? 0} waited 4+ hours${n.reply_median_min !== null && n.reply_median_min !== undefined ? `, typical first reply ${n.reply_median_min < 60 ? `${n.reply_median_min} min` : `${Math.round(n.reply_median_min / 60)}h`}` : ""}.`;
+      const waiting: any[] = (n.awaiting ?? []).slice(0, 3);
+      if (waiting.length) {
+        const names: string[] = [];
+        for (const w of waiting) {
+          const c = await ghl(cfg?.ghl_token || FALLBACK_TOKEN, `/contacts/${w.contactId}`, "GET", undefined, "2021-07-28");
+          const nm = [c.json?.contact?.firstName, c.json?.contact?.lastName].filter(Boolean).join(" ") || "a contact";
+          names.push(`${nm} (${w.hours}h)`);
+        }
+        waitingLine = `Waiting on a reply right now: ${names.join(", ")}.`;
+      }
+      const pl: any = await pipelineList({ tid, ghlToken: cfg?.ghl_token || FALLBACK_TOKEN });
+      const its: any[] = pl?.items ?? [];
+      if (its.length) pipeLine = `Pipeline check (my read): ${its.length} open, ${its.filter((x) => x.real).length} real — touched in the last 14 days and past first contact.`;
+    } catch { /* lines are a bonus */ }
+
     // Findings that keep coming back → one "Nth week in a row" line
     const { data: reps } = await supabase.from("business_memory").select("value, weeks_seen").eq("tenant_id", tid).eq("kind", "finding").eq("status", "active").gte("weeks_seen", 2).order("weeks_seen", { ascending: false }).limit(1);
     const repeatLine = reps?.[0] ? `${["", "", "Second", "Third", "Fourth", "Fifth"][Math.min(5, Number(reps[0].weeks_seen))] || `${reps[0].weeks_seen}th`} week running — ${String(reps[0].value).slice(0, 160)}` : "";
@@ -1282,6 +1308,8 @@ async function briefRun(tid: string, p: any) {
       "Capacity comes from the OWNER CAPACITY line. The Today list is exactly the LINEUP lines, with their numbers. Never add a task that is not listed there. At risk comes only from the AT_RISK line.",
       "Voice-first footer (overrides your instructions): do NOT include the command lines 'add P1 · wait P1 · drop P1', 'Reply SEND 1 · SKIP 1' or 'done 1 · move 2 fri · 👍/👎'. Keep the numbers on the lists (1, 2… and P1, P2…) so people can refer to them. End the OWNER brief with exactly one line: 🎙️ Just reply or send a voice note — e.g. \"done the first one\", \"send Jase's message\", \"give P2 to Sara\". End the TEAM brief with exactly one line: 🎙️ Just reply starting with \"Archie\" — e.g. \"Archie, done the first one\".",
       weekLine ? `Weekly pace (OWNER brief only, never the TEAM brief): add this as one line under Money, exactly: 📊 ${weekLine}` : "",
+      [speedLine, waitingLine, pipeLine].filter(Boolean).length ? `OWNER brief only — add these under Money/Pipeline as short lines, exactly as facts are given: ${[speedLine, waitingLine, pipeLine].filter(Boolean).join(" ")}` : "",
+      "FOCUS LINE (owner brief): one action, one name, the highest value first — someone waiting on a reply right now beats a proposal waiting, which beats the top must task. E.g. \"Reply to Steph — she's waited 6 hours.\" Never a generic focus.",
       repeatLine ? `Repeating issue (OWNER brief only): mention this in one short line near the Focus, e.g. "Third week in a row: …": ${repeatLine}` : "",
       "Return only the two briefs in the marker format.",
       "", "BRIEF CONTEXT:", ctx.slice(0, 6000),
@@ -2151,6 +2179,7 @@ async function weekNumbers(tid: string, cfg: any, weekStart: string, current: bo
   // 1. Messages sent — outbound, by a person or Archie on their behalf (not workflows/campaigns), not to the team
   try {
     let cursor = "", sent = 0, pages = 0, fetched = 0, outbound = 0, automated = 0, toTeam = 0, total: number | null = null;
+    const all: { c: string; d: string; t: number; s: string }[] = [];
     const startQ = fromIso.replace(/\.\d{3}Z$/, "Z"), endQ = toIso.replace(/\.\d{3}Z$/, "Z");
     do {
       const r = await ghl(token, `/conversations/messages/export?locationId=${loc}&startDate=${startQ}&endDate=${endQ}&limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`, "GET", undefined, "2021-04-15");
@@ -2158,6 +2187,7 @@ async function weekNumbers(tid: string, cfg: any, weekStart: string, current: bo
       const msgs: any[] = r.json?.messages ?? [];
       if (total === null && r.json?.total !== undefined) total = Number(r.json.total);
       fetched += msgs.length;
+      for (const m of msgs) all.push({ c: String(m.contactId ?? ""), d: String(m.direction ?? ""), t: Date.parse(String(m.dateAdded ?? "")), s: String(m.source ?? m.meta?.source ?? "").toLowerCase() });
       for (const m of msgs) {
         if (String(m.direction) !== "outbound") continue;
         outbound++;
@@ -2171,6 +2201,7 @@ async function weekNumbers(tid: string, cfg: any, weekStart: string, current: bo
     } while (cursor && pages < 30);
     out.messages_sent = sent;
     out.messages_detail = { fetched, total, outbound, automated, to_team: toTeam, pages };
+    Object.assign(out, speedToLead(all, teamContacts as Set<string>, nowMs));
   } catch (e) { out.errors.push(`messages: ${String(e).slice(0, 80)}`); }
 
   // 2. Calls — booked (created this week), held (happened this week, not no-show/cancelled), no-shows
@@ -2265,6 +2296,7 @@ function reportMessage(r: any): string {
     "",
     `✉️ Messages sent: ${f(n.messages_sent)}${arrow(n.messages_sent, p.messages_sent)}`,
     `📅 Calls booked: ${f(n.calls_booked)}${arrow(n.calls_booked, p.calls_booked)} · held ${f(n.calls_held)}${n.show_rate !== null && n.show_rate !== undefined ? ` · show rate ${n.show_rate}%` : ""}`,
+    n.enquiries !== undefined ? `⏱️ Enquiries: ${f(n.enquiries)} · ${f(n.reply_slow)} waited 4h+${n.reply_median_min !== null && n.reply_median_min !== undefined ? ` · typical reply ${n.reply_median_min < 60 ? `${n.reply_median_min} min` : `${Math.round(n.reply_median_min / 60)}h`}` : ""}` : "",
     `🤝 Sales: ${f(n.sales_count)}${arrow(n.sales_count, p.sales_count)} · ${money(n.sales_value)}`,
     `💰 New income: ${money(n.new_income)}${arrow(n.new_income, p.new_income)}`,
     `📈 Revenue this month: ${money(n.revenue_mtd)}${g.revenue_goal ? ` of ${money(g.revenue_goal)}${pct(n.revenue_mtd, g.revenue_goal)}` : ""}`,
@@ -2849,6 +2881,40 @@ async function updateBaselines(tid: string) {
   for (const [key, value] of set) {
     await supabase.from("business_memory").upsert({ tenant_id: tid, kind: "baseline", key, value, source: "data (weekly reports)", status: "active", updated_at: new Date().toISOString() }, { onConflict: "tenant_id,kind,key" });
   }
+}
+
+// ===================== v5.1: speed to lead =====================
+// An enquiry = an inbound message after 12h+ of quiet with that contact (or the first we see). Reply = the next outbound
+// sent by a person/Archie (not a workflow or campaign). Slow = 4+ hours. Waiting now = latest message is theirs, 2h+ ago.
+function speedToLead(all: { c: string; d: string; t: number; s: string }[], team: Set<string>, nowMs: number) {
+  const byC = new Map<string, { d: string; t: number; s: string }[]>();
+  for (const m of all) {
+    if (!m.c || team.has(m.c) || !Number.isFinite(m.t)) continue;
+    const l = byC.get(m.c) ?? []; l.push(m); byC.set(m.c, l);
+  }
+  let enquiries = 0, slow = 0;
+  const delays: number[] = [];
+  const awaiting: { contactId: string; hours: number }[] = [];
+  const human = (m: { d: string; s: string }) => m.d === "outbound" && !["workflow", "campaign", "bulk_actions"].includes(m.s);
+  for (const [c, list] of byC) {
+    list.sort((a, b) => a.t - b.t);
+    for (let i = 0; i < list.length; i++) {
+      const m = list[i];
+      if (m.d !== "inbound") continue;
+      const prev = list[i - 1];
+      if (prev && m.t - prev.t < 12 * 3600000) continue; // part of an ongoing chat
+      enquiries++;
+      const reply = list.slice(i + 1).find(human);
+      if (reply) { const mins = Math.round((reply.t - m.t) / 60000); delays.push(mins); if (mins >= 240) slow++; }
+      else if (nowMs - m.t >= 4 * 3600000) slow++;
+    }
+    const last = list[list.length - 1];
+    if (last && last.d === "inbound" && nowMs - last.t >= 2 * 3600000 && nowMs - last.t < 7 * 86400000) awaiting.push({ contactId: c, hours: Math.round((nowMs - last.t) / 3600000) });
+  }
+  delays.sort((a, b) => a - b);
+  const median = delays.length ? delays[Math.floor(delays.length / 2)] : null;
+  awaiting.sort((a, b) => b.hours - a.hours);
+  return { enquiries, reply_slow: slow, reply_median_min: median, awaiting: awaiting.slice(0, 10) };
 }
 
 // ===================== workflow side =====================
