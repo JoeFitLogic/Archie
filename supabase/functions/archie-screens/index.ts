@@ -1,4 +1,10 @@
-// archie-screens v5.5 — data and actions for the Archie AI Studio pages.
+// archie-screens v5.8 — data and actions for the Archie AI Studio pages.
+// v5.8: call prep — "I've got Sarah at 10" → who they are, the last thing they asked, what's open (deal, tasks, drafts),
+//       their form/quiz answers, call notes, client health, and 3 questions to ask. Built from GHL + Archie's own data.
+// v5.7: second opinion (council) — big decisions run past a Chair and the lenses that fit (Money, Members, Operations,
+//       Growth, Content) with the owner's real numbers; hot-seat questions first if vague; "ask Money more" follow-ups.
+// v5.6: Sara as CSM — her brief gets client health (reds/yellows with reasons), clients waiting on a reply, and her
+//       check-in prompts; she can draft, send and bin her own check-ins/chases; Monday she gets a client-numbers review (no money).
 // v5.5: task upgrades — slip counter ("third move"), stalled tasks, waiting-on items with day counts and a drafted chase,
 //       and "you're the blocker" when a team member is waiting on you; in each person's brief and by voice.
 // v5.4.1: Talk to Archie fix — their message now goes first and the context is trimmed to fit (it was being cut off the
@@ -183,6 +189,8 @@ Deno.serve(async (req) => {
       case "report": return j(await weeklyReport(c.tid, p));
       case "goals": return j(await getGoals(c.tid));
       case "checkup": return j(await checkup(c.tid));
+      case "council": return j(await councilRun(c.tid, p));
+      case "call_prep": return j(await callPrep(c.tid, p));
       case "member_health": return j(await memberHealthList(c.tid, String(p.status ?? "")));
       case "groups_suggest": return j(await groupsSuggest(c.tid));
       case "groups_link": return j(await groupsLink(c.tid, p));
@@ -1225,7 +1233,7 @@ async function briefRun(tid: string, p: any) {
   };
   try {
     const [{ data: cfg }, { data: t }, { data: team }] = await Promise.all([
-      supabase.from("tenant_config").select("ghl_location_id, ghl_token, timezone, brief_channel").eq("tenant_id", tid).single(),
+      supabase.from("tenant_config").select("ghl_location_id, ghl_token, timezone, brief_channel, csm_handle").eq("tenant_id", tid).single(),
       supabase.from("tenants").select("location_id, status").eq("id", tid).single(),
       supabase.from("team_members").select("handle, name, gets_financials, ghl_contact_id").eq("tenant_id", tid),
     ]);
@@ -1351,6 +1359,22 @@ async function briefRun(tid: string, p: any) {
       taskLinesTeam = teamH.map((h: string) => { const l = linesFor(h); return l ? `${h}: ${l}` : ""; }).filter(Boolean).join(" ");
     } catch { /* bonus */ }
 
+    // CSM lines for the client success person's brief
+    let csmLines = "";
+    try {
+      const csm = String(cfg?.csm_handle ?? "");
+      if (csm) {
+        const { data: mh } = await supabase.from("member_health").select("name, status, reasons").eq("tenant_id", tid).in("status", ["red", "yellow"]);
+        const reds = (mh ?? []).filter((m: any) => m.status === "red"), yellows = (mh ?? []).filter((m: any) => m.status === "yellow");
+        const waiting = (mh ?? []).filter((m: any) => (m.reasons ?? []).some((r: string) => /for our reply/.test(r)));
+        const parts: string[] = [];
+        if (reds.length || yellows.length) parts.push(`Client health: ${reds.length} red, ${yellows.length} yellow.${reds.length ? ` Red: ${reds.slice(0, 4).map((m: any) => `${m.name} — ${(m.reasons ?? [])[0]}`).join("; ")}.` : ""}${yellows.length ? ` Yellow: ${yellows.slice(0, 4).map((m: any) => `${m.name} — ${(m.reasons ?? [])[0]}`).join("; ")}.` : ""}`);
+        if (waiting.length) parts.push(`Clients waiting on a reply: ${waiting.slice(0, 5).map((m: any) => `${m.name} (${((m.reasons ?? []).find((r: string) => /for our reply/.test(r)) ?? "").replace(/ for our reply.*$/, "")})`).join(", ")}.`);
+        if (reds.length || yellows.length) parts.push(`Say "Archie, check in with the reds" (or a name) and I'll draft the messages for you to send.`);
+        if (parts.length) csmLines = `${csm}: ${parts.join(" ")}`;
+      }
+    } catch { /* bonus */ }
+
     // Findings that keep coming back → one "Nth week in a row" line
     const { data: reps } = await supabase.from("business_memory").select("value, weeks_seen").eq("tenant_id", tid).eq("kind", "finding").eq("status", "active").gte("weeks_seen", 2).order("weeks_seen", { ascending: false }).limit(1);
     const repeatLine = reps?.[0] ? `${["", "", "Second", "Third", "Fourth", "Fifth"][Math.min(5, Number(reps[0].weeks_seen))] || `${reps[0].weeks_seen}th`} week running — ${String(reps[0].value).slice(0, 160)}` : "";
@@ -1364,6 +1388,7 @@ async function briefRun(tid: string, p: any) {
       "FOCUS LINE (owner brief): one action, one name, the highest value first — someone waiting on a reply right now beats a proposal waiting, which beats the top must task. E.g. \"Reply to Steph — she's waited 6 hours.\" Never a generic focus.",
       taskLinesOwner ? `Task check (OWNER brief, short lines near the task list, exactly these facts): ${taskLinesOwner}` : "",
       taskLinesTeam ? `Task check (TEAM brief — each line only in that person's brief): ${taskLinesTeam}` : "",
+      csmLines ? `Client success (TEAM brief for the person named, near the top — they own client check-ins; no money totals): ${csmLines}` : "",
       repeatLine ? `Repeating issue (OWNER brief only): mention this in one short line near the Focus, e.g. "Third week in a row: …": ${repeatLine}` : "",
       "Return only the two briefs in the marker format.",
       "", "BRIEF CONTEXT:", ctx.slice(0, 6000),
@@ -1837,6 +1862,8 @@ const TALK_RULES = [
   "- archie_set_trial {stage} — 'our trial stage is X'.",
   "- archie_memory {action save|list|archive, kind definition|voice|worked|service|fact, key, value} — 'remember…', 'a client means…', 'that doesn't sound like me…', 'forget the … one'. archie_remember also works for plain facts.",
   "- archie_checkup — 'is everything working?'; give the report as it is.",
+  "- archie_call_prep {name, time} — 'I've got Sarah at 10', 'prep me for my 2pm', 'what do I need to know before the Martin call?'. Give the result as it is.",
+  "- archie_council {question, answers, lens} — big decisions ('second opinion: should I raise prices to £75?', 'should I hire a coach?'). If it comes back with QUESTIONS, ask them and, when they answer, run archie_council again with the same question + answers. 'Ask Money more about that' → {lens:'Money', question: what they want to know}. Give the result as it is.",
   "RULES: Only send to customers what exists as a waiting draft — never freehand. New customer messages: draft in REPLY and ask 'Send it?'. Team members never get money figures and only see their own list. Unclear which item? Ask one short question with ACTIONS_JSON: []. Never invent tasks, names, numbers, dates or results.",
 ].join("\n");
 
@@ -1881,7 +1908,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
   try {
     if ((!contactId && !opts.handle) || !text) return log("failed", "", "contact_id (or handle) and text required");
     const [{ data: cfg }, { data: t }, { data: team }] = await Promise.all([
-      supabase.from("tenant_config").select("ghl_location_id, ghl_token, timezone, brief_channel").eq("tenant_id", tid).single(),
+      supabase.from("tenant_config").select("ghl_location_id, ghl_token, timezone, brief_channel, csm_handle").eq("tenant_id", tid).single(),
       supabase.from("tenants").select("location_id, status, business_name").eq("id", tid).single(),
       supabase.from("team_members").select("handle, name, gets_financials, ghl_contact_id").eq("tenant_id", tid),
     ]);
@@ -2014,12 +2041,24 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
-      const OWNER_ONLY = ["archie_set_trial", "archie_groups", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
+      const OWNER_ONLY = ["archie_call_prep", "archie_council", "archie_set_trial", "archie_groups", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
+      // The CSM can draft, send and bin their OWN client check-ins and chases
+      const isCsm = !member.gets_financials && String(cfg?.csm_handle ?? "").toLowerCase() === String(member.handle).toLowerCase();
+      if (isCsm && ["archie_draft_followups", "archie_send_draft", "archie_skip_draft", "archie_drafts"].includes(act.tool)) {
+        const r2 = await csmDraftAction(tid, member.handle, act.tool, args, accessToken);
+        ran.push(`${act.tool}${r2.ok ? "" : " (failed)"}`);
+        results.push(`${act.tool} → ${r2.ok ? "OK" : "FAILED"}: ${r2.text.slice(0, 800)}`);
+        continue;
+      }
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_set_trial"
+      const r = act.tool === "archie_call_prep"
+        ? await (async () => { const x: any = await callPrep(tid, args); return { ok: !!x.ok, text: x.text }; })()
+        : act.tool === "archie_council"
+        ? await (async () => { const x: any = await councilRun(tid, args); return { ok: !!x.ok, text: x.text }; })()
+        : act.tool === "archie_set_trial"
         ? await (async () => { const x: any = await setTrialStage(tid, args); return { ok: !!x.ok, text: x.text }; })()
         : act.tool === "archie_groups"
         ? await (async () => {
@@ -2053,6 +2092,13 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
         : await runArchieTool(accessToken, act.tool, args);
       ran.push(`${act.tool}${r.ok ? "" : " (failed)"}`);
       results.push(`${act.tool} ${JSON.stringify(args)} → ${r.ok ? "OK" : "FAILED"}: ${r.text.slice(0, act.tool === "archie_run_skill" ? 6000 : 800)}`);
+    }
+
+    // Some results go straight back as they are (no rewrite): the council and the checkup
+    if (plan.actions.length === 1 && ["archie_council", "archie_checkup", "archie_call_prep"].includes(plan.actions[0].tool) && results[0]) {
+      const direct = results[0].replace(/^archie_\w+ \{[^\n]*?\} → (OK|FAILED): /, "").trim();
+      const sentD = await reply(direct);
+      return log(sentD.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${direct.slice(0, 80)} | actions: ${ran.join(", ")}`, sentD.ok ? null : `reply not sent (${sentD.status})`);
     }
 
     // Round 3: the final reply, from what actually happened
@@ -2385,7 +2431,7 @@ async function reportWeeklyRun(tid: string) {
       const f: any = await getFocus(tid, true);
       if (f.items?.length) msg += `\n\n🧭 *Where to focus this week*\n${f.items.map((x: any, i: number) => `${i + 1}. ${x.title} — ${x.why}`).join("\n")}\n\nReply "do 1" (or 2, 3) and I'll get it started.`;
     } catch { /* focus is a bonus — the report still goes */ }
-    await sendToTeam(tid, msg, "", "report");
+    await sendToTeam(tid, msg, await csmWeekly(tid, r.week_start, r.week_end), "report");
   } catch (e) {
     await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "report", trigger: "api", status: "failed", started_at: now, finished_at: now, error: String(e).slice(0, 200) });
   }
@@ -2559,7 +2605,7 @@ async function draftFollowups(tid: string, p: any) {
     const w = written.find((x: any) => String(x?.name ?? "").toLowerCase().includes(f.first.toLowerCase()));
     const body = String(w?.message ?? `Hi ${f.first}, just checking in — are you still keen to move things forward? Happy to jump on a quick call if that helps.`).slice(0, 1000);
     rank++;
-    const { error } = await supabase.from("message_drafts").insert({ tenant_id: tid, created_on: today, rank, status: "pending", source: "focus", contact_id: f.id, name: f.name, channel, body });
+    const { error } = await supabase.from("message_drafts").insert({ tenant_id: tid, created_on: today, rank, status: "pending", source: p.by ? `by:${p.by}` : "focus", contact_id: f.id, name: f.name, channel, body });
     if (error) rank--; else made.push(`${rank}. ${f.name}: ${body.slice(0, 90)}…`);
   }
   return { ok: true, text: `Drafted ${made.length} message${made.length === 1 ? "" : "s"} (${purpose}):\n${made.join("\n")}${missing.length ? `\nCouldn't find: ${missing.join(", ")}` : ""}\nAsk if they want them sent (archie_send_draft for each number).` };
@@ -3203,6 +3249,202 @@ async function trialNumbers(tid: string, cfg: any, token: string, loc: string, f
   }
   void stageIdx;
   return { trials_started: started.length, cohort_trials: cohort.length, cohort_showed: showed, cohort_joined: joined };
+}
+
+// ===================== v5.6: Sara as CSM =====================
+async function csmDraftAction(tid: string, handle: string, tool: string, args: any, accessToken: string): Promise<{ ok: boolean; text: string }> {
+  const mine = async () => {
+    const { data: newest } = await supabase.from("message_drafts").select("created_on").eq("tenant_id", tid).eq("status", "pending").eq("source", `by:${handle}`).order("created_on", { ascending: false }).limit(1).maybeSingle();
+    if (!newest?.created_on) return [] as any[];
+    const { data } = await supabase.from("message_drafts").select("*").eq("tenant_id", tid).eq("status", "pending").eq("source", `by:${handle}`).eq("created_on", newest.created_on).order("rank");
+    return data ?? [];
+  };
+  if (tool === "archie_draft_followups") {
+    const purpose = String(args.purpose ?? "check in with a client");
+    if (!/check|chase|follow|welcome|onboard|renew|support|reply/i.test(purpose)) return { ok: false, text: "Team members can draft client check-ins, chases and follow-ups." };
+    const d: any = await draftFollowups(tid, { ...args, purpose, by: handle });
+    return { ok: !!d.ok, text: d.text };
+  }
+  const list = await mine();
+  if (tool === "archie_drafts") return { ok: true, text: list.length ? list.map((d: any) => `${d.rank}. ${d.name}: ${String(d.body).slice(0, 140)}`).join("\n") : "No drafts of yours waiting." };
+  const byRank = args.rank !== undefined && args.rank !== null && args.rank !== "";
+  const hits = byRank ? list.filter((d: any) => Number(d.rank) === Number(args.rank)) : list.filter((d: any) => String(d.name ?? "").toLowerCase().includes(String(args.name ?? "").toLowerCase()));
+  if (!hits.length) return { ok: false, text: "That isn't one of your drafts." };
+  if (hits.length > 1) return { ok: false, text: `More than one matches: ${hits.map((d: any) => `${d.rank}. ${d.name}`).join(" / ")}.` };
+  const r = await runArchieTool(accessToken, tool, { rank: hits[0].rank });
+  return { ok: r.ok, text: r.text };
+}
+
+async function csmWeekly(tid: string, weekStart: string, weekEnd: string): Promise<string> {
+  const { data: cfg } = await supabase.from("tenant_config").select("csm_handle").eq("tenant_id", tid).maybeSingle();
+  const csm = String(cfg?.csm_handle ?? "");
+  if (!csm) return "";
+  const [{ count: active }, { data: mh }, { count: sent }] = await Promise.all([
+    supabase.from("clients").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("status", "active"),
+    supabase.from("member_health").select("name, status, reasons").eq("tenant_id", tid),
+    supabase.from("message_drafts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("source", `by:${csm}`).eq("status", "sent").gte("sent_at", weekStart).lte("sent_at", `${weekEnd}T23:59:59Z`),
+  ]);
+  const by = (k: string) => (mh ?? []).filter((m: any) => m.status === k);
+  const reds = by("red");
+  return [
+    `🤝 Client week · ${weekStart} to ${weekEnd}`,
+    "",
+    `Active clients: ${active ?? 0}`,
+    `Health now: ${reds.length} red · ${by("yellow").length} yellow · ${by("green").length} green`,
+    `Check-ins and chases sent through Archie: ${sent ?? 0}`,
+    reds.length ? `\nReds to start the week with:\n${reds.slice(0, 6).map((m: any) => `- ${m.name}: ${(m.reasons ?? []).join("; ")}`).join("\n")}` : "",
+    "",
+    `Say "Archie, check in with the reds" and I'll draft them for you.`,
+  ].filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n").trim();
+}
+
+// ===================== v5.7: second opinion (council) =====================
+async function councilRun(tid: string, p: any) {
+  const question = String(p.question ?? "").trim().slice(0, 600);
+  const answers = String(p.answers ?? "").trim().slice(0, 1200);
+  const lens = String(p.lens ?? "").trim();
+  const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).single();
+  const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
+  const agentId = await agentIdFor(tid, "ops", token, loc) || await agentIdFor(tid, "sales", token, loc);
+  if (!agentId) return { ok: false, text: "I can't find the Archie Ops agent to run the council." };
+
+  // Follow-up on one lens
+  if (lens) {
+    const last: any = cfg?.last_council ?? null;
+    if (!last?.output) return { ok: false, text: "There's no recent second opinion to follow up on — ask me the decision first." };
+    const msg = `Second-opinion follow-up. The owner wants the ${lens} lens to go deeper.\nTheir question: ${question || "go deeper"}\n\nEARLIER COUNCIL ON: ${last.question}\n${String(last.output).slice(0, 3500)}\n\nFACTS\n${String(last.facts ?? "").slice(0, 3000)}\n\nAnswer as the ${lens} lens only: a deeper view (do the maths where the facts allow), what you'd watch, and 2 actions for this week. Plain English, short lines, [NEED: …] for anything missing.`;
+    const res = await agentExecute(token, agentId, { locationId: loc, message: msg }, `council-${tid}-${Date.now()}`);
+    const out = tidy(clean(String(res.json?.finalText ?? ""))).trim();
+    return out ? { ok: true, text: out } : { ok: false, text: "The council didn't answer — try again in a minute." };
+  }
+  if (!question) return { ok: false, text: "What's the decision?" };
+
+  // The owner's real numbers
+  const [thisW, lastW, pl, mh] = await Promise.all([
+    weeklyReport(tid, { week: "this" }) as Promise<any>,
+    weeklyReport(tid, { week: "last" }) as Promise<any>,
+    pipelineList({ tid, ghlToken: token }) as Promise<any>,
+    supabase.from("member_health").select("status").eq("tenant_id", tid),
+  ]);
+  const { count: activeClients } = await supabase.from("clients").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("status", "active");
+  const health = ["red", "yellow", "green"].map((k) => `${(mh.data ?? []).filter((m: any) => m.status === k).length} ${k}`).join(", ");
+  const items: any[] = pl?.items ?? [];
+  const n = lastW.numbers ?? {};
+  const facts = [
+    `Goals: £${cfg?.mrr_target ?? "?"} MRR and £${cfg?.revenue_target ?? "?"} revenue a month by ${cfg?.goal_date ?? "?"} · average sale £${cfg?.avg_sale_value ?? "?"} · show rate ${Math.round(Number(cfg?.show_rate ?? 0.7) * 100)}% · close rate ${Math.round(Number(cfg?.close_rate ?? 0.45) * 100)}%.`,
+    `MRR now (Stripe): £${n.mrr ?? thisW.numbers?.mrr ?? "?"}. Revenue this month so far: £${thisW.numbers?.revenue_mtd ?? n.revenue_mtd ?? "?"}.`,
+    `Last week: ${n.messages_sent ?? "?"} messages sent, ${n.calls_booked ?? "?"} calls booked, ${n.calls_held ?? "?"} held, ${n.sales_count ?? "?"} sales (£${n.sales_value ?? "?"}), new income £${n.new_income ?? "?"}, new MRR £${n.new_mrr ?? "?"}.`,
+    `Pace needed: ${thisW.pace?.line ?? "?"}`,
+    `Active clients: ${activeClients ?? "?"} · client health: ${health}.`,
+    `Pipeline: ${items.length} open, ${items.filter((x) => x.real).length} real (touched in 14 days, past first contact), value of open deals £${items.reduce((a, x) => a + (Number(x.value) || 0), 0)}.`,
+    await memoryText(tid, ["definition", "service", "fact", "worked", "baseline", "finding"], 2500),
+  ].filter(Boolean).join("\n");
+  const msg = `Use your second-opinion skill.\n\nDECISION: ${question}${answers ? `\n\nTHEIR ANSWERS TO YOUR QUESTIONS:\n${answers}\n(Don't ask more questions now — give the council.)` : ""}\n\nFACTS (their real numbers)\n${facts}`;
+  const res = await agentExecute(token, agentId, { locationId: loc, message: msg.slice(0, 9500) }, `council-${tid}-${Date.now()}`);
+  if (!res.ok || res.json?.success === false) return { ok: false, text: `The council couldn't run just now (${res.status}). Try again in a minute.` };
+  const out = tidy(clean(String(res.json?.finalText ?? ""))).trim();
+  if (!out) return { ok: false, text: "The council didn't answer — try again in a minute." };
+  if (!/^\s*QUESTIONS:/i.test(out)) await supabase.from("tenant_config").update({ last_council: { question, output: out.slice(0, 6000), facts: facts.slice(0, 4000), at: new Date().toISOString() } }).eq("tenant_id", tid);
+  return { ok: true, text: /^\s*QUESTIONS:/i.test(out) ? `Before I run the council, a couple of questions:\n${out.replace(/^\s*QUESTIONS:\s*/i, "")}` : out };
+}
+
+// ===================== v5.8: call prep =====================
+async function callPrep(tid: string, p: any) {
+  const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).single();
+  const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
+  const tz = cfg?.timezone || "Europe/London";
+  const today = localDate(Date.now(), tz);
+  const V = "2021-07-28";
+  const want = String(p.name ?? "").trim().toLowerCase();
+  const time = String(p.time ?? "").trim();
+
+  // 1. Who: today's/tomorrow's booked calls first (match name or time), then contact search
+  const { data: owner } = await supabase.from("team_members").select("ghl_user_id, personal_calendar_id").eq("tenant_id", tid).eq("gets_financials", true).limit(1).maybeSingle();
+  const userId = owner?.ghl_user_id || cfg?.ghl_user_id;
+  let contactId = "", eventTitle = "", eventTime = "";
+  if (userId) {
+    const from = Date.parse(isoAtTz(today, "00:00", tz)), to = from + 2 * 86400000;
+    const ev = await ghl(token, `/calendars/events?locationId=${loc}&userId=${userId}&startTime=${from}&endTime=${to}`, "GET", undefined, "2021-04-15");
+    const events: any[] = (ev.json?.events ?? []).filter((e: any) => !e.isBlockSlot && e.calendarId !== owner?.personal_calendar_id && String(e.appointmentStatus ?? "").toLowerCase() !== "cancelled" && Date.parse(e.endTime ?? e.startTime) > Date.now());
+    const hhmm = (iso: string) => new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(iso));
+    const tWant = time.replace(/\s*(am|pm)$/i, (m) => m).match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+    const timeMatch = (e: any) => {
+      if (!tWant) return false;
+      let h = Number(tWant[1]); const mm = Number(tWant[2] ?? 0); const ap = (tWant[3] ?? "").toLowerCase();
+      if (ap === "pm" && h < 12) h += 12; if (!ap && h < 8) h += 12;
+      return hhmm(e.startTime) === `${String(h).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+    };
+    const hit = events.find((e) => (want && String(e.title ?? "").toLowerCase().includes(want)) || timeMatch(e)) ?? (!want && !time ? events[0] : null);
+    if (hit) { contactId = hit.contactId; eventTitle = String(hit.title ?? ""); eventTime = `${hhmm(hit.startTime)}${localDate(Date.parse(hit.startTime), tz) !== today ? " tomorrow" : ""}`; }
+  }
+  if (!contactId && want) {
+    const cs = await ghl(token, `/contacts/?locationId=${loc}&query=${encodeURIComponent(String(p.name))}&limit=3`, "GET", undefined, V);
+    const list: any[] = cs.json?.contacts ?? [];
+    if (list.length > 1 && !list.some((c) => [c.firstName, c.lastName].filter(Boolean).join(" ").toLowerCase() === want)) return { ok: false, text: `More than one ${p.name}: ${list.map((c) => [c.firstName, c.lastName].filter(Boolean).join(" ")).join(" / ")}. Which one?` };
+    contactId = (list.find((c) => [c.firstName, c.lastName].filter(Boolean).join(" ").toLowerCase() === want) ?? list[0])?.id ?? "";
+  }
+  if (!contactId) return { ok: false, text: want || time ? `I can't find a call or contact for "${p.name || time}".` : "Who's the call with?" };
+
+  // 2. Everything we know about them
+  const [ct, cv, nt, fields, opp] = await Promise.all([
+    ghl(token, `/contacts/${contactId}`, "GET", undefined, V),
+    ghl(token, `/conversations/search?locationId=${loc}&contactId=${contactId}&limit=1`, "GET", undefined, "2021-04-15"),
+    ghl(token, `/contacts/${contactId}/notes`, "GET", undefined, V),
+    ghl(token, `/locations/${loc}/customFields`, "GET", undefined, V),
+    ghl(token, `/opportunities/search?location_id=${loc}&contact_id=${contactId}&limit=5`, "GET", undefined, V),
+  ]);
+  const c = ct.json?.contact ?? {};
+  const name = [c.firstName, c.lastName].filter(Boolean).join(" ") || c.contactName || "them";
+  const fieldName = new Map((fields.json?.customFields ?? []).map((f: any) => [f.id, f.name]));
+  const answers = (c.customFields ?? c.customField ?? []).map((f: any) => {
+    const v = Array.isArray(f.value) ? f.value.join(", ") : String(f.value ?? f.fieldValue ?? "");
+    return v && v.length < 400 ? `${fieldName.get(f.id) ?? f.id}: ${v}` : "";
+  }).filter(Boolean).slice(0, 25);
+  let lastMessages: string[] = [];
+  const convId = cv.json?.conversations?.[0]?.id;
+  const { data: grp } = await supabase.from("client_groups").select("conversation_id, client_id").eq("tenant_id", tid);
+  const { data: client } = await supabase.from("clients").select("id, name, started_at").eq("tenant_id", tid).eq("ghl_contact_id", contactId).maybeSingle();
+  const convIds = [convId, ...(grp ?? []).filter((g: any) => client && g.client_id === client.id).map((g: any) => g.conversation_id)].filter(Boolean);
+  for (const id of convIds.slice(0, 2)) {
+    const ms = await ghl(token, `/conversations/${id}/messages?limit=12`, "GET", undefined, "2021-04-15");
+    const raw = ms.json?.messages?.messages ?? ms.json?.messages ?? [];
+    lastMessages.push(...(Array.isArray(raw) ? raw : []).filter((m: any) => String(m.body ?? "").trim()).map((m: any) => `${String(m.dateAdded ?? "").slice(0, 10)} ${m.direction === "inbound" ? "THEM" : "US"}: ${String(m.body).replace(/\s+/g, " ").slice(0, 220)}`));
+  }
+  lastMessages = lastMessages.sort().slice(-14);
+  const notes = (nt.json?.notes ?? []).slice(0, 6).map((n: any) => `${String(n.dateAdded ?? "").slice(0, 10)}: ${String(n.body ?? "").replace(/\s+/g, " ").slice(0, 400)}`);
+  const deals = (opp.json?.opportunities ?? []).map((o: any) => `${o.name} — ${o.status}${o.monetaryValue ? `, £${o.monetaryValue}` : ""}${o.lastStageChangeAt ? `, last moved ${String(o.lastStageChangeAt).slice(0, 10)}` : ""}`);
+  const { data: tasks } = await supabase.from("tasks").select("title, status, owner, due_date").eq("tenant_id", tid).in("status", ["open", "doing", "waiting", "proposed"]).or(client ? `client_id.eq.${client.id},title.ilike.%${(c.firstName ?? name).replace(/[%,]/g, "")}%` : `title.ilike.%${(c.firstName ?? name).replace(/[%,]/g, "")}%`).limit(8);
+  const { data: health } = client ? await supabase.from("member_health").select("status, reasons").eq("tenant_id", tid).eq("client_id", client.id).maybeSingle() : { data: null };
+
+  const facts = [
+    `CALL: ${eventTitle || "(not on the calendar)"}${eventTime ? ` at ${eventTime}` : ""}`,
+    `CONTACT: ${name}${c.email ? ` · ${c.email}` : ""}${c.companyName ? ` · ${c.companyName}` : ""}${(c.tags ?? []).length ? ` · tags: ${(c.tags ?? []).join(", ")}` : ""}${c.source ? ` · source: ${c.source}` : ""}`,
+    client ? `CLIENT since ${String(client.started_at ?? "?").slice(0, 10)}${health ? ` · health ${health.status}: ${(health.reasons ?? []).join("; ")}` : ""}` : "Not a client yet (lead).",
+    deals.length ? `DEALS: ${deals.join(" | ")}` : "DEALS: none",
+    answers.length ? `THEIR FORM / QUIZ ANSWERS (custom fields):\n${answers.join("\n")}` : "THEIR FORM / QUIZ ANSWERS: none on record",
+    notes.length ? `NOTES (newest first):\n${notes.join("\n")}` : "NOTES: none",
+    lastMessages.length ? `RECENT MESSAGES (oldest → newest):\n${lastMessages.join("\n")}` : "RECENT MESSAGES: none",
+    (tasks ?? []).length ? `OPEN TASKS: ${(tasks ?? []).map((t: any) => `${t.title} (${t.status}${t.owner ? `, ${t.owner}` : ""})`).join("; ")}` : "OPEN TASKS: none",
+  ].join("\n\n");
+
+  const agentId = await agentIdFor(tid, "sales", token, loc);
+  if (!agentId) return { ok: false, text: "I can't find the Archie Sales agent." };
+  const msg = [
+    "Prepare the owner for this call. Use ONLY the facts below. Plain English, short lines, no markdown symbols. Under ~18 lines.",
+    "Output exactly these parts:",
+    `CALL PREP — ${name}${eventTime ? `, ${eventTime}` : ""}`,
+    "Who: one line (client or lead, how long, where they came from).",
+    "Last thing they asked or said: one or two lines, with the date.",
+    "What's open: deals, tasks, anything promised or waiting.",
+    "Their answers: the 2–4 most useful form/quiz answers (if any).",
+    "Watch out for: one or two lines (health flags, objections, anything unanswered) — label judgement \"My read:\".",
+    "Ask them: 3 questions that move this forward.",
+    "",
+    `FACTS\n${facts}`,
+  ].join("\n");
+  const res = await agentExecute(token, agentId, { locationId: loc, message: msg.slice(0, 9500) }, `prep-${tid}-${Date.now()}`);
+  const out = tidy(clean(String(res.json?.finalText ?? ""))).trim();
+  return out ? { ok: true, text: out } : { ok: false, text: "Couldn't put the prep together just now — try again in a minute." };
 }
 
 // ===================== workflow side =====================
