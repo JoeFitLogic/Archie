@@ -1,4 +1,8 @@
-// archie-screens v5.3 — data and actions for the Archie AI Studio pages.
+// archie-screens v5.4.1 — data and actions for the Archie AI Studio pages.
+// v5.4.1: Talk to Archie fix — their message now goes first and the context is trimmed to fit (it was being cut off the
+//         end of long prompts, so Archie replied "your message didn't come through"); talk rules tightened.
+// v5.4: trial-to-member — set which pipeline stage means "trial / intro offer"; the weekly report counts trials started,
+//       and for trials started 2–5 weeks ago: how many showed up and how many became members.
 // v5.3: WhatsApp groups — clients linked to their group chats (Archie suggests matches, you confirm); member health reads
 //       the group (last message, and whether the client's side is waiting on us) as well as the 1:1 chat.
 // v5.2: member health — every active client scored Green / Yellow / Red nightly with the reasons and dates (last contact,
@@ -1778,40 +1782,28 @@ async function agentsHealth(c: any) {
 
 // ===================== v3.0: Talk to Archie =====================
 const TALK_RULES = [
-  "You are Archie, talking to a member of this business on WhatsApp. Reply like a sharp, friendly colleague: short, plain UK English, no markdown headings, no bullet walls, under about 8 lines unless returning written content.",
-  "DO NOT call any tools or apps yourself. Instead, list the actions Archie should take in ACTIONS_JSON — Archie's backend runs them and tells you the results.",
-  "Output format, exactly:",
-  "REPLY: <what to say to them now — if you listed actions, keep this to a short holding line like 'On it.'>",
+  "You are Archie, a member of this business's team, on WhatsApp. Short, plain UK English, like a sharp colleague texting. No markdown. Under ~8 lines unless returning written content.",
+  "Never call tools yourself. List what Archie should do in ACTIONS_JSON — the backend runs it and gives you the results.",
+  "Output exactly:",
+  "REPLY: <what to say now — a short holding line like 'On it.' if you listed actions>",
   'ACTIONS_JSON: [{"tool":"archie_add_task","args":{"title":"…","tier":"bonus","effort_minutes":15,"due_date":"YYYY-MM-DD"}}]',
-  "Use ACTIONS_JSON: [] when nothing needs doing (just chat or a question you can answer from the CONTEXT).",
-  "Rules for actions:",
-  "- Internal actions (add/complete/move tasks, capacity, quiet mode, day off, back on) — just do them, no 'are you sure?'.",
-  "- Tasks: the title is just the job; set tier (must/high/bonus), effort_minutes and due_date from what they said; 'today' = today's date from the CONTEXT. Never put the tier or time in the title.",
-  "- 'I'm off Friday' / 'block Thursday 2 till 4' / 'away Mon–Wed' → archie_day_off with real dates. 'Actually I'm working Friday' → archie_back_on.",
-  "- If a day off shows calls already booked, ask 'Want me to draft messages to rebook them?'. On yes → put archie_rebook_drafts in ACTIONS_JSON with the same dates/times (add a reason if they gave one). NEVER write a rebook message yourself in REPLY — it must come from archie_rebook_drafts so it has the right booking link and is saved so it can be sent.",
-  "- After archie_rebook_drafts has run, show the drafts it made (with their numbers) and ask 'Send them?'. On yes → archie_send_draft for each of those numbers.",
-  "- General rule for messages to customers: only ever offer to send something that exists as a waiting draft. If they ask you to send something that isn't a draft yet, create it through the right tool first (e.g. archie_rebook_drafts), never freehand.",
-  "- 'How's this week looking?' / 'how did last week go?' / 'am I on pace?' → archie_week with args {\"week\":\"this\"} or {\"week\":\"last\"} — messages sent, calls booked/held, sales, income, revenue and MRR vs goals, and pace. Give it back tidy and short, with one line on what stands out.",
-  "- Goals: 'set my MRR goal to £30k by June' / 'my average sale is £397' / 'my close rate is about 50%' → archie_set_goals with any of {mrr_goal, revenue_goal, goal_date (YYYY-MM-DD, end of the month they name), avg_sale_value, show_rate, close_rate (as percentages)}. Just do it and read back the new goals and the new weekly pace.",
-  "- Where to focus: 'what should I focus on?' → read the FOCUS list in the CONTEXT. 'Do 1' / 'do the first one' → carry out that focus item: if it says draft → archie_draft_followups with its names and purpose (then show the drafts and ask 'Send them?'); if it says skill → archie_run_skill; if it says task → archie_add_task.",
-  "- Numbers or money → archie_numbers (never guess). Calls on a day → archie_calls. Writing (posts, reels, carousels, stories, proposals, objection replies, SOPs, briefs) → archie_run_skill.",
-  "- 'Remember that…' → archie_remember.",
-  "- WhatsApp groups: 'link my client groups' / 'suggest group links' → archie_groups {action:\"suggest\"} (numbered suggestions). 'Link 1, 3 and 4' / 'link all' → archie_groups {action:\"link\", numbers:[1,3,4]} or {action:\"link\", all:true}. 'Link the CS Fitness group to Chris Stewart' → {action:\"link\", group:\"CS Fitness\", client:\"Chris Stewart\"}. 'Which groups are linked?' → {action:\"list\"}.",
-  "- Client health: 'who's at risk?' / 'how are my clients doing?' / 'any reds?' → archie_member_health {status: red|yellow|green or empty for all}. 'Draft a check-in for Lhea' / 'check in with the reds' → archie_draft_followups {names:[…], purpose:\"check in with a client\"}, then ask 'Send them?'.",
-  "- Business memory → archie_memory. 'Remember we don't do refunds after 14 days' → {action:\"save\", kind:\"fact\", key, value}. 'A member means anyone on a paid plan' / 'a trial is the £30 intro' → kind \"definition\" (key: member, trial, paused, refund…). 'That doesn't sound like me — I'd never say crush it' → kind \"voice\" (a rule for how they write). 'The free workshop worked really well' → kind \"worked\". 'We offer 1:1 PT, small group and online' → kind \"service\". 'What do you know about my business?' → {action:\"list\"}. 'Forget the refund one' → {action:\"archive\", key, reason}. Keys short and lower-case (e.g. member, refunds, tone-hype). Never save money figures for team members.",
-  "- 'Checkup' / 'is everything working?' / 'something's not right with Archie' → archie_checkup, and give them the report as it is.",
-  "- Email sequences: 'write me a nurture sequence for new leads' / 'a launch sequence for the November intake' → archie_run_skill with skill email-sequence and an input that starts 'Type: Nurture.' (or Launch, Re-engagement, Onboarding, Win-back) then who it's for and what it's about. Give them the emails (not the EMAILS_JSON line) and ask 'Save them to GHL as templates?'. On yes, or 'save that sequence to GHL' → archie_save_sequence (no args = the latest sequence).",
-  "- Repeating tasks: 'every Monday, content filming, 2 hours, must' / 'every weekday Sara checks the support inbox' / 'on the 1st of every month, send invoices' → archie_add_recurring {title, pattern: daily|weekdays|weekly|fortnightly|monthly|monthly_last, days: [\"mon\",…] for weekly/fortnightly/monthly_last, month_day for monthly, tier, effort_minutes, handle}. 'What's on repeat?' → archie_recurring. 'Pause the Monday filming for 2 weeks' → archie_pause_recurring {title, until: YYYY-MM-DD}; 'stop the Friday check-in one' → archie_pause_recurring {title, stop: true}; 'restart it' → {title, resume: true}.",
-  "- Booking calls: 'book Martin a diagnostic call Thursday at 2' → ask 'Book Martin, diagnostic call, Thursday 1 Oct at 14:00? Yes?' and only on yes → archie_book_call {name, calendar, date, time}. No time given ('get Steph in for a support call next week') → archie_free_slots {calendar, date} and offer 3 times; then book the one they pick (after a yes). 'What calendars have I got?' → archie_calendars.",
-  "- Personal events: 'coffee with Dave Thursday 10 till 11' / 'dentist Friday 3pm' → archie_personal_event {title, date, from, to} straight away (no confirm; default one hour). Title in their words, e.g. 'Coffee with Dave'.",
-  "- Pipeline: 'add Ross McKenley to follow up' / 'move Martin to proposal sent' → archie_move_deal with name + stage (moves and adds just happen). 'Move Jase to abandoned' / 'Jase is lost' / 'mark Martin won' → archie_move_deal with status — ask 'Mark Jase as abandoned? Yes?' first (won also starts onboarding), and only run it after they say yes. Include the reason if they gave one.",
-  "- The owner can ask about a team member: 'what's Sara got on?' → archie_today with handle sara; 'give this to Sara' → add the task with handle sara. Team members can only see their own list.",
-  "- Drafts waiting (the 'Ready to send' list): 'send the Jase message' / 'send 1' → archie_send_draft (rank or name). 'Bin that' / 'skip 2' → archie_skip_draft. 'What drafts are waiting?' → archie_drafts. Sending a waiting draft IS allowed when the owner clearly says send — that's their yes.",
-  "- Proposals (P1, P2… things spotted in messages): 'add P1' / 'add the Niamh one' → archie_proposal action add. 'Give P2 to Sara' → action give, to_handle sara. 'I'm waiting on Seve for that' → action wait, waiting_for. 'Drop P3' / 'bin that one' → action drop. 'What did you spot?' → archie_proposals.",
-  "- Anything new that goes to a customer (not an existing draft): never send it. Draft it in REPLY and ask 'Send it?'.",
-  "- Team members (not the owner) never get money figures.",
-  "- If it's unclear which task they mean, ask one short question and use ACTIONS_JSON: [].",
-  "- Never invent tasks, names, numbers, dates or results.",
+  "Use ACTIONS_JSON: [] when nothing needs doing.",
+  "TOOLS (tool → when):",
+  "- archie_add_task {title, tier must|high|bonus, effort_minutes, due_date, handle} · archie_complete_task · archie_move_task · archie_today {handle} — tasks. Title is just the job. 'today' = today's date in the CONTEXT. Just do it.",
+  "- archie_capacity · archie_quiet · archie_day_off {date, end_date, from, to} · archie_back_on — just do it. If a day off clashes with booked calls, ask 'Draft messages to rebook them?' → yes → archie_rebook_drafts (same dates) → show drafts → 'Send them?' → archie_send_draft for each.",
+  "- archie_drafts · archie_send_draft {rank|name} (owner saying 'send' IS the yes) · archie_skip_draft. archie_proposals · archie_proposal {rank|title, action add|give|wait|drop, to_handle, waiting_for}.",
+  "- archie_week {week this|last} — 'how's this week looking?', 'am I on pace?', 'how are trials converting?'. archie_set_goals {mrr_goal, revenue_goal, goal_date, avg_sale_value, show_rate, close_rate} — just do it, read back the new pace. archie_numbers — money (never guess).",
+  "- Focus: 'what should I focus on?' → the FOCUS list in the CONTEXT. 'do 1' → that item: draft → archie_draft_followups {names, purpose}; skill → archie_run_skill; task → archie_add_task.",
+  "- archie_run_skill {skill, input} — any writing (posts, reels, carousels, stories, proposals, objection replies, SOPs). Email sequences: skill email-sequence, input starts 'Type: Nurture.' (or Launch, Re-engagement, Onboarding, Win-back); show the emails, ask 'Save them to GHL as templates?' → archie_save_sequence.",
+  "- archie_book_call {name, calendar, date, time} — confirm first ('Book Martin, diagnostic call, Thu 1 Oct 14:00? Yes?'). No time → archie_free_slots {calendar, date}, offer 3. archie_calendars. archie_personal_event {title, date, from, to} — personal plans, just do it. archie_calls — calls on a day.",
+  "- archie_move_deal {name, stage | status won|lost|abandoned, reason} — stage moves just happen; won/lost/abandoned: ask 'Mark Jase as abandoned? Yes?' first.",
+  "- archie_add_recurring {title, pattern daily|weekdays|weekly|fortnightly|monthly|monthly_last, days [\"mon\",…], month_day, tier, effort_minutes, handle} · archie_recurring · archie_pause_recurring {title, until | stop | resume}.",
+  "- archie_member_health {status red|yellow|green|''} — 'who's at risk?'. Check-ins → archie_draft_followups {names, purpose:'check in with a client'}, then 'Send them?'.",
+  "- archie_groups {action suggest | link (numbers / all / group+client) | list} — link client WhatsApp groups.",
+  "- archie_set_trial {stage} — 'our trial stage is X'.",
+  "- archie_memory {action save|list|archive, kind definition|voice|worked|service|fact, key, value} — 'remember…', 'a client means…', 'that doesn't sound like me…', 'forget the … one'. archie_remember also works for plain facts.",
+  "- archie_checkup — 'is everything working?'; give the report as it is.",
+  "RULES: Only send to customers what exists as a waiting draft — never freehand. New customer messages: draft in REPLY and ask 'Send it?'. Team members never get money figures and only see their own list. Unclear which item? Ask one short question with ACTIONS_JSON: []. Never invent tasks, names, numbers, dates or results.",
 ].join("\n");
 
 const TALK_FOLLOWUP = [
@@ -1965,7 +1957,10 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     }
 
     // Round 1: what do they want?
-    const first = await ask(`${TALK_RULES}\n\nCONTEXT\n${ctx}\n\nTHEIR MESSAGE\n${text}`);
+    // Their message goes first and the context is trimmed to fit — never the other way round
+    const headPart = `THEIR MESSAGE\n${text.slice(0, 1500)}\n\n${TALK_RULES}\n\nCONTEXT\n`;
+    const room = 9300 - headPart.length;
+    const first = await ask(headPart + (ctx.length > room ? ctx.slice(0, Math.max(0, room - 40)) + "\n[context trimmed]" : ctx));
     if (!first.ok || first.json?.success === false) {
       await reply("Sorry — I couldn't process that just now. Try again in a minute, or use a quick command like done 1.");
       return log("failed", "", `Archie Assistant error ${first.status}: ${String(first.text).slice(0, 200)}`);
@@ -1985,12 +1980,14 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
-      const OWNER_ONLY = ["archie_groups", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
+      const OWNER_ONLY = ["archie_set_trial", "archie_groups", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_groups"
+      const r = act.tool === "archie_set_trial"
+        ? await (async () => { const x: any = await setTrialStage(tid, args); return { ok: !!x.ok, text: x.text }; })()
+        : act.tool === "archie_groups"
         ? await (async () => {
             const a2 = String(args.action ?? "suggest");
             const x: any = a2 === "list" ? await groupsList(tid) : a2 === "link" ? await groupsLink(tid, args) : await groupsSuggest(tid);
@@ -2269,6 +2266,12 @@ async function weekNumbers(tid: string, cfg: any, weekStart: string, current: bo
     out.sales_count = count; out.sales_value = Math.round(value); out.sales_names = names.slice(0, 10);
   } catch (e) { out.errors.push(`sales: ${String(e).slice(0, 80)}`); }
 
+  // 3b. Trials → members (only if a trial stage is set)
+  if (cfg?.trial_stage) {
+    try { Object.assign(out, await trialNumbers(tid, cfg, token, loc, fromMs, toMs)); }
+    catch (e) { out.errors.push(`trials: ${String(e).slice(0, 80)}`); }
+  }
+
   // 4. Money — from the daily Stripe snapshots
   try {
     const { data: rows } = await supabase.from("daily_metrics").select("metric_date, mrr, mrr_new, revenue_mtd, cash_24h")
@@ -2325,6 +2328,7 @@ function reportMessage(r: any): string {
     `✉️ Messages sent: ${f(n.messages_sent)}${arrow(n.messages_sent, p.messages_sent)}`,
     `📅 Calls booked: ${f(n.calls_booked)}${arrow(n.calls_booked, p.calls_booked)} · held ${f(n.calls_held)}${n.show_rate !== null && n.show_rate !== undefined ? ` · show rate ${n.show_rate}%` : ""}`,
     n.enquiries !== undefined ? `⏱️ Enquiries: ${f(n.enquiries)} · ${f(n.reply_slow)} waited 4h+${n.reply_median_min !== null && n.reply_median_min !== undefined ? ` · typical reply ${n.reply_median_min < 60 ? `${n.reply_median_min} min` : `${Math.round(n.reply_median_min / 60)}h`}` : ""}` : "",
+    n.trials_started !== undefined ? `🧪 Trials started: ${f(n.trials_started)}${arrow(n.trials_started, p.trials_started)}${n.cohort_trials ? ` · of ${n.cohort_trials} trials from 2–5 weeks ago: ${n.cohort_showed} showed, ${n.cohort_joined} joined (${Math.round((n.cohort_joined / n.cohort_trials) * 100)}%)` : ""}` : "",
     `🤝 Sales: ${f(n.sales_count)}${arrow(n.sales_count, p.sales_count)} · ${money(n.sales_value)}`,
     `💰 New income: ${money(n.new_income)}${arrow(n.new_income, p.new_income)}`,
     `📈 Revenue this month: ${money(n.revenue_mtd)}${g.revenue_goal ? ` of ${money(g.revenue_goal)}${pct(n.revenue_mtd, g.revenue_goal)}` : ""}`,
@@ -3116,6 +3120,55 @@ async function groupsList(tid: string) {
   const nameOf = new Map((clients ?? []).map((c: any) => [c.id, c.name]));
   const text = (data ?? []).length ? `Linked group chats:\n${(data ?? []).map((g: any) => `"${g.group_name}" → ${nameOf.get(g.client_id) ?? "client"}`).join("\n")}` : "No group chats linked yet. Say \"suggest group links\".";
   return { ok: true, items: data ?? [], text };
+}
+
+// ===================== v5.4: trial → member =====================
+async function setTrialStage(tid: string, p: any) {
+  const want = String(p.stage ?? "").trim();
+  if (!want) return { ok: false, text: "Which pipeline stage means someone's started a trial or intro offer?" };
+  const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+  const r = await ghl(cfg?.ghl_token || FALLBACK_TOKEN, `/opportunities/pipelines?locationId=${cfg?.ghl_location_id}`, "GET", undefined, "2021-07-28");
+  const norm = (x: string) => x.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const hits: { pipe: any; stage: any }[] = [];
+  for (const pipe of r.json?.pipelines ?? []) for (const st of pipe.stages ?? []) if (norm(st.name) === norm(want) || norm(st.name).includes(norm(want))) hits.push({ pipe, stage: st });
+  if (!hits.length) return { ok: false, text: `No pipeline stage called "${want}".` };
+  if (hits.length > 1 && !hits.some((h) => norm(h.stage.name) === norm(want))) return { ok: false, text: `More than one stage matches: ${hits.map((h) => `${h.stage.name} (${h.pipe.name})`).join(" / ")}. Which one?` };
+  const h = hits.find((x) => norm(x.stage.name) === norm(want)) ?? hits[0];
+  await supabase.from("tenant_config").update({ trial_stage: h.stage.id, trial_pipeline: h.pipe.id, trial_stage_name: h.stage.name }).eq("tenant_id", tid);
+  await supabase.from("weekly_reports").delete().eq("tenant_id", tid).eq("is_final", false);
+  return { ok: true, text: `Trial stage set: "${h.stage.name}" in ${h.pipe.name}. The weekly report will show trials started and how many show up and join.` };
+}
+
+// Trials = deals that entered the trial stage. Showed = had a booking held after they started. Joined = deal won or now an active client.
+async function trialNumbers(tid: string, cfg: any, token: string, loc: string, fromMs: number, toMs: number) {
+  const opps: any[] = [];
+  for (let page = 1; page <= 5; page++) {
+    const r = await ghl(token, `/opportunities/search?location_id=${loc}&pipeline_id=${cfg.trial_pipeline}&limit=100&page=${page}`, "GET", undefined, "2021-07-28");
+    const list: any[] = r.json?.opportunities ?? [];
+    opps.push(...list);
+    if (list.length < 100) break;
+  }
+  // When did each deal reach the trial stage? GHL keeps the last stage change; for deals still in (or past) the stage that's our best date.
+  const trialStart = (o: any) => Date.parse(String(o.lastStageChangeAt ?? o.updatedAt ?? o.createdAt ?? ""));
+  const stageIdx = new Map<string, number>();
+  const { data: pc } = await supabase.from("tenant_config").select("trial_stage").eq("tenant_id", tid).maybeSingle();
+  const inTrialOrPast = (o: any) => o.pipelineStageId === pc?.trial_stage || String(o.status) === "won";
+  const started = opps.filter((o) => o.pipelineStageId === cfg.trial_stage && trialStart(o) >= fromMs && trialStart(o) < toMs);
+  // Cohort: trials started 2–5 weeks before this week
+  const cFrom = fromMs - 35 * 86400000, cTo = fromMs - 14 * 86400000;
+  const cohort = opps.filter((o) => inTrialOrPast(o) && trialStart(o) >= cFrom && trialStart(o) < cTo).slice(0, 40);
+  const { data: active } = await supabase.from("clients").select("ghl_contact_id").eq("tenant_id", tid).eq("status", "active");
+  const activeSet = new Set((active ?? []).map((c: any) => c.ghl_contact_id));
+  let showed = 0, joined = 0;
+  for (const o of cohort) {
+    const cid = o.contactId ?? o.contact?.id;
+    if (String(o.status) === "won" || activeSet.has(cid)) joined++;
+    const ap = await ghl(token, `/contacts/${cid}/appointments`, "GET", undefined, "2021-07-28");
+    const evs: any[] = ap.json?.events ?? ap.json?.appointments ?? [];
+    if (evs.some((e) => Date.parse(e.startTime) >= trialStart(o) && Date.parse(e.startTime) <= Date.now() && !["cancelled", "noshow", "no_show", "invalid"].includes(String(e.appointmentStatus ?? e.status ?? "").toLowerCase()))) showed++;
+  }
+  void stageIdx;
+  return { trials_started: started.length, cohort_trials: cohort.length, cohort_showed: showed, cohort_joined: joined };
 }
 
 // ===================== workflow side =====================
