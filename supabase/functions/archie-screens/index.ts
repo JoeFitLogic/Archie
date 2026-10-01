@@ -1,4 +1,6 @@
-// archie-screens v5.2 — data and actions for the Archie AI Studio pages.
+// archie-screens v5.3 — data and actions for the Archie AI Studio pages.
+// v5.3: WhatsApp groups — clients linked to their group chats (Archie suggests matches, you confirm); member health reads
+//       the group (last message, and whether the client's side is waiting on us) as well as the 1:1 chat.
 // v5.2: member health — every active client scored Green / Yellow / Red nightly with the reasons and dates (last contact,
 //       waiting on our reply, failed payment, paused/cancel tags, next booking); drafted check-ins; in the brief and by voice.
 // v5.1: speed-to-lead (enquiries, slow replies, median first reply, who's waiting now), honest pipeline check
@@ -176,6 +178,9 @@ Deno.serve(async (req) => {
       case "goals": return j(await getGoals(c.tid));
       case "checkup": return j(await checkup(c.tid));
       case "member_health": return j(await memberHealthList(c.tid, String(p.status ?? "")));
+      case "groups_suggest": return j(await groupsSuggest(c.tid));
+      case "groups_link": return j(await groupsLink(c.tid, p));
+      case "groups_list": return j(await groupsList(c.tid));
       case "memory_list": return j(await memoryList(c.tid, String(p.kind ?? "")));
       case "memory_save": return j(await memoryAction(c.tid, { handle: c.owner?.handle ?? "owner", gets_financials: true }, { ...p, action: "save" }));
       case "memory_archive": return j(await memoryAction(c.tid, { handle: c.owner?.handle ?? "owner", gets_financials: true }, { ...p, action: "archive" }));
@@ -1791,6 +1796,7 @@ const TALK_RULES = [
   "- Where to focus: 'what should I focus on?' → read the FOCUS list in the CONTEXT. 'Do 1' / 'do the first one' → carry out that focus item: if it says draft → archie_draft_followups with its names and purpose (then show the drafts and ask 'Send them?'); if it says skill → archie_run_skill; if it says task → archie_add_task.",
   "- Numbers or money → archie_numbers (never guess). Calls on a day → archie_calls. Writing (posts, reels, carousels, stories, proposals, objection replies, SOPs, briefs) → archie_run_skill.",
   "- 'Remember that…' → archie_remember.",
+  "- WhatsApp groups: 'link my client groups' / 'suggest group links' → archie_groups {action:\"suggest\"} (numbered suggestions). 'Link 1, 3 and 4' / 'link all' → archie_groups {action:\"link\", numbers:[1,3,4]} or {action:\"link\", all:true}. 'Link the CS Fitness group to Chris Stewart' → {action:\"link\", group:\"CS Fitness\", client:\"Chris Stewart\"}. 'Which groups are linked?' → {action:\"list\"}.",
   "- Client health: 'who's at risk?' / 'how are my clients doing?' / 'any reds?' → archie_member_health {status: red|yellow|green or empty for all}. 'Draft a check-in for Lhea' / 'check in with the reds' → archie_draft_followups {names:[…], purpose:\"check in with a client\"}, then ask 'Send them?'.",
   "- Business memory → archie_memory. 'Remember we don't do refunds after 14 days' → {action:\"save\", kind:\"fact\", key, value}. 'A member means anyone on a paid plan' / 'a trial is the £30 intro' → kind \"definition\" (key: member, trial, paused, refund…). 'That doesn't sound like me — I'd never say crush it' → kind \"voice\" (a rule for how they write). 'The free workshop worked really well' → kind \"worked\". 'We offer 1:1 PT, small group and online' → kind \"service\". 'What do you know about my business?' → {action:\"list\"}. 'Forget the refund one' → {action:\"archive\", key, reason}. Keys short and lower-case (e.g. member, refunds, tone-hype). Never save money figures for team members.",
   "- 'Checkup' / 'is everything working?' / 'something's not right with Archie' → archie_checkup, and give them the report as it is.",
@@ -1979,12 +1985,18 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
-      const OWNER_ONLY = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
+      const OWNER_ONLY = ["archie_groups", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_member_health"
+      const r = act.tool === "archie_groups"
+        ? await (async () => {
+            const a2 = String(args.action ?? "suggest");
+            const x: any = a2 === "list" ? await groupsList(tid) : a2 === "link" ? await groupsLink(tid, args) : await groupsSuggest(tid);
+            return { ok: !!x.ok, text: x.text };
+          })()
+        : act.tool === "archie_member_health"
         ? await (async () => { const x: any = await memberHealthList(tid, String(args.status ?? "")); return { ok: true, text: x.text }; })()
         : act.tool === "archie_memory"
         ? await (async () => { const x: any = await memoryAction(tid, member, args); return { ok: !!x.ok, text: x.text }; })()
@@ -2950,6 +2962,9 @@ async function memberHealthRun(tid: string) {
     const failedByEmail = new Map((chase ?? []).map((t: any) => [String(t.source_ref).split(":")[1]?.toLowerCase(), String(t.created_at).slice(0, 10)]));
     const fmt = (ms: number) => new Date(ms).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: tz });
     const rows: any[] = [];
+    const { data: links } = await supabase.from("client_groups").select("client_id, conversation_id").eq("tenant_id", tid);
+    const groupsByClient = new Map<string, string[]>();
+    for (const l of links ?? []) { const a = groupsByClient.get(l.client_id) ?? []; a.push(l.conversation_id); groupsByClient.set(l.client_id, a); }
     for (const cl of clients ?? []) {
       if (!cl.ghl_contact_id) continue;
       const reasons: string[] = []; let level = 0; // 0 green, 1 yellow, 2 red
@@ -2959,8 +2974,17 @@ async function memberHealthRun(tid: string) {
         ghl(token, `/contacts/${cl.ghl_contact_id}/appointments`, "GET", undefined, "2021-07-28"),
       ]);
       const conv = cv.json?.conversations?.[0];
-      const lastMs = Math.max(Number(conv?.lastMessageDate ?? 0) || 0, Date.parse(String(cl.last_contact_at ?? "")) || 0);
-      const lastDir = String(conv?.lastMessageDirection ?? "").toLowerCase();
+      // Their WhatsApp group(s) count too — often that's where the real conversation is
+      const groups = groupsByClient.get(cl.id) ?? [];
+      const convs: { ms: number; dir: string }[] = [{ ms: Number(conv?.lastMessageDate ?? 0) || 0, dir: String(conv?.lastMessageDirection ?? "").toLowerCase() }];
+      for (const gid of groups) {
+        const g = await ghl(token, `/conversations/${gid}`, "GET", undefined, "2021-04-15");
+        const gc = g.json?.conversation ?? g.json ?? {};
+        convs.push({ ms: Number(gc.lastMessageDate ?? 0) || Date.parse(String(gc.dateUpdated ?? "")) || 0, dir: String(gc.lastMessageDirection ?? "").toLowerCase() });
+      }
+      const latest = convs.sort((a, b) => b.ms - a.ms)[0];
+      const lastMs = Math.max(latest?.ms || 0, Date.parse(String(cl.last_contact_at ?? "")) || 0);
+      const lastDir = latest?.ms && latest.ms >= lastMs - 60000 ? latest.dir : "";
       const contact = ct.json?.contact ?? {};
       const tags: string[] = (contact.tags ?? []).map((t: string) => String(t).toLowerCase());
       const email = String(contact.email ?? "").toLowerCase();
@@ -3008,6 +3032,90 @@ async function memberHealthList(tid: string, status: string) {
   const shown = items.filter((i: any) => i.status !== "green" || status === "green").slice(0, 15);
   const text = `Client health (Archie's scoring, ${new Date(items[0].computed_at).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}): ${counts}.\n${shown.map((i: any) => `${dot[i.status]} ${i.name} — ${(i.reasons ?? []).join("; ")}`).join("\n")}`;
   return { ok: true, items, text };
+}
+
+// ===================== v5.3: WhatsApp groups linked to clients =====================
+function normName(s: string) { return String(s ?? "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\b(x|and|the|fitlogic|systems|group|chat|support|team|coaching|fitness|ltd|limited)\b/g, " ").replace(/\s+/g, " ").trim(); }
+function nameScore(a: string, b: string) {
+  const A = new Set(normName(a).split(" ").filter((w) => w.length > 1)), B = new Set(normName(b).split(" ").filter((w) => w.length > 1));
+  if (!A.size || !B.size) return 0;
+  let hit = 0; for (const w of A) if (B.has(w)) hit++;
+  return hit / Math.min(A.size, B.size);
+}
+
+async function recentConversations(tid: string, pages = 3) {
+  const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+  const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
+  const out: any[] = [];
+  let startAfter = "";
+  for (let i = 0; i < pages; i++) {
+    const r = await ghl(token, `/conversations/search?locationId=${loc}&limit=100&sort=desc&sortBy=last_message_date${startAfter ? `&startAfterDate=${startAfter}` : ""}`, "GET", undefined, "2021-04-15");
+    const cs: any[] = r.json?.conversations ?? [];
+    out.push(...cs);
+    if (cs.length < 100) break;
+    startAfter = String(cs[cs.length - 1]?.lastMessageDate ?? "");
+    if (!startAfter) break;
+  }
+  return out;
+}
+
+async function groupsSuggest(tid: string) {
+  const [{ data: clients }, { data: linked }, convs] = await Promise.all([
+    supabase.from("clients").select("id, name, ghl_contact_id").eq("tenant_id", tid).eq("status", "active").limit(300),
+    supabase.from("client_groups").select("conversation_id, client_id").eq("tenant_id", tid),
+    recentConversations(tid),
+  ]);
+  const taken = new Set((linked ?? []).map((l: any) => l.conversation_id));
+  const own = new Set((clients ?? []).map((c: any) => c.ghl_contact_id));
+  const sugg: any[] = [];
+  for (const cv of convs) {
+    if (taken.has(cv.id) || own.has(cv.contactId)) continue; // already linked, or a client's own 1:1 chat
+    const gname = String(cv.fullName ?? cv.contactName ?? cv.companyName ?? "").trim();
+    if (!gname) continue;
+    let best: any = null, bestScore = 0;
+    for (const cl of clients ?? []) { const sc = nameScore(gname, cl.name ?? ""); if (sc > bestScore) { bestScore = sc; best = cl; } }
+    if (best && bestScore >= 0.5) sugg.push({ conversation_id: cv.id, group: gname, client_id: best.id, client: best.name, score: Math.round(bestScore * 100) });
+  }
+  sugg.sort((a, b) => b.score - a.score);
+  const list = sugg.slice(0, 30).map((x, i) => ({ n: i + 1, ...x }));
+  await supabase.from("tenant_config").update({ group_suggestions: list }).eq("tenant_id", tid);
+  const text = list.length
+    ? `Group chats that look like they belong to a client (my read — check before linking):\n${list.map((x) => `${x.n}. "${x.group}" → ${x.client}`).join("\n")}\n\nSay "link all", "link 1, 3 and 4", or "link the [group] group to [client]".`
+    : "I couldn't find any unlinked group chats that match a client's name. You can link one directly: \"link the [group] group to [client]\".";
+  return { ok: true, suggestions: list, text };
+}
+
+async function groupsLink(tid: string, p: any) {
+  const made: string[] = []; const missed: string[] = [];
+  const save = async (conversation_id: string, client_id: string, group: string, client: string) => {
+    const { error } = await supabase.from("client_groups").upsert({ tenant_id: tid, conversation_id, client_id, group_name: group, linked_by: "owner" }, { onConflict: "tenant_id,conversation_id" });
+    error ? missed.push(`${group} (${error.message})`) : made.push(`"${group}" → ${client}`);
+  };
+  if (p.conversation_id && p.client_id) {
+    await save(String(p.conversation_id), String(p.client_id), String(p.group ?? "group"), String(p.client ?? "client"));
+  } else if (p.all === true || String(p.all) === "true" || Array.isArray(p.numbers) || p.numbers) {
+    const { data: cfg } = await supabase.from("tenant_config").select("group_suggestions").eq("tenant_id", tid).maybeSingle();
+    const list: any[] = Array.isArray(cfg?.group_suggestions) ? cfg!.group_suggestions : [];
+    if (!list.length) return { ok: false, text: "No suggestions to link — ask me to \"suggest group links\" first." };
+    const nums = (p.all === true || String(p.all) === "true") ? list.map((x) => x.n) : (Array.isArray(p.numbers) ? p.numbers : String(p.numbers).split(/[\s,&and]+/)).map(Number).filter(Boolean);
+    for (const n of nums) { const x = list.find((y) => y.n === n); if (x) await save(x.conversation_id, x.client_id, x.group, x.client); else missed.push(`#${n}`); }
+  } else if (p.group && p.client) {
+    const [{ data: clients }, convs] = await Promise.all([supabase.from("clients").select("id, name").eq("tenant_id", tid).eq("status", "active"), recentConversations(tid)]);
+    const cl = (clients ?? []).map((c: any) => ({ c, sc: nameScore(String(p.client), c.name ?? "") })).sort((a, b) => b.sc - a.sc)[0];
+    const gv = convs.map((cv: any) => ({ cv, sc: nameScore(String(p.group), String(cv.fullName ?? cv.contactName ?? "")) })).sort((a, b) => b.sc - a.sc)[0];
+    if (!cl || cl.sc < 0.5) return { ok: false, text: `I can't find an active client called "${p.client}".` };
+    if (!gv || gv.sc < 0.5) return { ok: false, text: `I can't find a recent group chat called "${p.group}".` };
+    await save(gv.cv.id, cl.c.id, String(gv.cv.fullName ?? gv.cv.contactName ?? p.group), cl.c.name);
+  } else return { ok: false, text: "Which group and which client?" };
+  return { ok: made.length > 0, text: `${made.length ? `Linked:\n${made.join("\n")}` : ""}${missed.length ? `\nCouldn't link: ${missed.join(", ")}` : ""}\nClient health will use these chats from tonight.`.trim() };
+}
+
+async function groupsList(tid: string) {
+  const { data } = await supabase.from("client_groups").select("group_name, client_id, created_at").eq("tenant_id", tid);
+  const { data: clients } = await supabase.from("clients").select("id, name").eq("tenant_id", tid);
+  const nameOf = new Map((clients ?? []).map((c: any) => [c.id, c.name]));
+  const text = (data ?? []).length ? `Linked group chats:\n${(data ?? []).map((g: any) => `"${g.group_name}" → ${nameOf.get(g.client_id) ?? "client"}`).join("\n")}` : "No group chats linked yet. Say \"suggest group links\".";
+  return { ok: true, items: data ?? [], text };
 }
 
 // ===================== workflow side =====================
