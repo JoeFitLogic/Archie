@@ -1,4 +1,6 @@
-// archie-screens v5.8 — data and actions for the Archie AI Studio pages.
+// archie-screens v5.9 — data and actions for the Archie AI Studio pages.
+// v5.9: dump anything — "dump: …", "brain dump …" or a long rambling voice note becomes a clean note, tasks (for the right
+//       person), notes on the right contacts, and things to remember. Saved in Archie; the page shows recent dumps.
 // v5.8: call prep — "I've got Sarah at 10" → who they are, the last thing they asked, what's open (deal, tasks, drafts),
 //       their form/quiz answers, call notes, client health, and 3 questions to ask. Built from GHL + Archie's own data.
 // v5.7: second opinion (council) — big decisions run past a Chair and the lenses that fit (Money, Members, Operations,
@@ -191,6 +193,8 @@ Deno.serve(async (req) => {
       case "checkup": return j(await checkup(c.tid));
       case "council": return j(await councilRun(c.tid, p));
       case "call_prep": return j(await callPrep(c.tid, p));
+      case "dump": return j(await dumpAnything(c.tid, { handle: c.owner?.handle ?? "owner", gets_financials: true }, String(p.text ?? "")));
+      case "dumps": { const { data } = await supabase.from("dumps").select("id, handle, clean, summary, created_at").eq("tenant_id", c.tid).order("created_at", { ascending: false }).limit(20); return j({ ok: true, dumps: data ?? [] }); }
       case "member_health": return j(await memberHealthList(c.tid, String(p.status ?? "")));
       case "groups_suggest": return j(await groupsSuggest(c.tid));
       case "groups_link": return j(await groupsLink(c.tid, p));
@@ -1862,6 +1866,7 @@ const TALK_RULES = [
   "- archie_set_trial {stage} — 'our trial stage is X'.",
   "- archie_memory {action save|list|archive, kind definition|voice|worked|service|fact, key, value} — 'remember…', 'a client means…', 'that doesn't sound like me…', 'forget the … one'. archie_remember also works for plain facts.",
   "- archie_checkup — 'is everything working?'; give the report as it is.",
+  "- 'Show my last dump' → the LAST DUMP in the CONTEXT (give the clean note as it is). Dumps themselves are handled before you see them.",
   "- archie_call_prep {name, time} — 'I've got Sarah at 10', 'prep me for my 2pm', 'what do I need to know before the Martin call?'. Give the result as it is.",
   "- archie_council {question, answers, lens} — big decisions ('second opinion: should I raise prices to £75?', 'should I hire a coach?'). If it comes back with QUESTIONS, ask them and, when they answer, run archie_council again with the same question + answers. 'Ask Money more about that' → {lens:'Money', question: what they want to know}. Give the result as it is.",
   "RULES: Only send to customers what exists as a waiting draft — never freehand. New customer messages: draft in REPLY and ask 'Send it?'. Team members never get money figures and only see their own list. Unclear which item? Ask one short question with ACTIONS_JSON: []. Never invent tasks, names, numbers, dates or results.",
@@ -1940,6 +1945,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
         drafts = dr ?? [];
       }
     }
+    const { data: lastDump } = await supabase.from("dumps").select("clean, created_at").eq("tenant_id", tid).eq("handle", member.handle).order("created_at", { ascending: false }).limit(1).maybeSingle();
     let focusLine = "";
     if (member.gets_financials) {
       const { data: fc } = await supabase.from("weekly_focus").select("items").eq("tenant_id", tid).order("created_at", { ascending: false }).limit(1).maybeSingle();
@@ -1960,6 +1966,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
       `Their list today: ${(list ?? []).length ? (list ?? []).map((x: any) => `#${x.today_rank ?? "-"} ${x.title} [${x.tier}, ${x.effort_minutes ?? 30}m]`).join("; ") : "empty"}.`,
       (proposals ?? []).length ? `Proposals waiting (as numbered in the brief/inbox): ${(proposals ?? []).map((x: any) => `P${x.proposal_rank} ${x.title}`).join("; ")}. To add/wait/drop one, tell them to text e.g. "add P1" — or do it for them by adding the task with archie_add_task.` : "",
       focusLine,
+      lastDump ? `LAST DUMP (${String(lastDump.created_at).slice(0, 10)}): ${String(lastDump.clean).slice(0, 1200)}` : "",
       drafts.length ? `Drafts waiting to send: ${drafts.map((d: any) => `${d.rank}. ${d.name} (${d.channel}): "${String(d.body ?? "").slice(0, 80)}…"`).join("; ")}.` : "",
       (memories ?? []).length ? `Things to remember: ${(memories ?? []).map((m: any) => m.fact).join(" | ")}` : "",
       bizMemory,
@@ -1995,6 +2002,16 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     };
 
     // "do 1" / "do 2" / "do 3" → run exactly that focus item, no guessing
+    // Dump anything: "dump: …", "brain dump …", or a long voice note → note + tasks + contact notes + memory
+    const isVoice = text.startsWith("(voice note)");
+    const plainText = text.replace(/^\(voice note\)\s*/, "");
+    const dumpMatch = plainText.match(/^\s*(?:brain\s*dump|dump(?:\s+this)?|note this|capture this)[:,\-\s]+([\s\S]+)/i);
+    if (dumpMatch || (isVoice && plainText.split(/\s+/).length >= 90)) {
+      const d: any = await dumpAnything(tid, member, dumpMatch ? dumpMatch[1] : plainText);
+      const sentD = await reply(d.text);
+      return log(sentD.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${d.text.slice(0, 80)} | actions: dump`, sentD.ok ? null : `reply not sent (${sentD.status})`);
+    }
+
     const doN = text.trim().match(/^(?:do|start|go with|run)\s+(?:number\s+|no\.?\s*|#)?([1-3])\b/i);
     if (doN && member.gets_financials) {
       const { data: fc } = await supabase.from("weekly_focus").select("items").eq("tenant_id", tid).order("created_at", { ascending: false }).limit(1).maybeSingle();
@@ -3445,6 +3462,81 @@ async function callPrep(tid: string, p: any) {
   const res = await agentExecute(token, agentId, { locationId: loc, message: msg.slice(0, 9500) }, `prep-${tid}-${Date.now()}`);
   const out = tidy(clean(String(res.json?.finalText ?? ""))).trim();
   return out ? { ok: true, text: out } : { ok: false, text: "Couldn't put the prep together just now — try again in a minute." };
+}
+
+// ===================== v5.9: dump anything =====================
+async function dumpAnything(tid: string, member: any, raw: string) {
+  const text = String(raw ?? "").trim().slice(0, 8000);
+  if (text.length < 10) return { ok: false, text: "What do you want to dump?" };
+  const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).single();
+  const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
+  const tz = cfg?.timezone || "Europe/London";
+  const today = localDate(Date.now(), tz);
+  const { data: team } = await supabase.from("team_members").select("handle, name").eq("tenant_id", tid);
+  const agentId = await agentIdFor(tid, "ops", token, loc) || await agentIdFor(tid, "assistant", token, loc);
+  if (!agentId) return { ok: false, text: "I can't find the Archie Ops agent to sort that." };
+  const msg = [
+    `Turn this ${member.handle}'s brain dump into something useful. Today is ${today} (${new Date(`${today}T12:00:00Z`).toLocaleDateString("en-GB", { weekday: "long", timeZone: "UTC" })}). Team: ${(team ?? []).map((m: any) => `${m.handle} (${m.name ?? ""})`).join(", ")}.`,
+    "Only use what they actually said. Don't invent tasks, dates, names or numbers. If a date is vague ('next week'), pick the obvious date and keep the wording in the title only if needed.",
+    "Return ONLY this JSON, nothing else:",
+    '{"note":"the dump rewritten as a clean, short note — plain sentences, grouped by topic, no markdown symbols","summary":"one line","tasks":[{"title":"just the job","tier":"must|high|bonus","effort_minutes":30,"due_date":"YYYY-MM-DD or empty","owner":"a team handle or empty for the person dumping"}],"contact_notes":[{"name":"the person mentioned","note":"what was said about them"}],"remember":[{"kind":"fact|definition|worked|service|voice","key":"short-key","value":"the detail"}]}',
+    "Tasks only for clear actions. contact_notes only for real people/clients/leads they talked about. remember only for lasting facts about the business (not one-off tasks). Empty arrays are fine.",
+    "",
+    `THE DUMP:\n${text}`,
+  ].join("\n");
+  const res = await agentExecute(token, agentId, { locationId: loc, message: msg.slice(0, 9500) }, `dump-${tid}-${Date.now()}`);
+  const outText = tidy(clean(String(res.json?.finalText ?? "")));
+  let parsed: any = null;
+  try { const m = outText.match(/\{[\s\S]*\}/); parsed = m ? JSON.parse(m[0]) : null; } catch { parsed = null; }
+  if (!parsed) {
+    await supabase.from("dumps").insert({ tenant_id: tid, handle: member.handle, raw: text, clean: text, summary: "saved as it was" });
+    return { ok: true, text: "Saved your note as it was — I couldn't sort it into tasks this time. Say \"show my last dump\" to see it, or tell me the tasks." };
+  }
+  const handles = new Set((team ?? []).map((m: any) => String(m.handle).toLowerCase()));
+  // Tasks
+  const added: string[] = [];
+  for (const t of (Array.isArray(parsed.tasks) ? parsed.tasks : []).slice(0, 12)) {
+    const title = String(t?.title ?? "").trim().slice(0, 200);
+    if (!title) continue;
+    let owner = String(t?.owner ?? "").toLowerCase();
+    if (!handles.has(owner) || (!member.gets_financials && owner !== member.handle)) owner = member.handle;
+    const due = /^\d{4}-\d{2}-\d{2}$/.test(String(t?.due_date ?? "")) ? String(t.due_date) : null;
+    const effort = Number(t?.effort_minutes) > 0 ? Math.max(15, Math.round(Number(t.effort_minutes) / 15) * 15) : 30;
+    const { error } = await supabase.from("tasks").insert({
+      tenant_id: tid, title, tier: ["must", "high", "bonus"].includes(t?.tier) ? t.tier : "high", kind: "shallow", effort_minutes: effort,
+      status: "open", owner, source: "dump", source_ref: `dump:${crypto.randomUUID()}`, due_date: due,
+      ...(due === today ? { today: true, today_set_on: today } : {}), accepted_by: member.handle, accepted_at: new Date().toISOString(),
+    });
+    if (!error) added.push(`${title}${owner !== member.handle ? ` (${owner})` : ""}${due ? ` — ${due === today ? "today" : due}` : ""}`);
+  }
+  // Notes on contacts
+  const noted: string[] = [];
+  for (const cn of (Array.isArray(parsed.contact_notes) ? parsed.contact_notes : []).slice(0, 6)) {
+    const nm = String(cn?.name ?? "").trim(), note = String(cn?.note ?? "").trim();
+    if (!nm || !note) continue;
+    const cs = await ghl(token, `/contacts/?locationId=${loc}&query=${encodeURIComponent(nm)}&limit=2`, "GET", undefined, "2021-07-28");
+    const list: any[] = cs.json?.contacts ?? [];
+    if (list.length !== 1) continue; // only when we're sure who it is
+    const w = await ghl(token, `/contacts/${list[0].id}/notes`, "POST", { body: `[note from ${member.handle}] ${today} — ${note.slice(0, 900)}` }, "2021-07-28");
+    if (w.ok) noted.push([list[0].firstName, list[0].lastName].filter(Boolean).join(" ") || nm);
+  }
+  // Things to remember
+  const remembered: string[] = [];
+  for (const r of (Array.isArray(parsed.remember) ? parsed.remember : []).slice(0, 5)) {
+    const x: any = await memoryAction(tid, member, { action: "save", kind: r?.kind, key: r?.key, value: r?.value });
+    if (x.ok) remembered.push(String(r?.value ?? "").slice(0, 60));
+  }
+  await supabase.from("dumps").insert({ tenant_id: tid, handle: member.handle, raw: text, clean: String(parsed.note ?? "").slice(0, 6000), summary: String(parsed.summary ?? "").slice(0, 300) });
+  return {
+    ok: true,
+    text: [
+      `Got it — ${String(parsed.summary ?? "note saved").replace(/\.$/, "")}.`,
+      added.length ? `Added ${added.length} task${added.length === 1 ? "" : "s"}:\n${added.map((a) => `- ${a}`).join("\n")}` : "No tasks in that.",
+      noted.length ? `Notes added to: ${noted.join(", ")}.` : "",
+      remembered.length ? `Remembered: ${remembered.join("; ")}.` : "",
+      `Say "show my last dump" for the clean note.`,
+    ].filter(Boolean).join("\n"),
+  };
 }
 
 // ===================== workflow side =====================
