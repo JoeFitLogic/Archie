@@ -1,4 +1,23 @@
-// archie-screens v6.6.2 — data and actions for the Archie AI Studio pages.
+// archie-screens v6.9 — data and actions for the Archie AI Studio pages.
+// v6.9: onboarding coach — for the first 30 days Archie sends the owner one short tip a day (14 tips, then weekly), skipping
+//       anything they've already used; the control panel shows days since they last talked to Archie and alerts you (and
+//       Sara) when a client in their first 30 days goes quiet for 2+ days.
+// v6.8: Instagram insights — Connect Instagram (your Meta app, via meta-connect), nightly sync of every post's reach,
+//       views, saves, shares, likes, comments, interactions and reel watch time + followers; "See how it did" (vs your
+//       normal, winners, plain-English summary); your winners get "why it worked" + a follow-up idea; by voice too.
+// v6.7.2: captions you can see and change — "write a caption" shows it, "make the caption shorter / add a question"
+//         rewrites it, "caption: …" uses your own words; "post it" uses the latest caption; the page can edit it too.
+// v6.7.1: "post it" on WhatsApp → your latest reel goes into Social Planner as a draft (Instagram/Facebook/TikTok/YouTube
+//         accounts), with a caption; the reel-ready message says so.
+// v6.7: your control panel — agency_overview (every client: checkup status, last brief, cost this month, reds, failed
+//       runs) for the agency account only; every 3 hours Archie checks all clients and WhatsApps you when one goes red.
+// v6.6.6: fresh ideas every week — each account's top 3 recent posts (vs their own normal) are worked up every check,
+//         as well as any big standouts; two worked on at a time so a batch is ready faster.
+// v6.6.5: standout posts from the whole 60 days count (was 30), so strong older posts aren't skipped.
+// v6.6.4: Find ideas fixes — weekly limit raised to 12 and a "Find new ideas" tap always gets its own batch; the page
+//         stops spinning when nothing's being worked on; a plain note when a check finds nothing new.
+// v6.6.3: ideas_list also says what Archie's doing right now (accounts being checked, posts being worked on, last checked)
+//         so the page can show live progress after "Find new ideas".
 // v6.6.2: see the original — each outlier's video (and thumbnail) is kept privately for reference so it plays on the
 //         Content page (Instagram's own links expire); private links only, cleared after 60 days.
 // v6.6.1: Find ideas fixes — tries the current Gemini models in turn, records why a video couldn't be watched, and asks
@@ -175,6 +194,8 @@ Deno.serve(async (req) => {
         return j(await editStart(tenant_id, String(p.handle ?? own?.handle ?? "owner"), p));
       }
       if (action === "ideas_run") return j(await ideasFindNow(tenant_id));
+      if (action === "ig_sync_run") return j(await igSync(tenant_id));
+      if (action === "coach_run") return j(await coachRun(tenant_id, p));
       if (action === "recurring_run") { const r = await recurringRun(tenant_id); return j({ ok: true, ...r }); }
       if (action === "health_run") { startInBackground(memberHealthRun(tenant_id)); return j({ ok: true, started: true }); }
       if (action === "report_nightly_run") { startInBackground(weeklyReport(tenant_id, { week: "this", refresh: "yes" })); return j({ ok: true, started: true }); }
@@ -240,6 +261,13 @@ Deno.serve(async (req) => {
       case "goals": return j(await getGoals(c.tid));
       case "checkup": return j(await checkup(c.tid));
       case "settings_get": return j(await settingsGet(c.tid));
+      case "ig_connect_url": return j(await igConnectUrl(c.tid));
+      case "ig_status": { const { data } = await supabase.from("ig_connections").select("ig_username, page_name, followers, connected_at, last_sync_at, last_error, other_accounts").eq("tenant_id", c.tid).maybeSingle(); return j({ ok: true, connected: !!data, ...(data ?? {}) }); }
+      case "ig_disconnect": { await supabase.from("ig_connections").delete().eq("tenant_id", c.tid); return j({ ok: true, text: "Instagram disconnected." }); }
+      case "ig_sync": return j(await igSync(c.tid));
+      case "coach_status": return j(await coachStatus(c.tid));
+      case "ig_results": return j(await igResults(c.tid, Number(p.days ?? 60)));
+      case "agency_overview": return j(await agencyOverview(c.tid));
       case "ideas_accounts": { const { data } = await supabase.from("watched_accounts").select("handle, platform, followers, median_views, last_scraped_at, active").eq("tenant_id", c.tid).eq("active", true).order("handle"); return j({ ok: true, accounts: data ?? [] }); }
       case "ideas_account_add": return j(await ideasAccountAdd(c.tid, String(p.handle ?? "")));
       case "ideas_account_remove": { await supabase.from("watched_accounts").update({ active: false }).eq("tenant_id", c.tid).eq("handle", String(p.handle ?? "").replace(/^@/, "").toLowerCase()); return j({ ok: true }); }
@@ -249,8 +277,10 @@ Deno.serve(async (req) => {
       case "edit_upload_url": return j(await editUploadUrl(c.tid, String(p.filename ?? "clip.mp4")));
       case "edit_start": return j(await editStart(c.tid, c.owner?.handle ?? "owner", p));
       case "edit_status": return j(await editStatus(c.tid, String(p.id ?? "")));
-      case "edit_list": { const { data } = await supabase.from("edit_jobs").select("id, title, status, output_url, ghl_media_url, error, created_at").eq("tenant_id", c.tid).order("created_at", { ascending: false }).limit(20); return j({ ok: true, jobs: data ?? [] }); }
+      case "edit_list": { const { data } = await supabase.from("edit_jobs").select("id, title, status, output_url, ghl_media_url, error, created_at, caption, planner_post_id").eq("tenant_id", c.tid).order("created_at", { ascending: false }).limit(20); return j({ ok: true, jobs: data ?? [] }); }
       case "edit_redo": return j(await editRedo(c.tid, String(p.id ?? ""), String(p.change ?? "")));
+      case "reel_caption": return j(await reelCaption(c.tid, p));
+      case "reel_post": return j(await reelToPlanner(c.tid, p.id ? String(p.id) : undefined));
       case "usage": return j(await usage(c.tid, String(p.month ?? "")));
       case "pin_set": return j(await pinSet(c.tid, p));
       case "logout": { if (p.session) await supabase.from("page_sessions").delete().eq("tenant_id", c.tid).eq("token", String(p.session)); return j({ ok: true }); }
@@ -1799,6 +1829,12 @@ async function dispatch(_p: any) {
     const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", t.id).maybeSingle();
     try { await editFinishPending(t.id); } catch { /* never block the scheduler */ }
     try { startInBackground(ideasTick(t.id)); } catch { /* never block the scheduler */ }
+    try {
+      if (cfg?.is_agency) {
+        const slot = `${new Date().toISOString().slice(0, 10)}-${Math.floor(new Date().getUTCHours() / 3)}`;
+        if (await claim(t.id, "agency_sweep", slot)) startInBackground(agencySweep(t.id));
+      }
+    } catch { /* never block the scheduler */ }
     if (!cfg || cfg.schedules_on !== true) continue; // opt-in per client, so nothing double-runs alongside GHL workflows
     const tz = cfg.timezone || "Europe/London";
     const now = localNow(tz);
@@ -1810,6 +1846,8 @@ async function dispatch(_p: any) {
       { job: "evening", due: days(cfg.sched_evening_days, "0,1,2,3,4").includes(now.weekday) && dueNow(now.minutes, hhmm(cfg.sched_evening, "20:00")), key: now.date, action: "evening_run" },
       { job: "plan", due: now.weekday === Number(cfg.sched_plan_day ?? 6) && dueNow(now.minutes, hhmm(cfg.sched_plan, "08:00")), key: now.date, action: "plan_run" },
       { job: "ideas", due: now.weekday === Number(cfg.sched_ideas_day ?? 1) && dueNow(now.minutes, hhmm(cfg.sched_ideas, "05:00")), key: now.date, action: "ideas_run" },
+      { job: "ig_sync", due: dueNow(now.minutes, hhmm(cfg.sched_ig, "04:30")), key: now.date, action: "ig_sync_run" },
+      { job: "coach", due: !!cfg.coach_on && dueNow(now.minutes, hhmm(cfg.sched_coach, "12:30")), key: now.date, action: "coach_run" },
       { job: "recurring", due: dueNow(now.minutes, hhmm(cfg.sched_recurring, "04:00")), key: now.date, action: "recurring_run" },
       { job: "health", due: dueNow(now.minutes, hhmm(cfg.sched_health, "03:30")), key: now.date, action: "health_run" },
       { job: "report_nightly", due: dueNow(now.minutes, hhmm(cfg.sched_report_nightly, "23:30")), key: now.date, action: "report_nightly_run" },
@@ -1954,8 +1992,9 @@ const TALK_RULES = [
   "- archie_memory {action save|list|archive, kind definition|voice|worked|service|fact, key, value} — 'remember…', 'a client means…', 'that doesn't sound like me…', 'forget the … one'. archie_remember also works for plain facts.",
   "- archie_checkup — 'is everything working?'; give the report as it is.",
   "- 'Show my last dump' → the LAST DUMP in the CONTEXT (give the clean note as it is). Dumps themselves are handled before you see them.",
+  "- archie_instagram {action: results|sync, days} — their own Instagram: 'how did my posts do?', 'what's my best post this month?', 'how are my reels doing?' → results (days 30 by default). 'Refresh my Instagram' → sync. Give the answer as it is.",
   "- archie_ideas {action: list|find|film|skip, numbers, status} — content ideas: 'what's working?' / 'any ideas this week?' → list (numbered). 'Find me ideas now' → find. 'Film 1 and 3' → {action:'film', numbers:[1,3]}. 'Skip 2' → skip. 'What do I need to film?' → {action:'list', status:'to_film'}.",
-  "- archie_reel {action: redo|left|status, change} — reels from Archie Edit: 'make that reel shorter' / 'different hook' / 'drop the list' → {action:'redo', change: what they said}. 'How many edits have I got left?' → {action:'left'}. 'Is my reel ready?' → {action:'status'}. To edit a NEW video they just send it on WhatsApp with 'edit'.",
+  "- archie_reel {action: redo|left|status|post, change} — 'post it' / 'schedule the reel' → {action:'post'} (adds the latest reel to Social Planner as a draft). — reels from Archie Edit: 'make that reel shorter' / 'different hook' / 'drop the list' → {action:'redo', change: what they said}. 'How many edits have I got left?' → {action:'left'}. 'Is my reel ready?' → {action:'status'}. To edit a NEW video they just send it on WhatsApp with 'edit'.",
   "- archie_data {question} — any question about their numbers or lists that isn't covered above: 'top 20 clients', 'who paid the most this year', 'how did last week compare to the month before', 'which clients joined in January', 'how many leads came from Instagram'. Pass their question as it is; give the answer as it is.",
   "- archie_call_prep {name, time} — 'I've got Sarah at 10', 'prep me for my 2pm', 'what do I need to know before the Martin call?'. Give the result as it is.",
   "- archie_council {question, answers, lens} — big decisions ('second opinion: should I raise prices to £75?', 'should I hire a coach?'). If it comes back with QUESTIONS, ask them and, when they answer, run archie_council again with the same question + answers. 'Ask Money more about that' → {lens:'Money', question: what they want to know}. Give the result as it is.",
@@ -2102,6 +2141,25 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
       return log(sentD.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${d.text.slice(0, 80)} | actions: dump`, sentD.ok ? null : `reply not sent (${sentD.status})`);
     }
 
+    // Captions for the latest reel: "caption: my own words" · "write a caption" · "make the caption shorter"
+    if (member.gets_financials) {
+      const own = plainText.match(/^\s*caption\s*[:\-]\s*([\s\S]{5,})$/i);
+      const write = /^\s*(?:write|give me|draft|do)\s+(?:me\s+)?(?:a\s+)?caption\b/i.test(plainText);
+      const change = plainText.match(/^\s*(?:make|change|rewrite|redo)\s+the\s+caption\s*(.*)$/i);
+      if (own || write || change) {
+        const r3: any = await reelCaption(tid, own ? { own: own[1] } : { change: change ? change[1] || "a fresh version" : "" });
+        const sentC = await reply(r3.text);
+        return log(sentC.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${r3.text.slice(0, 80)} | actions: caption`, sentC.ok ? null : `reply not sent (${sentC.status})`);
+      }
+    }
+
+    // "Post it" → the latest finished reel becomes a Social Planner draft
+    if (/^\s*(?:please\s+)?(?:post|schedule|queue)\s*(?:it|that|this|the reel|my reel)?\s*(?:please)?[.!]?\s*$/i.test(plainText) && member.gets_financials) {
+      const r2: any = await reelToPlanner(tid);
+      const sentP = await reply(r2.text);
+      return log(sentP.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${r2.text.slice(0, 80)} | actions: post reel`, sentP.ok ? null : `reply not sent (${sentP.status})`);
+    }
+
     const doN = text.trim().match(/^(?:do|start|go with|run)\s+(?:number\s+|no\.?\s*|#)?([1-3])\b/i);
     if (doN && member.gets_financials) {
       const { data: fc } = await supabase.from("weekly_focus").select("items").eq("tenant_id", tid).order("created_at", { ascending: false }).limit(1).maybeSingle();
@@ -2148,7 +2206,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep", "archie_data", "archie_reel", "archie_ideas"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep", "archie_data", "archie_reel", "archie_ideas", "archie_instagram"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
       const OWNER_ONLY = ["archie_data", "archie_call_prep", "archie_council", "archie_set_trial", "archie_groups", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
@@ -2161,7 +2219,9 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
         continue;
       }
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_ideas"
+      const r = act.tool === "archie_instagram"
+        ? await (async () => { const x: any = String(args.action ?? "results") === "sync" ? await igSync(tid) : await igResults(tid, Number(args.days ?? 30)); return { ok: !!x.ok, text: x.text }; })()
+        : act.tool === "archie_ideas"
         ? await (async () => {
             const a2 = String(args.action ?? "list");
             if (a2 === "find") { const x: any = await ideasFindNow(tid); return { ok: !!x.ok, text: x.text }; }
@@ -2181,6 +2241,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
             const { data: last } = await supabase.from("edit_jobs").select("id, title, status").eq("tenant_id", tid).order("created_at", { ascending: false }).limit(1).maybeSingle();
             if (!last) return { ok: false, text: "No reels yet — send me a video with \"edit\"." };
             if (a2 === "status") return { ok: true, text: `Latest reel${last.title ? ` (${last.title})` : ""}: ${last.status}.` };
+            if (a2 === "post") { const x: any = await reelToPlanner(tid); return { ok: !!x.ok, text: x.text }; }
             const x: any = await editRedo(tid, last.id, String(args.change ?? text));
             return { ok: !!x.ok, text: x.ok ? x.text : String(x.error) };
           })()
@@ -2227,7 +2288,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     }
 
     // Some results go straight back as they are (no rewrite): the council and the checkup
-    if (plan.actions.length === 1 && ["archie_council", "archie_checkup", "archie_call_prep", "archie_data"].includes(plan.actions[0].tool) && results[0]) {
+    if (plan.actions.length === 1 && ["archie_council", "archie_checkup", "archie_call_prep", "archie_data", "archie_instagram"].includes(plan.actions[0].tool) && results[0]) {
       const direct = results[0].replace(/^archie_\w+ \{[^\n]*?\} → (OK|FAILED): /, "").trim();
       const sentD = await reply(direct);
       return log(sentD.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${direct.slice(0, 80)} | actions: ${ran.join(", ")}`, sentD.ok ? null : `reply not sent (${sentD.status})`);
@@ -3771,7 +3832,8 @@ const SETTINGS_FIELDS: Record<string, "text" | "int" | "bool" | "num" | "time" |
   sched_recurring: "time", sched_health: "time",
   won_creates_invoice: "bool", stale_threshold_days: "int", pipeline_name: "text", trial_stage_name: "text",
   brand_primary: "text", brand_accent: "text", brand_text: "text", brand_logo_url: "text", caption_style: "text",
-  outro_text: "text", outro_sub: "text", edit_allowance: "int", instagram_handle: "text", sched_ideas: "time", sched_ideas_day: "int",
+  outro_text: "text", outro_sub: "text", edit_allowance: "int", instagram_handle: "text", sched_ideas: "time", sched_ideas_day: "int", sched_ig: "time",
+  coach_on: "bool", onboarding_started_at: "text", sched_coach: "time",
 };
 const SECRET_FIELDS = ["stripe_key", "fathom_api_key", "ghl_token"];
 
@@ -3816,6 +3878,11 @@ async function settingsSave(tid: string, p: any) {
   if (String(src.fathom_api_key ?? "").trim().length > 10) patch.fathom_api_key = String(src.fathom_api_key).trim();
   if (src.business_name) await supabase.from("tenants").update({ business_name: String(src.business_name).slice(0, 120) }).eq("id", tid);
   if (src.trial_stage_name !== undefined && src.trial_stage_name) { const r: any = await setTrialStage(tid, { stage: src.trial_stage_name }); if (!r.ok) bad.push(`trial stage: ${r.text}`); delete patch.trial_stage_name; }
+  // Switching schedules on for the first time starts the onboarding coach (day 1 = today)
+  if (patch.schedules_on === true) {
+    const { data: ob } = await supabase.from("tenant_config").select("onboarding_started_at, is_agency").eq("tenant_id", tid).maybeSingle();
+    if (!ob?.onboarding_started_at && !ob?.is_agency) { patch.onboarding_started_at = new Date().toISOString(); if (!("coach_on" in patch)) patch.coach_on = true; }
+  }
   if (Object.keys(patch).length) {
     const { error } = await supabase.from("tenant_config").update(patch).eq("tenant_id", tid);
     if (error) return { ok: false, error: error.message };
@@ -4105,7 +4172,7 @@ async function editStatus(tid: string, id: string) {
   const { data: job } = await supabase.from("edit_jobs").select("*").eq("tenant_id", tid).eq("id", id).maybeSingle();
   if (!job) return { ok: false, error: "edit not found" };
   if (job.status === "rendering" && job.render_id) await editCheck(tid, job);
-  const { data: now } = await supabase.from("edit_jobs").select("id, title, status, output_url, ghl_media_url, error, seconds, progress").eq("id", id).single();
+  const { data: now } = await supabase.from("edit_jobs").select("id, title, status, output_url, ghl_media_url, error, seconds, progress, caption, planner_post_id").eq("id", id).single();
   return { ok: true, job: now };
 }
 
@@ -4129,7 +4196,7 @@ async function editCheck(tid: string, job: any) {
     const { data: m } = await supabase.from("team_members").select("ghl_contact_id").eq("tenant_id", tid).eq("handle", job.handle).maybeSingle();
     if (m?.ghl_contact_id) {
       const { data: c2 } = await supabase.from("tenant_config").select("ghl_token, brief_channel").eq("tenant_id", tid).single();
-      await ghl(c2?.ghl_token || FALLBACK_TOKEN, "/conversations/messages", "POST", { type: String(c2?.brief_channel ?? "").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS", contactId: m.ghl_contact_id, message: `📹 Your reel's ready${job.title ? `: ${job.title}` : ""} (${job.seconds ?? "?"}s)\n${mediaUrl || url}\n\nReply with any changes ("shorter", "different hook", "no list") or post it from the Skills page.` }, "2021-04-15");
+      await ghl(c2?.ghl_token || FALLBACK_TOKEN, "/conversations/messages", "POST", { type: String(c2?.brief_channel ?? "").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS", contactId: m.ghl_contact_id, message: `📹 Your reel's ready${job.title ? `: ${job.title}` : ""} (${job.seconds ?? "?"}s)\n${mediaUrl || url}\n\nReply "post it" to add it to Social Planner as a draft (I'll write the caption), "write a caption" to see it first, or tell me what to change ("shorter", "different hook", "no list").` }, "2021-04-15");
     }
   } catch (e) { await supabase.from("edit_jobs").update({ error: `progress check: ${String(e).slice(0, 200)}` }).eq("id", job.id); }
 }
@@ -4170,6 +4237,7 @@ async function ideasFindNow(tid: string) {
       started++;
     }
   }
+  if (started) await supabase.from("tenant_config").update({ ideas_manual_at: new Date().toISOString(), ideas_note: null }).eq("tenant_id", tid);
   return { ok: started > 0, text: started ? `Looking at ${started} account${started === 1 ? "" : "s"} now — ideas will be ready in about 10–20 minutes.` : "Couldn't start — check the Apify key." };
 }
 
@@ -4177,6 +4245,7 @@ async function ideasFindNow(tid: string) {
 async function ideasTick(tid: string) {
   if (!apifyToken()) return;
   // 1. Finished scrapes → posts with scores
+  let newOutliers = 0;
   const { data: runs } = await supabase.from("apify_runs").select("*").eq("tenant_id", tid).eq("status", "running").limit(12);
   for (const run of runs ?? []) {
     const st = await fetch(`${APIFY}/actor-runs/${run.run_id}?token=${apifyToken()}`).then((r) => r.json()).catch(() => null);
@@ -4187,7 +4256,7 @@ async function ideasTick(tid: string) {
     const reels = (Array.isArray(items) ? items : []).filter((x) => x?.videoUrl && Number(x?.videoPlayCount ?? x?.videoViewCount ?? 0) > 0);
     const views = reels.map((x) => Number(x.videoPlayCount ?? x.videoViewCount ?? 0)).sort((a, b) => a - b);
     const median = views.length ? views[Math.floor(views.length / 2)] : 0;
-    const cutoff = Date.now() - 30 * 86400000;
+    const cutoff = Date.now() - 60 * 86400000;
     const rows = reels.map((x) => {
       const v = Number(x.videoPlayCount ?? x.videoViewCount ?? 0);
       const score = median ? Math.round((v / median) * 10) / 10 : 0;
@@ -4206,19 +4275,50 @@ async function ideasTick(tid: string) {
       const done = new Map((known ?? []).map((k: any) => [k.shortcode, k.status]));
       const fresh = rows.map((r) => (done.has(r.shortcode) && done.get(r.shortcode) !== "seen" ? { ...r, status: done.get(r.shortcode) } : r));
       await supabase.from("content_posts").upsert(fresh, { onConflict: "tenant_id,shortcode" });
+      newOutliers += fresh.filter((r) => r.status === "queued" && !done.has(r.shortcode)).length;
+      // Fresh ideas every week: this account's top 3 recent posts (last 14 days, above their normal) not yet worked on
+      if (!run.own) {
+        const recentCut = Date.now() - 14 * 86400000;
+        const picks = fresh
+          .filter((r) => r.status === "seen" && Date.parse(String(r.posted_at ?? "")) >= recentCut && r.score >= 1.2)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, Math.max(0, 3 - fresh.filter((r) => r.status === "queued" && Date.parse(String(r.posted_at ?? "")) >= recentCut).length));
+        if (picks.length) {
+          await supabase.from("content_posts").update({ status: "queued", pick: "top" }).eq("tenant_id", tid).in("shortcode", picks.map((p) => p.shortcode));
+          newOutliers += picks.length;
+        }
+      }
     }
     await supabase.from("watched_accounts").update({ median_views: median, last_scraped_at: new Date().toISOString(), followers: Number(items?.[0]?.ownerFollowersCount ?? 0) || null }).eq("tenant_id", tid).eq("handle", run.handle);
     await supabase.from("apify_runs").update({ status: "done" }).eq("id", run.id);
   }
-  // 2. One outlier at a time: see why it worked → make it yours (best score first, max 6 a week)
+  if ((runs ?? []).length) {
+    const { count: stillRunning } = await supabase.from("apify_runs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("status", "running");
+    if (!stillRunning) {
+      const { count: q } = await supabase.from("content_posts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("status", "queued");
+      const note = newOutliers ? null : q ? null : `Checked your accounts ${new Date().toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })} — no new standout posts since last time. Try adding a few more accounts to learn from.`;
+      await supabase.from("tenant_config").update({ ideas_note: note }).eq("tenant_id", tid);
+    }
+  }
+
+  // 2. One outlier at a time: see why it worked → make it yours (best score first; 12 a week, and a "Find new ideas" tap always gets its own batch)
   const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString();
   const { count: doneThisWeek } = await supabase.from("content_posts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).in("status", ["ready", "to_film", "filmed", "skipped"]).gte("updated_at", weekAgo);
-  if ((doneThisWeek ?? 0) < 6) {
-    const { data: next } = await supabase.from("content_posts").select("*").eq("tenant_id", tid).eq("status", "queued").order("score", { ascending: false }).limit(1).maybeSingle();
-    if (next) {
-      await supabase.from("content_posts").update({ status: "analysing" }).eq("id", next.id).eq("status", "queued");
-      await analyseOutlier(tid, next);
+  const { data: ic } = await supabase.from("tenant_config").select("ideas_manual_at").eq("tenant_id", tid).maybeSingle();
+  const manualRecent = ic?.ideas_manual_at && Date.now() - Date.parse(ic.ideas_manual_at) < 6 * 3600000;
+  let manualDone = 0;
+  if (manualRecent) {
+    const { count } = await supabase.from("content_posts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).in("status", ["ready", "failed"]).gte("updated_at", ic.ideas_manual_at);
+    manualDone = count ?? 0;
+  }
+  if ((doneThisWeek ?? 0) < 24 || (manualRecent && manualDone < 12)) {
+    const { data: nexts } = await supabase.from("content_posts").select("*").eq("tenant_id", tid).eq("status", "queued").order("score", { ascending: false }).limit(2);
+    const claimed: any[] = [];
+    for (const n of nexts ?? []) {
+      const { data: got } = await supabase.from("content_posts").update({ status: "analysing" }).eq("id", n.id).eq("status", "queued").select("id");
+      if (got?.length) claimed.push(n);
     }
+    await Promise.all(claimed.map((n) => analyseOutlier(tid, n)));
   }
   // Tidy up: kept copies older than 60 days are removed (the post and idea stay)
   if (Math.random() < 0.02) {
@@ -4319,7 +4419,9 @@ async function analyseOutlier(tid: string, post: any) {
     if (!agentId) debug.push("no Archie Content agent");
     else {
       const msg = [
-        "Turn this post that's working for someone else into an ORIGINAL idea for this business — the same reason it works, but their own topic, words and story. Never copy lines or claim their results.",
+        post.source === "own"
+          ? "This is the OWNER'S OWN post and it did better than their normal. Work out a follow-up idea that builds on why it worked — a part 2, the next question people will have, or the same format on a new topic. In their voice."
+          : "Turn this post that's working for someone else into an ORIGINAL idea for this business — the same reason it works, but their own topic, words and story. Never copy lines or claim their results.",
         `It got ${post.views} views — ${post.score}x that account's normal (@${post.handle}).`,
         `Why it worked: ${JSON.stringify({ hook: breakdown.hook, format: breakdown.format, steps: breakdown.steps, why_it_worked: breakdown.why_it_worked, payoff: breakdown.payoff, said: breakdown.spoken_summary }).slice(0, 2500)}`,
         "",
@@ -4354,7 +4456,7 @@ async function analyseOutlier(tid: string, post: any) {
 
 async function ideasList(tid: string, status: string) {
   const st = ["ready", "to_film", "filmed", "skipped", "queued"].includes(status) ? status : "ready";
-  const { data } = await supabase.from("content_posts").select("id, handle, source, url, thumb_url, ref_path, thumb_path, views, likes, comments, score, posted_at, breakdown, idea, status").eq("tenant_id", tid).eq("status", st).order("score", { ascending: false }).limit(20);
+  const { data } = await supabase.from("content_posts").select("id, handle, source, pick, url, thumb_url, ref_path, thumb_path, views, likes, comments, score, posted_at, breakdown, idea, status").eq("tenant_id", tid).eq("status", st).order("score", { ascending: false }).limit(20);
   // Private, short-lived links to the kept copies so the originals play on the page
   const items = await Promise.all((data ?? []).map(async (x: any) => {
     let video = "", thumb = x.thumb_url ?? "";
@@ -4363,16 +4465,303 @@ async function ideasList(tid: string, status: string) {
     return { ...x, video_play_url: video, thumb_play_url: thumb };
   }));
   const { count: waiting } = await supabase.from("content_posts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).in("status", ["queued", "analysing"]);
+  const { count: checking } = await supabase.from("apify_runs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("status", "running");
+  const { data: lastRun } = await supabase.from("watched_accounts").select("last_scraped_at").eq("tenant_id", tid).not("last_scraped_at", "is", null).order("last_scraped_at", { ascending: false }).limit(1).maybeSingle();
   const text = items.length
     ? `${st === "to_film" ? "Your filming list" : "Ideas that are working"}:\n${items.slice(0, 8).map((x: any, i: number) => `${i + 1}. ${x.idea?.title ?? "Idea"} — @${x.handle}, ${x.score}x their normal\n   Hook: "${x.idea?.hook ?? ""}"`).join("\n")}`
     : waiting ? `Archie's still working through ${waiting} post${waiting === 1 ? "" : "s"} — ideas soon.` : st === "to_film" ? "Nothing on your filming list yet." : "No new ideas yet — say \"find me ideas\" to look now.";
-  return { ok: true, items, waiting: waiting ?? 0, text };
+  // Only "busy" if something is actually being worked on right now (not posts parked by the weekly limit)
+  const { count: analysing } = await supabase.from("content_posts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("status", "analysing");
+  const { data: tc } = await supabase.from("tenant_config").select("ideas_manual_at, ideas_note").eq("tenant_id", tid).maybeSingle();
+  const manualRecent = tc?.ideas_manual_at && Date.now() - Date.parse(tc.ideas_manual_at) < 6 * 3600000;
+  const busy = !!(checking || analysing || (waiting && manualRecent));
+  const progress = checking ? `Checking ${checking} account${checking === 1 ? "" : "s"} for posts that are working…` : busy ? `Working out why ${waiting} post${waiting === 1 ? "" : "s"} did so well — one every few minutes.` : "";
+  return { ok: true, items, waiting: waiting ?? 0, checking: checking ?? 0, busy, progress, note: tc?.ideas_note ?? null, last_checked: lastRun?.last_scraped_at ?? null, text };
 }
 
 async function ideaUpdate(tid: string, id: string, status: string) {
   if (!["to_film", "filmed", "skipped", "ready"].includes(status)) return { ok: false, error: "status must be to_film, filmed, skipped or ready" };
   const { error } = await supabase.from("content_posts").update({ status, updated_at: new Date().toISOString() }).eq("tenant_id", tid).eq("id", id);
   return error ? { ok: false, error: error.message } : { ok: true };
+}
+
+// ===================== v6.7: your control panel =====================
+async function agencyOverview(agencyTid: string) {
+  const { data: me } = await supabase.from("tenant_config").select("is_agency").eq("tenant_id", agencyTid).maybeSingle();
+  if (!me?.is_agency) return { ok: false, error: "Only the agency account can see this." };
+  const { data: ts } = await supabase.from("tenants").select("id, business_name, status, created_at").in("status", ["active", "paused"]).order("business_name");
+  const month = new Date().toISOString().slice(0, 7);
+  const rows = await Promise.all((ts ?? []).map(async (t: any) => {
+    const [{ data: last }, { data: brief }, u, { data: mh }, { count: fails }, { data: cfg }] = await Promise.all([
+      supabase.from("agency_checks").select("status, problems, checked_at").eq("tenant_id", t.id).maybeSingle(),
+      supabase.from("briefs").select("brief_date").eq("tenant_id", t.id).order("brief_date", { ascending: false }).limit(1).maybeSingle(),
+      usage(t.id, month) as Promise<any>,
+      supabase.from("member_health").select("status").eq("tenant_id", t.id),
+      supabase.from("agent_runs").select("id", { count: "exact", head: true }).eq("tenant_id", t.id).eq("status", "failed").gte("finished_at", new Date(Date.now() - 24 * 3600000).toISOString()),
+      supabase.from("tenant_config").select("schedules_on, is_agency").eq("tenant_id", t.id).maybeSingle(),
+    ]);
+    return {
+      tenant_id: t.id, business: t.business_name, since: String(t.created_at ?? "").slice(0, 10), agency: !!cfg?.is_agency,
+      status: last?.status ?? "unknown", problems: last?.problems ?? [], checked_at: last?.checked_at ?? null,
+      last_brief: brief?.brief_date ?? null, schedules_on: !!cfg?.schedules_on,
+      runs_month: u.runs, cost_month_gbp: u.est_cost_gbp, projected_gbp: u.projected_month_gbp,
+      clients_red: (mh ?? []).filter((m: any) => m.status === "red").length, clients_yellow: (mh ?? []).filter((m: any) => m.status === "yellow").length,
+      failed_24h: fails ?? 0,
+      ...(await quietInfo(t.id)),
+    };
+  }));
+  const total = rows.reduce((a, r) => a + (r.cost_month_gbp || 0), 0);
+  return { ok: true, month, tenants: rows, totals: { clients: rows.filter((r) => !r.agency).length, red: rows.filter((r) => r.status === "red").length, amber: rows.filter((r) => r.status === "amber").length, cost_month_gbp: Math.round(total * 100) / 100 } };
+}
+
+// Every 3 hours: check every client; WhatsApp the agency owner when a client turns red (once a day per client)
+async function agencySweep(agencyTid: string) {
+  const { data: ts } = await supabase.from("tenants").select("id, business_name").eq("status", "active");
+  const alerts: string[] = [];
+  const quiet: string[] = [];
+  for (const t of ts ?? []) {
+    try {
+      const r: any = await checkup(t.id);
+      const prev = await supabase.from("agency_checks").select("status").eq("tenant_id", t.id).maybeSingle();
+      await supabase.from("agency_checks").upsert({ tenant_id: t.id, status: r.status, problems: r.problems ?? [], text: String(r.text ?? "").slice(0, 4000), checked_at: new Date().toISOString() }, { onConflict: "tenant_id" });
+      // A new client gone quiet (first 30 days, no message to Archie for 2+ days)
+      const q = await quietInfo(t.id);
+      if (q.in_first_30 && q.quiet_days !== null && q.quiet_days >= 2 && (await claim(agencyTid, `quiet:${t.id}`, new Date().toISOString().slice(0, 10)))) {
+        quiet.push(`🤫 ${t.business_name}: hasn't talked to Archie for ${q.quiet_days} days (day ${q.onboarding_day} of onboarding) — worth a nudge.`);
+      }
+      if (r.status === "red" && (await claim(agencyTid, `alert:${t.id}`, new Date().toISOString().slice(0, 10)))) {
+        alerts.push(`🔴 ${t.business_name}: ${(r.problems ?? []).slice(0, 3).join(" · ")}${prev.data?.status && prev.data.status !== "red" ? " (was " + prev.data.status + ")" : ""}`);
+      }
+    } catch (e) { alerts.push(`⚠️ ${t.business_name}: checkup couldn't run (${String(e).slice(0, 60)})`); }
+  }
+  if (alerts.length) await sendToTeam(agencyTid, `Archie client check:\n${alerts.join("\n")}\n\nOpen the control panel for details.`, "", "agency");
+  if (quiet.length) { const m = `New clients gone quiet:\n${quiet.join("\n")}`; await sendToTeam(agencyTid, m, m, "agency"); }
+}
+
+// ===================== v6.7.1: post the latest reel to Social Planner =====================
+async function latestReel(tid: string) {
+  const { data: job } = await supabase.from("edit_jobs").select("*").eq("tenant_id", tid).eq("status", "done").order("updated_at", { ascending: false }).limit(1).maybeSingle();
+  return job;
+}
+
+// Write (or rewrite) the caption for a reel, in the owner's voice, from what they actually said
+async function reelCaption(tid: string, p: any) {
+  const job = p.id ? (await supabase.from("edit_jobs").select("*").eq("tenant_id", tid).eq("id", String(p.id)).maybeSingle()).data : await latestReel(tid);
+  if (!job) return { ok: false, text: "I don't have a finished reel yet — send me a video with \"edit\" first." };
+  // Their own words: use as-is
+  if (String(p.own ?? "").trim()) {
+    const own = String(p.own).trim().slice(0, 2200);
+    await supabase.from("edit_jobs").update({ caption: own }).eq("id", job.id);
+    return { ok: true, id: job.id, caption: own, text: `Caption saved:\n\n${own}\n\nSay "post it" when you're ready.` };
+  }
+  const { data: cf } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+  const token = cf?.ghl_token || FALLBACK_TOKEN;
+  const agentId = await agentIdFor(tid, "content", token, cf?.ghl_location_id);
+  const said = (job.transcript?.words ?? []).map((w: any) => w.w).join(" ").slice(0, 2500);
+  if (!agentId || !said) return { ok: false, text: "I couldn't write a caption for that one — send me your own with \"caption: …\"." };
+  const change = String(p.change ?? "").trim();
+  const msg = [
+    "Write an Instagram caption for this reel, in the owner's voice.",
+    "Shape: a first line that makes people stop (it shows before 'more'), 2–4 short lines that add to the video (don't just repeat it), one clear call to action, then up to 5 relevant hashtags on the last line. Plain text, no markdown, no emojis at the start of every line.",
+    job.caption && change ? `THE CURRENT CAPTION:\n${job.caption}\n\nCHANGE IT LIKE THIS: ${change}` : change ? `Also: ${change}` : "",
+    "Only the caption.",
+    "",
+    `WHAT THEY SAID IN THE REEL:\n${said}`,
+    "",
+    await businessContext(tid),
+  ].filter(Boolean).join("\n");
+  const res = await agentExecute(token, agentId, { locationId: cf?.ghl_location_id, message: msg }, `caption-${tid}-${Date.now()}`);
+  const caption = tidy(clean(String(res.json?.finalText ?? ""))).replace(/^caption:\s*/i, "").trim().slice(0, 2200);
+  if (!caption) return { ok: false, text: "The caption didn't come back — try again in a minute." };
+  await supabase.from("edit_jobs").update({ caption }).eq("id", job.id);
+  return { ok: true, id: job.id, caption, text: `Here's the caption:\n\n${caption}\n\nSay "post it" to add the reel to Social Planner with this, "make it shorter" (or any change), or send your own with "caption: …".` };
+}
+
+async function reelToPlanner(tid: string, id?: string) {
+  const job = id ? (await supabase.from("edit_jobs").select("*").eq("tenant_id", tid).eq("id", id).maybeSingle()).data : await latestReel(tid);
+  if (!job) return { ok: false, text: "I don't have a finished reel yet — send me a video with \"edit\" first." };
+  if (job.planner_post_id) return { ok: true, text: `That reel's already in Social Planner as a draft${job.title ? ` (${job.title})` : ""}. Open Social Planner to pick the time and post it.` };
+  const { data: cfg } = await supabase.from("tenant_config").select("ghl_token").eq("tenant_id", tid).single();
+  const c = { tid, ghlToken: cfg?.ghl_token || FALLBACK_TOKEN };
+  let caption = String(job.caption ?? "").trim();
+  if (!caption) { const cap: any = await reelCaption(tid, { id: job.id }); caption = cap.ok ? cap.caption : ""; }
+  const r: any = await toPlanner(c, { type: "reel", text: caption || job.title || "", media_url: job.ghl_media_url || job.output_url, media_type: "video/mp4" });
+  if (!r.ok) return { ok: false, text: `I couldn't add it to Social Planner: ${r.error}` };
+  await supabase.from("edit_jobs").update({ planner_post_id: r.post_id ?? "added" }).eq("id", job.id);
+  return { ok: true, text: `✅ Added to Social Planner as a draft${r.accounts?.length ? ` for ${r.accounts.join(", ")}` : ""}.${caption ? `\n\nCaption:\n${caption}` : ""}\n\nOpen Social Planner to check it, pick a time and schedule it.` };
+}
+
+// ===================== v6.8: Instagram insights (Meta app) =====================
+const IG_G = "https://graph.facebook.com/v21.0";
+
+async function igConnectUrl(tid: string) {
+  const appId = Deno.env.get("META_APP_ID"), config = Deno.env.get("META_LOGIN_CONFIG_ID");
+  if (!appId || !config) return { ok: false, error: "Instagram connect isn't set up yet (META_APP_ID / META_LOGIN_CONFIG_ID)." };
+  const state = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+  await supabase.from("oauth_states").insert({ state, tenant_id: tid, provider: "meta" });
+  const redirect = encodeURIComponent(`${Deno.env.get("SUPABASE_URL")}/functions/v1/meta-connect`);
+  return { ok: true, url: `https://www.facebook.com/v21.0/dialog/oauth?client_id=${appId}&redirect_uri=${redirect}&config_id=${config}&response_type=code&state=${state}` };
+}
+
+function igType(m: any): "REEL" | "VIDEO" | "IMAGE" | "CAROUSEL_ALBUM" | "OTHER" {
+  if (m.media_product_type === "REELS") return "REEL";
+  return ["VIDEO", "IMAGE", "CAROUSEL_ALBUM"].includes(m.media_type) ? m.media_type : "OTHER";
+}
+
+async function igSync(tid: string) {
+  const { data: con } = await supabase.from("ig_connections").select("*").eq("tenant_id", tid).maybeSingle();
+  if (!con) return { ok: false, text: "Instagram isn't connected — Settings → Content → Connect Instagram." };
+  const tok = encodeURIComponent(con.page_token);
+  const mr = await fetch(`${IG_G}/${con.ig_user_id}/media?fields=id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count&limit=50&access_token=${tok}`);
+  const mj: any = await mr.json().catch(() => null);
+  if (!mr.ok) {
+    const msg = String(mj?.error?.message ?? mr.status);
+    await supabase.from("ig_connections").update({ last_error: msg.slice(0, 300) }).eq("tenant_id", tid);
+    return { ok: false, text: `Instagram sync failed: ${msg.slice(0, 160)}${/expired|session|OAuth/i.test(msg) ? " — reconnect Instagram in Settings." : ""}` };
+  }
+  const media: any[] = mj?.data ?? [];
+  const rows: any[] = [];
+  for (let i = 0; i < media.length; i += 8) {
+    const batch = media.slice(i, i + 8);
+    const got = await Promise.all(batch.map(async (m) => {
+      const t = igType(m);
+      const metrics = t === "REEL" ? "reach,likes,comments,saved,shares,views,total_interactions,ig_reels_avg_watch_time"
+        : t === "VIDEO" ? "reach,likes,comments,saved,shares,views,total_interactions"
+        : "reach,likes,comments,saved,shares,total_interactions";
+      const ir = await fetch(`${IG_G}/${m.id}/insights?metric=${metrics}&access_token=${tok}`);
+      const ij: any = await ir.json().catch(() => null);
+      const v: Record<string, number> = {};
+      for (const it of ij?.data ?? []) v[it.name] = Number(it.values?.[0]?.value ?? it.total_value?.value ?? 0);
+      return {
+        tenant_id: tid, media_id: m.id, kind: t, caption: String(m.caption ?? "").slice(0, 2200), permalink: m.permalink, media_url: m.media_url ?? null,
+        thumb_url: m.thumbnail_url ?? m.media_url ?? null, posted_at: m.timestamp,
+        reach: v.reach ?? null, views: v.views ?? null, likes: v.likes ?? m.like_count ?? null, comments: v.comments ?? m.comments_count ?? null,
+        saves: v.saved ?? null, shares: v.shares ?? null, interactions: v.total_interactions ?? null,
+        avg_watch_ms: v.ig_reels_avg_watch_time ?? null, insights_ok: ir.ok, synced_at: new Date().toISOString(),
+      };
+    }));
+    rows.push(...got);
+  }
+  if (rows.length) await supabase.from("ig_posts").upsert(rows, { onConflict: "tenant_id,media_id" });
+  // Followers today
+  const ar: any = await fetch(`${IG_G}/${con.ig_user_id}?fields=followers_count,media_count&access_token=${tok}`).then((r) => r.json()).catch(() => null);
+  if (ar?.followers_count !== undefined) {
+    await supabase.from("ig_daily").upsert({ tenant_id: tid, day: new Date().toISOString().slice(0, 10), followers: ar.followers_count }, { onConflict: "tenant_id,day" });
+  }
+  await supabase.from("ig_connections").update({ last_sync_at: new Date().toISOString(), last_error: null, followers: ar?.followers_count ?? con.followers }).eq("tenant_id", tid);
+
+  // Your winners (reels doing 2x+ your normal reach in the last 30 days) → "why it worked" + a follow-up idea
+  try {
+    const reels = rows.filter((r) => (r.kind === "REEL" || r.kind === "VIDEO") && r.reach);
+    const med = median(reels.map((r) => r.reach));
+    const cut = Date.now() - 30 * 86400000;
+    const winners = reels.filter((r) => med && r.reach / med >= 2 && Date.parse(r.posted_at) >= cut && r.media_url);
+    for (const w of winners.slice(0, 3)) {
+      await supabase.from("content_posts").upsert({
+        tenant_id: tid, handle: con.ig_username, source: "own", pick: "own_winner", shortcode: `ig_${w.media_id}`, url: w.permalink,
+        video_url: w.media_url, thumb_url: w.thumb_url, caption: w.caption, views: w.views ?? w.reach, likes: w.likes, comments: w.comments,
+        posted_at: w.posted_at, score: Math.round((w.reach / med) * 10) / 10, status: "queued", updated_at: new Date().toISOString(),
+      }, { onConflict: "tenant_id,shortcode", ignoreDuplicates: true });
+    }
+  } catch { /* winners are a bonus */ }
+  return { ok: true, synced: rows.length, text: `Instagram refreshed — ${rows.length} posts, ${ar?.followers_count ?? "?"} followers.` };
+}
+
+function median(xs: number[]) { const a = xs.filter((x) => Number.isFinite(x) && x > 0).sort((p, q) => p - q); return a.length ? a[Math.floor(a.length / 2)] : 0; }
+
+async function igResults(tid: string, days = 60) {
+  const { data: con } = await supabase.from("ig_connections").select("ig_username, last_sync_at, followers").eq("tenant_id", tid).maybeSingle();
+  if (!con) return { ok: false, connected: false, text: "Instagram isn't connected yet — Settings → Content → Connect Instagram." };
+  const since = new Date(Date.now() - Math.max(7, Math.min(365, days)) * 86400000).toISOString();
+  const { data: posts } = await supabase.from("ig_posts").select("*").eq("tenant_id", tid).gte("posted_at", since).order("posted_at", { ascending: false }).limit(100);
+  const list = posts ?? [];
+  const { data: all } = await supabase.from("ig_posts").select("kind, reach, saves, shares").eq("tenant_id", tid).order("posted_at", { ascending: false }).limit(60);
+  const normal = { reach: median((all ?? []).map((p: any) => p.reach)), saves: median((all ?? []).map((p: any) => p.saves)), shares: median((all ?? []).map((p: any) => p.shares)) };
+  const scored = list.map((p: any) => ({
+    ...p, vs_normal: normal.reach && p.reach ? Math.round((p.reach / normal.reach) * 10) / 10 : null,
+    watch_seconds: p.avg_watch_ms ? Math.round(p.avg_watch_ms / 100) / 10 : null,
+  }));
+  const best = [...scored].filter((p) => p.vs_normal).sort((a, b) => (b.vs_normal ?? 0) - (a.vs_normal ?? 0)).slice(0, 3);
+  const { data: fol } = await supabase.from("ig_daily").select("day, followers").eq("tenant_id", tid).gte("day", since.slice(0, 10)).order("day");
+  const fFirst = fol?.[0]?.followers, fLast = fol?.[fol.length - 1]?.followers;
+  const growth = fFirst !== undefined && fLast !== undefined ? fLast - fFirst : null;
+  const byKind = ["REEL", "CAROUSEL_ALBUM", "IMAGE"].map((k) => { const xs = scored.filter((p) => p.kind === k); return { kind: k, posts: xs.length, avg_reach: xs.length ? Math.round(xs.reduce((a, p) => a + (p.reach ?? 0), 0) / xs.length) : 0 }; }).filter((k) => k.posts);
+  const label = (k: string) => k === "REEL" ? "reels" : k === "CAROUSEL_ALBUM" ? "carousels" : "photos";
+  const text = !scored.length ? `No posts in the last ${days} days on @${con.ig_username} yet.` : [
+    `@${con.ig_username}, last ${days} days: ${scored.length} posts${growth !== null ? ` · followers ${growth >= 0 ? "+" : ""}${growth} (now ${fLast})` : con.followers ? ` · ${con.followers} followers` : ""}.`,
+    `Your normal: ~${normal.reach} reach, ${normal.saves} saves, ${normal.shares} shares a post.`,
+    best.length ? `Best:\n${best.map((b, i) => `${i + 1}. "${String(b.caption ?? "").split("\n")[0].slice(0, 60)}" — ${b.vs_normal}x your normal reach (${b.reach} reach, ${b.saves ?? 0} saves, ${b.shares ?? 0} shares)`).join("\n")}` : "",
+    byKind.length > 1 ? `By type: ${byKind.map((k) => `${label(k.kind)} ~${k.avg_reach} reach (${k.posts})`).join(" · ")}.` : "",
+    `(From Instagram insights, synced ${con.last_sync_at ? String(con.last_sync_at).slice(0, 16).replace("T", " ") : "not yet"}.)`,
+  ].filter(Boolean).join("\n");
+  return { ok: true, connected: true, username: con.ig_username, last_sync_at: con.last_sync_at, normal, followers_now: fLast ?? con.followers, followers_change: growth, by_kind: byKind, best, posts: scored, text };
+}
+
+// ===================== v6.9: onboarding coach =====================
+type Tip = { key: string; title: string; text: string; try: string; used?: (tid: string, since: string) => Promise<boolean> };
+const usedJob = (job: string) => async (tid: string, since: string) => { const { count } = await supabase.from("agent_usage").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("job", job).gte("created_at", since); return (count ?? 0) > 0; };
+const usedRows = (table: string, extra?: (q: any) => any) => async (tid: string, since: string) => { let q = supabase.from(table).select("id", { count: "exact", head: true }).eq("tenant_id", tid).gte("created_at", since); if (extra) q = extra(q); const { count } = await q; return (count ?? 0) > 0; };
+const COACH_TIPS: Tip[] = [
+  { key: "reply_brief", title: "Reply to your brief", text: "Your morning brief gets better when you reply to it. Voice notes are fine — you don't need commands.", try: "\"Done 1\" or \"move 3 to Friday\"",
+    used: async (tid, since) => { const { count } = await supabase.from("talk_messages").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("role", "user").gte("created_at", since); return (count ?? 0) >= 3; } },
+  { key: "add_tasks", title: "Hand Archie your to-dos", text: "Anything you'd normally write on a sticky note — say it to Archie and it lands on the right list, on the right day.", try: "\"Add call Lewis tomorrow, must, 30 minutes\"" },
+  { key: "memory", title: "Teach Archie once", text: "Tell Archie how you count things and how you sound. Everything it writes and works out after that follows it.", try: "\"A member means anyone on a paid plan\" or \"I'd never say 'game-changer'\"",
+    used: async (tid, since) => { const { count } = await supabase.from("business_memory").select("id", { count: "exact", head: true }).eq("tenant_id", tid).gte("created_at", since); return (count ?? 0) >= 3; } },
+  { key: "dump", title: "Brain dump", text: "After a call or at the end of the day, just ramble. Archie turns it into a clean note, tasks for the right person and notes on the right contacts.", try: "Start a voice note with \"Brain dump…\"", used: usedRows("dumps") },
+  { key: "risk", title: "Who's drifting?", text: "Archie scores every client green, yellow or red overnight. The reds are your cancellations waiting to happen.", try: "\"Who's at risk?\" then \"check in with the reds\"" },
+  { key: "days_off", title: "Take a day off properly", text: "Archie blocks your calendar, moves your tasks and drafts rebook messages for anyone booked in.", try: "\"I'm off Friday\"" },
+  { key: "report", title: "Monday's 2 minutes", text: "The Report shows your week against your goal — and Where to focus gives you three actions with real names.", try: "\"How's this week looking?\" then \"do 1\"" },
+  { key: "ideas", title: "Ideas that are working", text: "Archie checks the accounts you learn from and turns their best recent posts into ideas in your voice.", try: "\"What's working?\" then \"film 1 and 3\"", used: async (tid, since) => { const { count } = await supabase.from("content_posts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).in("status", ["to_film", "filmed"]).gte("updated_at", since); return (count ?? 0) > 0; } },
+  { key: "edit", title: "Let Archie edit your video", text: "Film yourself on your phone — mistakes and all. Send it with \"edit\" and get back a captioned, branded reel.", try: "Send a video on WhatsApp with \"edit\"", used: usedRows("edit_jobs") },
+  { key: "post", title: "Caption and post", text: "When a reel's ready, Archie writes the caption from what you said and puts it into Social Planner as a draft.", try: "\"Write a caption\" then \"post it\"", used: async (tid, since) => { const { count } = await supabase.from("edit_jobs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).not("planner_post_id", "is", null).gte("created_at", since); return (count ?? 0) > 0; } },
+  { key: "prep", title: "Walk into calls prepared", text: "Before any call, Archie pulls who they are, the last thing they said, their form answers and three questions to ask.", try: "\"I've got Sarah at 10\"", used: usedJob("prep") },
+  { key: "data", title: "Ask your numbers anything", text: "Any question about your clients, money or leads — answered from your real data, with where it came from.", try: "\"Who are my top 10 clients this year?\"", used: usedJob("data") },
+  { key: "council", title: "Get a second opinion", text: "For big decisions — prices, hiring, a new offer — Archie runs a small council against your real numbers and makes a clear call.", try: "\"Second opinion: should I raise my prices?\"", used: usedJob("council") },
+  { key: "instagram", title: "See how your posts did", text: "Connect Instagram once and Archie shows your reach, saves and shares against your normal — and what your best posts have in common.", try: "Settings → Content → Connect Instagram, then \"how did my posts do?\"", used: async (tid) => { const { count } = await supabase.from("ig_connections").select("tenant_id", { count: "exact", head: true }).eq("tenant_id", tid); return (count ?? 0) > 0; } },
+  // weekly after day 14
+  { key: "repeat", title: "Repeating tasks", text: "The things you do every week shouldn't need remembering. Set them once.", try: "\"Every Monday, content filming, 2 hours, must\"", used: usedRows("recurring_tasks") },
+  { key: "review", title: "Your first month", text: "You're a month in. Tell Archie what's been useful and what's noise — it adjusts.", try: "\"What have I used you for most this month?\"" },
+];
+
+async function quietInfo(tid: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("onboarding_started_at").eq("tenant_id", tid).maybeSingle();
+  const start = cfg?.onboarding_started_at ? Date.parse(cfg.onboarding_started_at) : null;
+  const day = start ? Math.floor((Date.now() - start) / 86400000) + 1 : null;
+  const { data: last } = await supabase.from("talk_messages").select("created_at").eq("tenant_id", tid).eq("role", "user").order("created_at", { ascending: false }).limit(1).maybeSingle();
+  const quiet = last?.created_at ? Math.floor((Date.now() - Date.parse(last.created_at)) / 86400000) : (day ?? null);
+  return { onboarding_day: day, in_first_30: day !== null && day <= 30, last_talked_at: last?.created_at ?? null, quiet_days: quiet };
+}
+
+async function coachRun(tid: string, _p: any) {
+  const { data: cfg } = await supabase.from("tenant_config").select("coach_on, onboarding_started_at, coach_sent").eq("tenant_id", tid).maybeSingle();
+  if (!cfg?.coach_on || !cfg.onboarding_started_at) return { ok: true, skipped: "coach off" };
+  const day = Math.floor((Date.now() - Date.parse(cfg.onboarding_started_at)) / 86400000) + 1;
+  if (day < 1 || day > 30) {
+    if (day > 30) await supabase.from("tenant_config").update({ coach_on: false }).eq("tenant_id", tid);
+    return { ok: true, skipped: `day ${day}` };
+  }
+  // Daily for 14 days, then days 21 and 28
+  if (day > 14 && ![21, 28].includes(day)) return { ok: true, skipped: `day ${day} (weekly after day 14)` };
+  const sent: string[] = Array.isArray(cfg.coach_sent) ? cfg.coach_sent : [];
+  const pool = day <= 14 ? COACH_TIPS.slice(0, 14) : COACH_TIPS.slice(14);
+  let tip: Tip | null = null;
+  for (const t of pool) {
+    if (sent.includes(t.key)) continue;
+    if (t.used && (await t.used(tid, cfg.onboarding_started_at))) { sent.push(t.key); continue; } // already using it — skip
+    tip = t; break;
+  }
+  if (!tip) { await supabase.from("tenant_config").update({ coach_sent: sent }).eq("tenant_id", tid); return { ok: true, skipped: "nothing new to suggest" }; }
+  const n = sent.length + 1;
+  await sendToTeam(tid, `💡 Archie tip${day <= 14 ? ` (${Math.min(n, 14)} of 14)` : ""}: ${tip.title}\n${tip.text}\n\nTry it now: ${tip.try}`, "", "coach");
+  sent.push(tip.key);
+  await supabase.from("tenant_config").update({ coach_sent: sent }).eq("tenant_id", tid);
+  return { ok: true, sent: tip.key, day };
+}
+
+async function coachStatus(tid: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("coach_on, onboarding_started_at, coach_sent").eq("tenant_id", tid).maybeSingle();
+  const q = await quietInfo(tid);
+  return { ok: true, coach_on: !!cfg?.coach_on, started: cfg?.onboarding_started_at ?? null, day: q.onboarding_day, sent: cfg?.coach_sent ?? [], quiet_days: q.quiet_days, tips: COACH_TIPS.map((t) => ({ key: t.key, title: t.title })) };
 }
 
 // ===================== workflow side =====================
