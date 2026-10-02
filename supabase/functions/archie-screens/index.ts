@@ -1,4 +1,13 @@
-// archie-screens v6.4 — data and actions for the Archie AI Studio pages.
+// archie-screens v6.6.2 — data and actions for the Archie AI Studio pages.
+// v6.6.2: see the original — each outlier's video (and thumbnail) is kept privately for reference so it plays on the
+//         Content page (Instagram's own links expire); private links only, cleared after 60 days.
+// v6.6.1: Find ideas fixes — tries the current Gemini models in turn, records why a video couldn't be watched, and asks
+//         for the idea as simple labelled lines (much more reliable than JSON).
+// v6.6: Find ideas (native SMAI) — watched Instagram accounts scraped weekly (Apify), each post scored against that
+//       account's normal (outliers = 3x+), Gemini watches the outliers ("see why it worked"), Archie turns each into an idea
+//       in your voice ("make it yours") with a hook, script and filming note; Monday WhatsApp with the best ones.
+// v6.5: Archie Edit from WhatsApp — capture starts edits for videos sent with "edit"; Talk to Archie handles reel changes
+//       ("make it shorter", "different hook") and "how many edits have I got left?".
 // v6.4: Archie Edit — upload a raw clip → Deepgram transcript with word timings → Archie's edit plan (best takes, hook,
 //       emphasis, overlays, zooms) → captions and cuts worked out exactly → Remotion Lambda render in the client's brand →
 //       MP4 into their GHL media → "📹 Your reel's ready". Monthly allowance per client. Schedule days accept mon,tue… too.
@@ -161,6 +170,11 @@ Deno.serve(async (req) => {
         for (const t of ts ?? []) { const u: any = await usage(t.id, String(p.month ?? "")); out.push({ business: t.business_name, runs: u.runs, est_cost_gbp: u.est_cost_gbp }); }
         return j({ ok: true, month: String(p.month ?? "") || new Date().toISOString().slice(0, 7), tenants: out, total_gbp: Math.round(out.reduce((a, x) => a + (x.est_cost_gbp || 0), 0) * 100) / 100 });
       }
+      if (action === "edit_start") {
+        const { data: own } = await supabase.from("team_members").select("handle").eq("tenant_id", tenant_id).eq("gets_financials", true).maybeSingle();
+        return j(await editStart(tenant_id, String(p.handle ?? own?.handle ?? "owner"), p));
+      }
+      if (action === "ideas_run") return j(await ideasFindNow(tenant_id));
       if (action === "recurring_run") { const r = await recurringRun(tenant_id); return j({ ok: true, ...r }); }
       if (action === "health_run") { startInBackground(memberHealthRun(tenant_id)); return j({ ok: true, started: true }); }
       if (action === "report_nightly_run") { startInBackground(weeklyReport(tenant_id, { week: "this", refresh: "yes" })); return j({ ok: true, started: true }); }
@@ -226,6 +240,12 @@ Deno.serve(async (req) => {
       case "goals": return j(await getGoals(c.tid));
       case "checkup": return j(await checkup(c.tid));
       case "settings_get": return j(await settingsGet(c.tid));
+      case "ideas_accounts": { const { data } = await supabase.from("watched_accounts").select("handle, platform, followers, median_views, last_scraped_at, active").eq("tenant_id", c.tid).eq("active", true).order("handle"); return j({ ok: true, accounts: data ?? [] }); }
+      case "ideas_account_add": return j(await ideasAccountAdd(c.tid, String(p.handle ?? "")));
+      case "ideas_account_remove": { await supabase.from("watched_accounts").update({ active: false }).eq("tenant_id", c.tid).eq("handle", String(p.handle ?? "").replace(/^@/, "").toLowerCase()); return j({ ok: true }); }
+      case "ideas_find_now": return j(await ideasFindNow(c.tid));
+      case "ideas_list": return j(await ideasList(c.tid, String(p.status ?? "")));
+      case "idea_update": return j(await ideaUpdate(c.tid, String(p.id ?? ""), String(p.status ?? "")));
       case "edit_upload_url": return j(await editUploadUrl(c.tid, String(p.filename ?? "clip.mp4")));
       case "edit_start": return j(await editStart(c.tid, c.owner?.handle ?? "owner", p));
       case "edit_status": return j(await editStatus(c.tid, String(p.id ?? "")));
@@ -1778,6 +1798,7 @@ async function dispatch(_p: any) {
   for (const t of tenants ?? []) {
     const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", t.id).maybeSingle();
     try { await editFinishPending(t.id); } catch { /* never block the scheduler */ }
+    try { startInBackground(ideasTick(t.id)); } catch { /* never block the scheduler */ }
     if (!cfg || cfg.schedules_on !== true) continue; // opt-in per client, so nothing double-runs alongside GHL workflows
     const tz = cfg.timezone || "Europe/London";
     const now = localNow(tz);
@@ -1788,6 +1809,7 @@ async function dispatch(_p: any) {
       { job: "morning", due: days(cfg.sched_morning_days, "0,1,2,3,4,5,6").includes(now.weekday) && dueNow(now.minutes, hhmm(cfg.sched_morning, "04:30")), key: now.date, action: "morning_run", body: { referral_link: String(cfg.referral_link ?? "") } },
       { job: "evening", due: days(cfg.sched_evening_days, "0,1,2,3,4").includes(now.weekday) && dueNow(now.minutes, hhmm(cfg.sched_evening, "20:00")), key: now.date, action: "evening_run" },
       { job: "plan", due: now.weekday === Number(cfg.sched_plan_day ?? 6) && dueNow(now.minutes, hhmm(cfg.sched_plan, "08:00")), key: now.date, action: "plan_run" },
+      { job: "ideas", due: now.weekday === Number(cfg.sched_ideas_day ?? 1) && dueNow(now.minutes, hhmm(cfg.sched_ideas, "05:00")), key: now.date, action: "ideas_run" },
       { job: "recurring", due: dueNow(now.minutes, hhmm(cfg.sched_recurring, "04:00")), key: now.date, action: "recurring_run" },
       { job: "health", due: dueNow(now.minutes, hhmm(cfg.sched_health, "03:30")), key: now.date, action: "health_run" },
       { job: "report_nightly", due: dueNow(now.minutes, hhmm(cfg.sched_report_nightly, "23:30")), key: now.date, action: "report_nightly_run" },
@@ -1932,6 +1954,8 @@ const TALK_RULES = [
   "- archie_memory {action save|list|archive, kind definition|voice|worked|service|fact, key, value} — 'remember…', 'a client means…', 'that doesn't sound like me…', 'forget the … one'. archie_remember also works for plain facts.",
   "- archie_checkup — 'is everything working?'; give the report as it is.",
   "- 'Show my last dump' → the LAST DUMP in the CONTEXT (give the clean note as it is). Dumps themselves are handled before you see them.",
+  "- archie_ideas {action: list|find|film|skip, numbers, status} — content ideas: 'what's working?' / 'any ideas this week?' → list (numbered). 'Find me ideas now' → find. 'Film 1 and 3' → {action:'film', numbers:[1,3]}. 'Skip 2' → skip. 'What do I need to film?' → {action:'list', status:'to_film'}.",
+  "- archie_reel {action: redo|left|status, change} — reels from Archie Edit: 'make that reel shorter' / 'different hook' / 'drop the list' → {action:'redo', change: what they said}. 'How many edits have I got left?' → {action:'left'}. 'Is my reel ready?' → {action:'status'}. To edit a NEW video they just send it on WhatsApp with 'edit'.",
   "- archie_data {question} — any question about their numbers or lists that isn't covered above: 'top 20 clients', 'who paid the most this year', 'how did last week compare to the month before', 'which clients joined in January', 'how many leads came from Instagram'. Pass their question as it is; give the answer as it is.",
   "- archie_call_prep {name, time} — 'I've got Sarah at 10', 'prep me for my 2pm', 'what do I need to know before the Martin call?'. Give the result as it is.",
   "- archie_council {question, answers, lens} — big decisions ('second opinion: should I raise prices to £75?', 'should I hire a coach?'). If it comes back with QUESTIONS, ask them and, when they answer, run archie_council again with the same question + answers. 'Ask Money more about that' → {lens:'Money', question: what they want to know}. Give the result as it is.",
@@ -2124,7 +2148,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep", "archie_data"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep", "archie_data", "archie_reel", "archie_ideas"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
       const OWNER_ONLY = ["archie_data", "archie_call_prep", "archie_council", "archie_set_trial", "archie_groups", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
@@ -2137,7 +2161,30 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
         continue;
       }
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_data"
+      const r = act.tool === "archie_ideas"
+        ? await (async () => {
+            const a2 = String(args.action ?? "list");
+            if (a2 === "find") { const x: any = await ideasFindNow(tid); return { ok: !!x.ok, text: x.text }; }
+            if (a2 === "film" || a2 === "skip") {
+              const { data: ready } = await supabase.from("content_posts").select("id").eq("tenant_id", tid).eq("status", "ready").order("score", { ascending: false }).limit(10);
+              const nums: number[] = (Array.isArray(args.numbers) ? args.numbers : String(args.numbers ?? "").split(/[\s,&and]+/)).map(Number).filter(Boolean);
+              for (const n of nums) { const it = (ready ?? [])[n - 1]; if (it) await ideaUpdate(tid, it.id, a2 === "film" ? "to_film" : "skipped"); }
+              return { ok: true, text: `${a2 === "film" ? "Added to your filming list" : "Skipped"}: ${nums.join(", ")}.` };
+            }
+            const x: any = await ideasList(tid, String(args.status ?? "ready"));
+            return { ok: true, text: x.text };
+          })()
+        : act.tool === "archie_reel"
+        ? await (async () => {
+            const a2 = String(args.action ?? "redo");
+            if (a2 === "left") { const x = await editAllowanceLeft(tid); return { ok: true, text: `${x.left} of ${x.allowance} reel edits left this month.` }; }
+            const { data: last } = await supabase.from("edit_jobs").select("id, title, status").eq("tenant_id", tid).order("created_at", { ascending: false }).limit(1).maybeSingle();
+            if (!last) return { ok: false, text: "No reels yet — send me a video with \"edit\"." };
+            if (a2 === "status") return { ok: true, text: `Latest reel${last.title ? ` (${last.title})` : ""}: ${last.status}.` };
+            const x: any = await editRedo(tid, last.id, String(args.change ?? text));
+            return { ok: !!x.ok, text: x.ok ? x.text : String(x.error) };
+          })()
+        : act.tool === "archie_data"
         ? await (async () => { const x: any = await askData(tid, String(args.question ?? text)); return { ok: !!x.ok, text: x.text }; })()
         : act.tool === "archie_call_prep"
         ? await (async () => { const x: any = await callPrep(tid, args); return { ok: !!x.ok, text: x.text }; })()
@@ -3724,7 +3771,7 @@ const SETTINGS_FIELDS: Record<string, "text" | "int" | "bool" | "num" | "time" |
   sched_recurring: "time", sched_health: "time",
   won_creates_invoice: "bool", stale_threshold_days: "int", pipeline_name: "text", trial_stage_name: "text",
   brand_primary: "text", brand_accent: "text", brand_text: "text", brand_logo_url: "text", caption_style: "text",
-  outro_text: "text", outro_sub: "text", edit_allowance: "int",
+  outro_text: "text", outro_sub: "text", edit_allowance: "int", instagram_handle: "text", sched_ideas: "time", sched_ideas_day: "int",
 };
 const SECRET_FIELDS = ["stripe_key", "fathom_api_key", "ghl_token"];
 
@@ -4090,6 +4137,242 @@ async function editCheck(tid: string, job: any) {
 async function editFinishPending(tid: string) {
   const { data: jobs } = await supabase.from("edit_jobs").select("*").eq("tenant_id", tid).eq("status", "rendering").limit(5);
   for (const j of jobs ?? []) await editCheck(tid, j);
+}
+
+// ===================== v6.6: Find ideas (native SMAI) =====================
+const APIFY = "https://api.apify.com/v2";
+const apifyToken = () => Deno.env.get("APIFY_API_TOKEN") ?? "";
+
+async function ideasAccountAdd(tid: string, raw: string) {
+  const handle = raw.trim().replace(/^https?:\/\/(www\.)?instagram\.com\//i, "").replace(/[/?#].*$/, "").replace(/^@/, "").toLowerCase();
+  if (!/^[a-z0-9._]{2,30}$/.test(handle)) return { ok: false, error: "That doesn't look like an Instagram handle." };
+  const { error } = await supabase.from("watched_accounts").upsert({ tenant_id: tid, handle, platform: "instagram", active: true }, { onConflict: "tenant_id,handle" });
+  return error ? { ok: false, error: error.message } : { ok: true, text: `Watching @${handle}.` };
+}
+
+// Start a scrape of every watched account (Apify runs in the background; ideasTick collects the results)
+async function ideasFindNow(tid: string) {
+  if (!apifyToken()) return { ok: false, text: "Finding ideas isn't set up yet (APIFY_API_TOKEN missing)." };
+  const { data: accounts } = await supabase.from("watched_accounts").select("handle").eq("tenant_id", tid).eq("active", true).limit(12);
+  const { data: cfg } = await supabase.from("tenant_config").select("instagram_handle").eq("tenant_id", tid).maybeSingle();
+  const handles = [...(accounts ?? []).map((a: any) => ({ h: a.handle, own: false })), ...(cfg?.instagram_handle ? [{ h: String(cfg.instagram_handle).replace(/^@/, "").toLowerCase(), own: true }] : [])];
+  if (!handles.length) return { ok: false, text: "Add some accounts to watch first (Content → Find ideas → Accounts I learn from)." };
+  const since = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+  let started = 0;
+  for (const { h, own } of handles) {
+    const r = await fetch(`${APIFY}/acts/apify~instagram-scraper/runs?token=${apifyToken()}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ directUrls: [`https://www.instagram.com/${h}/`], resultsType: "posts", resultsLimit: 40, onlyPostsNewerThan: since, addParentData: false }),
+    });
+    const js: any = await r.json().catch(() => null);
+    if (r.ok && js?.data?.id) {
+      await supabase.from("apify_runs").insert({ tenant_id: tid, handle: h, own, run_id: js.data.id, dataset_id: js.data.defaultDatasetId, status: "running" });
+      started++;
+    }
+  }
+  return { ok: started > 0, text: started ? `Looking at ${started} account${started === 1 ? "" : "s"} now — ideas will be ready in about 10–20 minutes.` : "Couldn't start — check the Apify key." };
+}
+
+// Every 5 minutes (from the scheduler): collect finished scrapes, score posts, and work on one outlier
+async function ideasTick(tid: string) {
+  if (!apifyToken()) return;
+  // 1. Finished scrapes → posts with scores
+  const { data: runs } = await supabase.from("apify_runs").select("*").eq("tenant_id", tid).eq("status", "running").limit(12);
+  for (const run of runs ?? []) {
+    const st = await fetch(`${APIFY}/actor-runs/${run.run_id}?token=${apifyToken()}`).then((r) => r.json()).catch(() => null);
+    const status = String(st?.data?.status ?? "");
+    if (["RUNNING", "READY"].includes(status)) continue;
+    if (status !== "SUCCEEDED") { await supabase.from("apify_runs").update({ status: "failed" }).eq("id", run.id); continue; }
+    const items: any[] = await fetch(`${APIFY}/datasets/${run.dataset_id}/items?token=${apifyToken()}&clean=true&limit=100`).then((r) => r.json()).catch(() => []);
+    const reels = (Array.isArray(items) ? items : []).filter((x) => x?.videoUrl && Number(x?.videoPlayCount ?? x?.videoViewCount ?? 0) > 0);
+    const views = reels.map((x) => Number(x.videoPlayCount ?? x.videoViewCount ?? 0)).sort((a, b) => a - b);
+    const median = views.length ? views[Math.floor(views.length / 2)] : 0;
+    const cutoff = Date.now() - 30 * 86400000;
+    const rows = reels.map((x) => {
+      const v = Number(x.videoPlayCount ?? x.videoViewCount ?? 0);
+      const score = median ? Math.round((v / median) * 10) / 10 : 0;
+      const recent = Date.parse(String(x.timestamp ?? "")) >= cutoff;
+      const outlier = recent && views.length >= 5 && score >= (run.own ? 2 : 3);
+      return {
+        tenant_id: tid, handle: run.handle, source: run.own ? "own" : "watched", shortcode: String(x.shortCode ?? x.id ?? x.url),
+        url: x.url, video_url: x.videoUrl, thumb_url: x.displayUrl ?? x.thumbnailUrl ?? null, caption: String(x.caption ?? "").slice(0, 2000),
+        views: v, likes: Number(x.likesCount ?? 0), comments: Number(x.commentsCount ?? 0), posted_at: x.timestamp ?? null,
+        score, status: outlier ? "queued" : "seen", updated_at: new Date().toISOString(),
+      };
+    });
+    if (rows.length) {
+      // Don't reset posts we've already worked on
+      const { data: known } = await supabase.from("content_posts").select("shortcode, status").eq("tenant_id", tid).in("shortcode", rows.map((r) => r.shortcode));
+      const done = new Map((known ?? []).map((k: any) => [k.shortcode, k.status]));
+      const fresh = rows.map((r) => (done.has(r.shortcode) && done.get(r.shortcode) !== "seen" ? { ...r, status: done.get(r.shortcode) } : r));
+      await supabase.from("content_posts").upsert(fresh, { onConflict: "tenant_id,shortcode" });
+    }
+    await supabase.from("watched_accounts").update({ median_views: median, last_scraped_at: new Date().toISOString(), followers: Number(items?.[0]?.ownerFollowersCount ?? 0) || null }).eq("tenant_id", tid).eq("handle", run.handle);
+    await supabase.from("apify_runs").update({ status: "done" }).eq("id", run.id);
+  }
+  // 2. One outlier at a time: see why it worked → make it yours (best score first, max 6 a week)
+  const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+  const { count: doneThisWeek } = await supabase.from("content_posts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).in("status", ["ready", "to_film", "filmed", "skipped"]).gte("updated_at", weekAgo);
+  if ((doneThisWeek ?? 0) < 6) {
+    const { data: next } = await supabase.from("content_posts").select("*").eq("tenant_id", tid).eq("status", "queued").order("score", { ascending: false }).limit(1).maybeSingle();
+    if (next) {
+      await supabase.from("content_posts").update({ status: "analysing" }).eq("id", next.id).eq("status", "queued");
+      await analyseOutlier(tid, next);
+    }
+  }
+  // Tidy up: kept copies older than 60 days are removed (the post and idea stay)
+  if (Math.random() < 0.02) {
+    const { data: old } = await supabase.from("content_posts").select("id, ref_path, thumb_path").eq("tenant_id", tid).not("ref_path", "is", null).lt("updated_at", new Date(Date.now() - 60 * 86400000).toISOString()).limit(50);
+    const paths = (old ?? []).flatMap((o: any) => [o.ref_path, o.thumb_path].filter(Boolean));
+    if (paths.length) { await supabase.storage.from(CLIPS_BUCKET).remove(paths); await supabase.from("content_posts").update({ ref_path: null, thumb_path: null }).in("id", (old ?? []).map((o: any) => o.id)); }
+  }
+
+  // 3. When the week's batch is ready, one WhatsApp
+  const { count: running } = await supabase.from("apify_runs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("status", "running");
+  const { count: queued } = await supabase.from("content_posts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).in("status", ["queued", "analysing"]);
+  if (!running && !queued) {
+    const { data: ready } = await supabase.from("content_posts").select("handle, score, idea, source").eq("tenant_id", tid).eq("status", "ready").gte("updated_at", weekAgo).order("score", { ascending: false }).limit(5);
+    if (ready?.length) {
+      const wk = `${new Date().getUTCFullYear()}-w${Math.ceil(((Date.now() - Date.UTC(new Date().getUTCFullYear(), 0, 1)) / 86400000 + 1) / 7)}`;
+      if (await claim(tid, "ideas_msg", wk)) {
+        const lines = ready.map((r: any, i: number) => `${i + 1}. ${r.idea?.title ?? "Idea"} — from @${r.handle}${r.source === "own" ? " (one of yours)" : ""}, ${r.score}x their normal`);
+        await sendToTeam(tid, `💡 ${ready.length} idea${ready.length === 1 ? "" : "s"} that are working right now:\n${lines.join("\n")}\n\nReply "film 1 and 3" to add them to your filming list, or open Content to see why each one worked.`, "", "ideas");
+      }
+    }
+  }
+}
+
+// Gemini watches the video → plain-English breakdown; then Archie makes it yours
+async function analyseOutlier(tid: string, post: any) {
+  const key = Deno.env.get("GEMINI_API_KEY") ?? "";
+  const debug: string[] = [];
+  try {
+    let breakdown: any = null;
+    if (!key) debug.push("no GEMINI_API_KEY");
+    else {
+      const vid = await fetch(post.video_url, { headers: { "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148" } });
+      if (!vid.ok) debug.push(`video download ${vid.status} (Instagram links expire — will re-scrape next week)`);
+      else {
+        const buf = new Uint8Array(await vid.arrayBuffer());
+        const mime = vid.headers.get("content-type")?.split(";")[0] || "video/mp4";
+        debug.push(`video ${Math.round(buf.length / 1024)}KB ${mime}`);
+        // Keep a private copy so the original plays on the Content page (reference only — never reposted)
+        try {
+          const refPath = `refs/${tid}/${String(post.shortcode).replace(/[^a-zA-Z0-9_-]/g, "")}.mp4`;
+          const { error: ue } = await supabase.storage.from(CLIPS_BUCKET).upload(refPath, buf, { contentType: mime, upsert: true });
+          if (!ue) await supabase.from("content_posts").update({ ref_path: refPath }).eq("id", post.id);
+          if (post.thumb_url) {
+            const th = await fetch(post.thumb_url);
+            if (th.ok) {
+              const thPath = refPath.replace(/\.mp4$/, ".jpg");
+              const { error: te } = await supabase.storage.from(CLIPS_BUCKET).upload(thPath, new Uint8Array(await th.arrayBuffer()), { contentType: th.headers.get("content-type") || "image/jpeg", upsert: true });
+              if (!te) await supabase.from("content_posts").update({ thumb_path: thPath }).eq("id", post.id);
+            }
+          }
+        } catch (e) { debug.push(`keeping a copy failed: ${String(e).slice(0, 60)}`); }
+        const up = await fetch(`https://generativelanguage.googleapis.com/upload/v1beta/files?key=${key}`, {
+          method: "POST",
+          headers: { "X-Goog-Upload-Command": "start, upload, finalize", "X-Goog-Upload-Header-Content-Length": String(buf.length), "X-Goog-Upload-Header-Content-Type": mime, "Content-Type": mime },
+          body: buf,
+        });
+        const uj: any = await up.json().catch(() => null);
+        const fileName = uj?.file?.name, fileUri = uj?.file?.uri;
+        if (!fileName) debug.push(`gemini upload ${up.status}: ${JSON.stringify(uj).slice(0, 150)}`);
+        else {
+          let state = "";
+          for (let i = 0; i < 30; i++) {
+            const f: any = await fetch(`https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${key}`).then((r) => r.json()).catch(() => null);
+            state = String(f?.state ?? "");
+            if (state === "ACTIVE" || state === "FAILED") break;
+            await new Promise((ok) => setTimeout(ok, 3000));
+          }
+          if (state !== "ACTIVE") debug.push(`gemini file state ${state || "unknown"}`);
+          const ask = [
+            "Watch this short video. Explain in plain English why it did so well. Return ONLY JSON:",
+            '{"hook":"what happens in the first 3 seconds, with the exact opening words if spoken","format":"e.g. talking head, screen recording, list, story","steps":["the structure in 3-6 short steps"],"why_it_worked":["3 short reasons people watched to the end"],"payoff":"what the viewer gets at the end","spoken_summary":"2-3 sentences on what was said"}',
+            `Caption: ${String(post.caption ?? "").slice(0, 600)}`,
+          ].join("\n");
+          // Try the current Flash models in turn (Google renames them often)
+          const models = [...new Set([Deno.env.get("GEMINI_MODEL"), "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.1-flash-lite", "gemini-2.5-flash"].filter(Boolean) as string[])];
+          for (const model of models) {
+            const g = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ contents: [{ parts: [{ file_data: { mime_type: mime, file_uri: fileUri } }, { text: ask }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.4 } }),
+            });
+            const gj: any = await g.json().catch(() => null);
+            if (!g.ok) { debug.push(`${model}: ${g.status} ${String(gj?.error?.message ?? "").slice(0, 80)}`); continue; }
+            const txt = gj?.candidates?.[0]?.content?.parts?.map((x: any) => x.text ?? "").join("") ?? "";
+            try { breakdown = JSON.parse(txt.replace(/^```(?:json)?|```$/g, "").trim()); breakdown.model = model; break; }
+            catch { debug.push(`${model}: answer wasn't JSON`); }
+          }
+        }
+      }
+    }
+    if (!breakdown) breakdown = { hook: String(post.caption ?? "").split("\n")[0].slice(0, 160), format: "unknown", steps: [], why_it_worked: [], payoff: "", spoken_summary: "", from: "caption only" };
+    breakdown.debug = debug;
+
+    // Make it yours — asked for as simple labelled lines (more reliable than JSON)
+    const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+    const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
+    const agentId = await agentIdFor(tid, "content", token, loc);
+    let idea: any = null;
+    if (!agentId) debug.push("no Archie Content agent");
+    else {
+      const msg = [
+        "Turn this post that's working for someone else into an ORIGINAL idea for this business — the same reason it works, but their own topic, words and story. Never copy lines or claim their results.",
+        `It got ${post.views} views — ${post.score}x that account's normal (@${post.handle}).`,
+        `Why it worked: ${JSON.stringify({ hook: breakdown.hook, format: breakdown.format, steps: breakdown.steps, why_it_worked: breakdown.why_it_worked, payoff: breakdown.payoff, said: breakdown.spoken_summary }).slice(0, 2500)}`,
+        "",
+        await businessContext(tid),
+        "",
+        "Reply in EXACTLY this format, plain English, nothing else:",
+        "TITLE: short name for the idea",
+        "PILLAR: which of their content pillars",
+        "WHY: one line — the reason the original worked, in plain words",
+        "HOOK: the exact first line to say on camera",
+        "SCRIPT:",
+        "- line 1 to say",
+        "- line 2 to say",
+        "- (4 to 8 lines in total)",
+        "FILMING: one line — where and how to film it",
+        "CAPTION: a short caption with a call to action",
+      ].join("\n");
+      const res = await agentExecute(token, agentId, { locationId: loc, message: msg.slice(0, 9500) }, `ideas-${tid}-${Date.now()}`);
+      const out = tidy(clean(String(res.json?.finalText ?? "")));
+      if (!res.ok) debug.push(`content agent ${res.status}`);
+      const grab = (label: string) => out.match(new RegExp(`^\\s*\\**${label}\\**\\s*:\\s*(.+)$`, "im"))?.[1]?.replace(/\*+/g, "").trim() ?? "";
+      const scriptBlock = out.split(/^\s*\**SCRIPT\**\s*:?\s*$/im)[1]?.split(/^\s*\**(FILMING|CAPTION)\**\s*:/im)[0] ?? "";
+      const script = scriptBlock.split("\n").map((l) => l.replace(/^\s*(?:[-•*]|\d+[.)])\s*/, "").trim()).filter((l) => l.length > 2).slice(0, 10);
+      if (grab("TITLE") && grab("HOOK")) idea = { title: grab("TITLE"), pillar: grab("PILLAR"), why: grab("WHY"), hook: grab("HOOK"), script, filming_note: grab("FILMING"), caption: grab("CAPTION") };
+      else debug.push(`idea not in the expected format: ${out.slice(0, 120)}`);
+    }
+    await supabase.from("content_posts").update({ breakdown, idea, status: idea ? "ready" : "failed", updated_at: new Date().toISOString() }).eq("id", post.id);
+  } catch (e) {
+    await supabase.from("content_posts").update({ status: "failed", breakdown: { error: String(e).slice(0, 200), debug }, updated_at: new Date().toISOString() }).eq("id", post.id);
+  }
+}
+
+async function ideasList(tid: string, status: string) {
+  const st = ["ready", "to_film", "filmed", "skipped", "queued"].includes(status) ? status : "ready";
+  const { data } = await supabase.from("content_posts").select("id, handle, source, url, thumb_url, ref_path, thumb_path, views, likes, comments, score, posted_at, breakdown, idea, status").eq("tenant_id", tid).eq("status", st).order("score", { ascending: false }).limit(20);
+  // Private, short-lived links to the kept copies so the originals play on the page
+  const items = await Promise.all((data ?? []).map(async (x: any) => {
+    let video = "", thumb = x.thumb_url ?? "";
+    if (x.ref_path) { const { data: sv } = await supabase.storage.from(CLIPS_BUCKET).createSignedUrl(x.ref_path, 60 * 60 * 24); video = sv?.signedUrl ?? ""; }
+    if (x.thumb_path) { const { data: st2 } = await supabase.storage.from(CLIPS_BUCKET).createSignedUrl(x.thumb_path, 60 * 60 * 24); thumb = st2?.signedUrl ?? thumb; }
+    return { ...x, video_play_url: video, thumb_play_url: thumb };
+  }));
+  const { count: waiting } = await supabase.from("content_posts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).in("status", ["queued", "analysing"]);
+  const text = items.length
+    ? `${st === "to_film" ? "Your filming list" : "Ideas that are working"}:\n${items.slice(0, 8).map((x: any, i: number) => `${i + 1}. ${x.idea?.title ?? "Idea"} — @${x.handle}, ${x.score}x their normal\n   Hook: "${x.idea?.hook ?? ""}"`).join("\n")}`
+    : waiting ? `Archie's still working through ${waiting} post${waiting === 1 ? "" : "s"} — ideas soon.` : st === "to_film" ? "Nothing on your filming list yet." : "No new ideas yet — say \"find me ideas\" to look now.";
+  return { ok: true, items, waiting: waiting ?? 0, text };
+}
+
+async function ideaUpdate(tid: string, id: string, status: string) {
+  if (!["to_film", "filmed", "skipped", "ready"].includes(status)) return { ok: false, error: "status must be to_film, filmed, skipped or ready" };
+  const { error } = await supabase.from("content_posts").update({ status, updated_at: new Date().toISOString() }).eq("tenant_id", tid).eq("id", id);
+  return error ? { ok: false, error: error.message } : { ok: true };
 }
 
 // ===================== workflow side =====================
