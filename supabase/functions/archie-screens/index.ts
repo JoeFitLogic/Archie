@@ -1,4 +1,7 @@
-// archie-screens v6.3 — data and actions for the Archie AI Studio pages.
+// archie-screens v6.4 — data and actions for the Archie AI Studio pages.
+// v6.4: Archie Edit — upload a raw clip → Deepgram transcript with word timings → Archie's edit plan (best takes, hook,
+//       emphasis, overlays, zooms) → captions and cuts worked out exactly → Remotion Lambda render in the client's brand →
+//       MP4 into their GHL media → "📹 Your reel's ready". Monthly allowance per client. Schedule days accept mon,tue… too.
 // v6.3: usage + costs — every agent run is logged (job, time, size); usage action shows runs per job and an estimated
 //       cost per client per month (rate set by you); in the checkup and for all clients.
 // v6.2: security — each client can have its own workflow secret (the master secret still works for you and the scheduler);
@@ -223,6 +226,11 @@ Deno.serve(async (req) => {
       case "goals": return j(await getGoals(c.tid));
       case "checkup": return j(await checkup(c.tid));
       case "settings_get": return j(await settingsGet(c.tid));
+      case "edit_upload_url": return j(await editUploadUrl(c.tid, String(p.filename ?? "clip.mp4")));
+      case "edit_start": return j(await editStart(c.tid, c.owner?.handle ?? "owner", p));
+      case "edit_status": return j(await editStatus(c.tid, String(p.id ?? "")));
+      case "edit_list": { const { data } = await supabase.from("edit_jobs").select("id, title, status, output_url, ghl_media_url, error, created_at").eq("tenant_id", c.tid).order("created_at", { ascending: false }).limit(20); return j({ ok: true, jobs: data ?? [] }); }
+      case "edit_redo": return j(await editRedo(c.tid, String(p.id ?? ""), String(p.change ?? "")));
       case "usage": return j(await usage(c.tid, String(p.month ?? "")));
       case "pin_set": return j(await pinSet(c.tid, p));
       case "logout": { if (p.session) await supabase.from("page_sessions").delete().eq("tenant_id", c.tid).eq("token", String(p.session)); return j({ ok: true }); }
@@ -1769,10 +1777,12 @@ async function dispatch(_p: any) {
   const started: string[] = [];
   for (const t of tenants ?? []) {
     const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", t.id).maybeSingle();
+    try { await editFinishPending(t.id); } catch { /* never block the scheduler */ }
     if (!cfg || cfg.schedules_on !== true) continue; // opt-in per client, so nothing double-runs alongside GHL workflows
     const tz = cfg.timezone || "Europe/London";
     const now = localNow(tz);
-    const days = (v: unknown, fb: string) => String(v ?? fb).split(",").map((x) => Number(x.trim())).filter((x) => !isNaN(x));
+    const DAYN: Record<string, number> = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+    const days = (v: unknown, fb: string) => String(v || fb).split(",").map((x) => { const k = x.trim().toLowerCase(); return k.slice(0, 3) in DAYN ? DAYN[k.slice(0, 3)] : Number(k); }).filter((x) => !isNaN(x));
     const jobs: { job: string; due: boolean; key: string; action: string; body?: Record<string, unknown> }[] = [
       { job: "renewals", due: dueNow(now.minutes, hhmm(cfg.sched_renewals, "04:15")), key: now.date, action: "renewals_run" },
       { job: "morning", due: days(cfg.sched_morning_days, "0,1,2,3,4,5,6").includes(now.weekday) && dueNow(now.minutes, hhmm(cfg.sched_morning, "04:30")), key: now.date, action: "morning_run", body: { referral_link: String(cfg.referral_link ?? "") } },
@@ -3713,6 +3723,8 @@ const SETTINGS_FIELDS: Record<string, "text" | "int" | "bool" | "num" | "time" |
   sched_renewals: "time", sched_report: "time", sched_report_day: "int", sched_report_nightly: "time",
   sched_recurring: "time", sched_health: "time",
   won_creates_invoice: "bool", stale_threshold_days: "int", pipeline_name: "text", trial_stage_name: "text",
+  brand_primary: "text", brand_accent: "text", brand_text: "text", brand_logo_url: "text", caption_style: "text",
+  outro_text: "text", outro_sub: "text", edit_allowance: "int",
 };
 const SECRET_FIELDS = ["stripe_key", "fathom_api_key", "ghl_token"];
 
@@ -3861,6 +3873,223 @@ async function usage(tid: string, month: string) {
     ok: true, month: m, runs, est_cost_gbp: est, projected_month_gbp: projected, rate_per_run_gbp: rate, jobs,
     text: `Agent runs in ${m}: ${runs} (estimate £${est.toFixed(2)} so far, about £${projected.toFixed(2)} for the month at £${rate} a run).\n${jobs.slice(0, 10).map((j) => `${j.job}: ${j.runs} runs${j.failed ? `, ${j.failed} failed` : ""}, ~${j.avg_seconds}s each`).join("\n")}\n(Estimate — the real figure is on GHL's Agent Studio billing.)`,
   };
+}
+
+// ===================== v6.4: Archie Edit =====================
+import { renderMediaOnLambda, getRenderProgress } from "npm:@remotion/lambda-client@4.0.532";
+const CLIPS_BUCKET = "archie-clips";
+
+async function editUploadUrl(tid: string, filename: string) {
+  const safe = filename.toLowerCase().replace(/[^a-z0-9.\-_]/g, "-").slice(-60) || "clip.mp4";
+  const path = `${tid}/${Date.now()}-${safe}`;
+  const { data, error } = await supabase.storage.from(CLIPS_BUCKET).createSignedUploadUrl(path);
+  if (error || !data) return { ok: false, error: error?.message ?? "couldn't create upload link" };
+  return { ok: true, path, upload_url: data.signedUrl, token: data.token, how: "PUT the file to upload_url with Content-Type video/mp4 (or the file's type), then call edit_start with this path." };
+}
+
+async function editAllowanceLeft(tid: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("edit_allowance").eq("tenant_id", tid).maybeSingle();
+  const allowance = Number(cfg?.edit_allowance ?? 12) || 12;
+  const monthStart = `${new Date().toISOString().slice(0, 7)}-01T00:00:00Z`;
+  const { count } = await supabase.from("edit_jobs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).gte("created_at", monthStart).neq("status", "failed");
+  return { allowance, used: count ?? 0, left: Math.max(0, allowance - (count ?? 0)) };
+}
+
+async function editStart(tid: string, handle: string, p: any) {
+  const cap = await editAllowanceLeft(tid);
+  if (cap.left <= 0) return { ok: false, error: `You've used all ${cap.allowance} reel edits this month.` };
+  let sourceUrl = String(p.video_url ?? "").trim();
+  const path = String(p.path ?? "").trim();
+  if (!sourceUrl && path) {
+    const { data, error } = await supabase.storage.from(CLIPS_BUCKET).createSignedUrl(path, 60 * 60 * 24 * 3);
+    if (error || !data) return { ok: false, error: `can't read the upload: ${error?.message ?? "not found"}` };
+    sourceUrl = data.signedUrl;
+  }
+  if (!/^https?:\/\//.test(sourceUrl)) return { ok: false, error: "No video — upload a clip or pick one from your media." };
+  const { data: job, error } = await supabase.from("edit_jobs").insert({
+    tenant_id: tid, handle, source_url: sourceUrl, source_path: path || null, status: "transcribing",
+    title: String(p.title ?? "").slice(0, 120) || null, brief: String(p.brief ?? "").slice(0, 600) || null,
+  }).select("id").single();
+  if (error || !job) return { ok: false, error: error?.message ?? "couldn't start" };
+  startInBackground(editPipeline(tid, job.id));
+  return { ok: true, id: job.id, used: cap.used + 1, allowance: cap.allowance, text: "Got it — transcribing and editing now. Usually ready in 2–4 minutes." };
+}
+
+async function editRedo(tid: string, id: string, change: string) {
+  const { data: job } = await supabase.from("edit_jobs").select("*").eq("tenant_id", tid).eq("id", id).maybeSingle();
+  if (!job) return { ok: false, error: "edit not found" };
+  await supabase.from("edit_jobs").update({ status: "planning", change_request: change.slice(0, 600), render_id: null, output_url: null, error: null, updated_at: new Date().toISOString() }).eq("id", id);
+  startInBackground(editPipeline(tid, id, true));
+  return { ok: true, id, text: "Re-editing with your changes — a couple of minutes." };
+}
+
+async function editFail(id: string, msg: string) {
+  await supabase.from("edit_jobs").update({ status: "failed", error: msg.slice(0, 500), updated_at: new Date().toISOString() }).eq("id", id);
+}
+
+// Transcribe → plan → build props → start the render
+async function editPipeline(tid: string, id: string, replan = false) {
+  try {
+    const { data: job } = await supabase.from("edit_jobs").select("*").eq("id", id).single();
+    const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).single();
+    // 1. Transcript with word timings (Deepgram reads the video straight from its link)
+    let words: { w: string; s: number; e: number }[] = job.transcript?.words ?? [];
+    let duration = Number(job.transcript?.duration ?? 0);
+    if (!replan || !words.length) {
+      const key = Deno.env.get("DEEPGRAM_API_KEY");
+      if (!key) return editFail(id, "Transcription isn't set up (DEEPGRAM_API_KEY missing).");
+      const r = await fetch("https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&punctuate=true&language=en", {
+        method: "POST", headers: { Authorization: `Token ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ url: job.source_url }),
+      });
+      const js: any = await r.json().catch(() => null);
+      if (!r.ok) return editFail(id, `Transcription failed (${r.status}): ${JSON.stringify(js).slice(0, 200)}`);
+      const alt = js?.results?.channels?.[0]?.alternatives?.[0];
+      words = (alt?.words ?? []).map((x: any) => ({ w: String(x.punctuated_word ?? x.word), s: Number(x.start), e: Number(x.end) }));
+      duration = Number(js?.metadata?.duration ?? (words.length ? words[words.length - 1].e : 0));
+      if (!words.length) return editFail(id, "I couldn't hear any speech in that clip.");
+      await supabase.from("edit_jobs").update({ transcript: { words, duration }, status: "planning", updated_at: new Date().toISOString() }).eq("id", id);
+    }
+
+    // 2. Sentences with ids (the plan refers to these, never to raw times)
+    const sentences: { id: number; text: string; s: number; e: number; from: number; to: number }[] = [];
+    let cur: number[] = [];
+    words.forEach((w, i) => {
+      cur.push(i);
+      const gap = i + 1 < words.length ? words[i + 1].s - w.e : 9;
+      if (/[.!?]$/.test(w.w) || gap > 1.2 || cur.length >= 30) {
+        sentences.push({ id: sentences.length + 1, text: cur.map((k) => words[k].w).join(" "), s: words[cur[0]].s, e: words[cur[cur.length - 1]].e, from: cur[0], to: cur[cur.length - 1] });
+        cur = [];
+      }
+    });
+
+    // 3. Archie's edit plan
+    const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
+    const agentId = await agentIdFor(tid, "content", token, loc);
+    if (!agentId) return editFail(id, "Couldn't find the Archie Content agent.");
+    const msg = [
+      "You are editing a short vertical talking-head reel (Instagram/TikTok). Below are the sentences of the raw clip with ids and times.",
+      "Choose the strongest version: keep the best take of anything repeated, drop false starts, filler and dead air, and put the best hook first if a later sentence is a stronger opener. Aim for 20–60 seconds unless the content needs more.",
+      job.brief ? `The owner's brief: ${job.brief}` : "",
+      job.change_request ? `CHANGES REQUESTED to the last edit: ${job.change_request}` : "",
+      "Return ONLY JSON:",
+      '{"title":"short title","keep":[3,1,4,5],"emphasis":{"3":["word","word"]},"overlays":[{"type":"title|callout|stat|list|card","at":3,"text":"…","value":"for stat e.g. 3x","items":["for list"],"position":"top|middle|bottom","seconds":2.5}],"zooms":[4],"outro":{"text":"…","sub":"…"}}',
+      "keep = sentence ids in the order to play them. emphasis = 1–2 key words per kept sentence to colour. overlays: 2–4 max, short punchy text (under 6 words), only facts actually said. zooms = sentence ids to push in on (1–3). outro optional: a short call to action.",
+      "",
+      "SENTENCES:",
+      ...sentences.map((x) => `${x.id} [${x.s.toFixed(1)}–${x.e.toFixed(1)}s] ${x.text}`),
+    ].filter(Boolean).join("\n").slice(0, 9400);
+    const res = await agentExecute(token, agentId, { locationId: loc, message: msg }, `edit-${tid}-${Date.now()}`);
+    let plan: any = null;
+    try { const m = tidy(clean(String(res.json?.finalText ?? ""))).match(/\{[\s\S]*\}/); plan = m ? JSON.parse(m[0]) : null; } catch { plan = null; }
+    const keep: number[] = (Array.isArray(plan?.keep) ? plan.keep : sentences.map((x) => x.id)).map(Number).filter((n: number) => sentences.some((x) => x.id === n));
+    if (!keep.length) return editFail(id, "The edit plan came back empty — try again.");
+
+    // 4. Cuts and captions worked out exactly from the word timings (pauses over 0.45s inside a sentence are cut too)
+    const cuts: { start: number; end: number }[] = [];
+    const captions: { text: string; start: number; end: number; emphasis: string[] }[] = [];
+    const sentStart = new Map<number, number>();
+    let t = 0;
+    for (const sid of keep) {
+      const snt = sentences.find((x) => x.id === sid)!;
+      sentStart.set(sid, t);
+      const emph: string[] = (plan?.emphasis?.[String(sid)] ?? []).map(String);
+      // Fillers (um, uh, erm…) are cut out completely
+      const FILLER = /^(u+m+|u+h+|e+r+m*|a+h+|hmm+)[,.!?]?$/i;
+      const idx: number[] = [];
+      for (let k = snt.from; k <= snt.to; k++) if (!FILLER.test(words[k].w)) idx.push(k);
+      if (!idx.length) continue;
+      let segStart = Math.max(0, words[idx[0]].s - 0.06), groupStart = t, group: string[] = [];
+      for (let q = 0; q < idx.length; q++) {
+        const k = idx[q];
+        const w = words[k];
+        const next = q + 1 < idx.length ? words[idx[q + 1]] : undefined;
+        const skipped = next ? idx[q + 1] - k > 1 : false; // a filler sat between these two words
+        const pause = next ? next.s - w.e : 0;
+        const segEndHere = !next || pause > 0.45 || skipped;
+        group.push(w.w);
+        const wordEndOut = t + (w.e + (segEndHere ? 0.08 : 0) - segStart);
+        if (group.length >= 4 || segEndHere || /[,.!?]$/.test(w.w)) {
+          captions.push({ text: group.join(" ").replace(/[.]$/, ""), start: groupStart, end: wordEndOut, emphasis: emph });
+          group = []; groupStart = wordEndOut;
+        }
+        if (segEndHere) {
+          const segEnd = Math.min(duration || w.e + 0.1, w.e + 0.08);
+          cuts.push({ start: Number(segStart.toFixed(3)), end: Number(segEnd.toFixed(3)) });
+          t += segEnd - segStart;
+          if (next) { segStart = Math.max(0, next.s - 0.06); groupStart = t; }
+        }
+      }
+    }
+    const total = t;
+    const overlays = (Array.isArray(plan?.overlays) ? plan.overlays : []).slice(0, 4).map((o: any) => {
+      const at = sentStart.get(Number(o.at)) ?? 0;
+      return { type: ["title", "callout", "stat", "list", "card"].includes(o.type) ? o.type : "callout", text: String(o.text ?? "").slice(0, 60), value: o.value ? String(o.value).slice(0, 10) : undefined, items: Array.isArray(o.items) ? o.items.map(String).slice(0, 4) : undefined, start: at + 0.2, end: Math.min(total, at + 0.2 + (Number(o.seconds) || 2.5)), position: ["top", "middle", "bottom"].includes(o.position) ? o.position : "top" };
+    }).filter((o: any) => o.text || o.value);
+    const zooms = (Array.isArray(plan?.zooms) ? plan.zooms : []).slice(0, 3).map((zid: any) => { const st = sentStart.get(Number(zid)); return st === undefined ? null : { start: st, end: Math.min(total, st + 2.2), scale: 1.12 }; }).filter(Boolean);
+    const outroSecs = 2.5;
+    const props = {
+      videoUrl: job.source_url, cuts, captions, overlays, zooms,
+      brand: { primary: cfg?.brand_primary || "#E0312B", accent: cfg?.brand_accent || "#FFFFFF", text: cfg?.brand_text || "#FFFFFF", logoUrl: cfg?.brand_logo_url || undefined },
+      progressBar: true, captionStyle: cfg?.caption_style === "clean" ? "clean" : "bold",
+      ...(plan?.outro?.text || cfg?.outro_text ? { outro: { text: String(cfg?.outro_text || plan.outro.text).slice(0, 40), sub: String(cfg?.outro_sub || plan?.outro?.sub || "").slice(0, 60), seconds: outroSecs } } : {}),
+    };
+
+    // 5. Render on Remotion Lambda (few chunks — new AWS accounts allow ~10 at once)
+    const frames = Math.max(30, Math.round(total * 30));
+    const render = await renderMediaOnLambda({
+      region: (Deno.env.get("REMOTION_REGION") ?? "eu-west-2") as any,
+      functionName: Deno.env.get("REMOTION_FUNCTION")!,
+      serveUrl: Deno.env.get("REMOTION_SERVE_URL")!,
+      composition: "ArchieReel", inputProps: props, codec: "h264", privacy: "no-acl",
+      framesPerLambda: Math.max(90, Math.ceil(frames / 4)),
+      outName: `archie-${tid.slice(0, 8)}-${id.slice(0, 8)}.mp4`,
+    } as any);
+    await supabase.from("edit_jobs").update({
+      status: "rendering", plan, props, render_id: render.renderId, bucket: render.bucketName,
+      title: job.title || String(plan?.title ?? "").slice(0, 120) || null, seconds: Math.round(total), updated_at: new Date().toISOString(),
+    }).eq("id", id);
+  } catch (e) {
+    await editFail(id, `Edit failed: ${String(e).slice(0, 300)}`);
+  }
+}
+
+// Check a render; when it's done, save the MP4 into their GHL media and tell them
+async function editStatus(tid: string, id: string) {
+  const { data: job } = await supabase.from("edit_jobs").select("*").eq("tenant_id", tid).eq("id", id).maybeSingle();
+  if (!job) return { ok: false, error: "edit not found" };
+  if (job.status === "rendering" && job.render_id) await editCheck(tid, job);
+  const { data: now } = await supabase.from("edit_jobs").select("id, title, status, output_url, ghl_media_url, error, seconds, progress").eq("id", id).single();
+  return { ok: true, job: now };
+}
+
+async function editCheck(tid: string, job: any) {
+  try {
+    const pr: any = await getRenderProgress({ renderId: job.render_id, bucketName: job.bucket, functionName: Deno.env.get("REMOTION_FUNCTION")!, region: (Deno.env.get("REMOTION_REGION") ?? "eu-west-2") as any } as any);
+    if (pr.fatalErrorEncountered) return editFail(job.id, `Render failed: ${String(pr.errors?.[0]?.message ?? "unknown").slice(0, 300)}`);
+    if (!pr.done) { await supabase.from("edit_jobs").update({ progress: Math.round((pr.overallProgress ?? 0) * 100) }).eq("id", job.id); return; }
+    const url = String(pr.outputFile ?? "");
+    // Into their GHL media library (by link, so nothing is downloaded here)
+    const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+    let mediaUrl = "";
+    try {
+      const fd = new FormData();
+      fd.append("hosted", "true"); fd.append("fileUrl", url); fd.append("name", `${job.title || "Archie reel"} (${new Date().toISOString().slice(0, 10)}).mp4`);
+      const up = await fetch(`https://services.leadconnectorhq.com/medias/upload-file?altType=location&altId=${cfg?.ghl_location_id}`, { method: "POST", headers: { Authorization: `Bearer ${cfg?.ghl_token || FALLBACK_TOKEN}`, Version: "2021-07-28" }, body: fd });
+      const uj: any = await up.json().catch(() => null);
+      mediaUrl = String(uj?.url ?? uj?.fileUrl ?? "");
+    } catch { /* the S3 link still works */ }
+    await supabase.from("edit_jobs").update({ status: "done", output_url: url, ghl_media_url: mediaUrl || null, progress: 100, updated_at: new Date().toISOString() }).eq("id", job.id);
+    const { data: m } = await supabase.from("team_members").select("ghl_contact_id").eq("tenant_id", tid).eq("handle", job.handle).maybeSingle();
+    if (m?.ghl_contact_id) {
+      const { data: c2 } = await supabase.from("tenant_config").select("ghl_token, brief_channel").eq("tenant_id", tid).single();
+      await ghl(c2?.ghl_token || FALLBACK_TOKEN, "/conversations/messages", "POST", { type: String(c2?.brief_channel ?? "").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS", contactId: m.ghl_contact_id, message: `📹 Your reel's ready${job.title ? `: ${job.title}` : ""} (${job.seconds ?? "?"}s)\n${mediaUrl || url}\n\nReply with any changes ("shorter", "different hook", "no list") or post it from the Skills page.` }, "2021-04-15");
+    }
+  } catch (e) { await supabase.from("edit_jobs").update({ error: `progress check: ${String(e).slice(0, 200)}` }).eq("id", job.id); }
+}
+
+async function editFinishPending(tid: string) {
+  const { data: jobs } = await supabase.from("edit_jobs").select("*").eq("tenant_id", tid).eq("status", "rendering").limit(5);
+  for (const j of jobs ?? []) await editCheck(tid, j);
 }
 
 // ===================== workflow side =====================
