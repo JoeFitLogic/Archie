@@ -1,4 +1,7 @@
-// capture v6.8 — everything the owner or team texts (or voice-notes) to Archie.
+// capture v7.1 — everything the owner or team texts (or voice-notes) to Archie.
+// v7.1: screenshots/photos with no "save" → Archie reads them and acts; videos with "a week of content" / "cut into reels" → several reels + a carousel.
+// v7.0: "edit, this is idea 2" links the video to number 2 on the filming list.
+// v6.9: videos and photos sent on WhatsApp are saved into GHL Media; say "edit" with a video and Archie Edit makes it a reel.
 // capture v6.8: accepts each client's own workflow secret as well as the master secret.
 // Quick commands (instant, free) — as v5:
 // task: / <handle>: / capacity: / done: <text>
@@ -52,7 +55,7 @@ async function secretOk(header: string | null, tenantId: string): Promise<boolea
 }
 
 Deno.serve(async (req) => {
-  console.log("capture v6.7 start");
+  console.log("capture v7.1 start");
   try {
     const raw = await req.json();
     const p = { ...raw, ...(raw.customData ?? {}) };
@@ -64,6 +67,48 @@ Deno.serve(async (req) => {
     if (!tenant_id) return j({ ok: true, reply: "" });
 
     const { data: cfg } = await supabase.from("tenant_config").select("timezone, ghl_token, ghl_location_id").eq("tenant_id", tenant_id).single();
+
+    // Videos and photos → save to GHL Media (and "edit" → Archie Edit). Checked only when the message could be media.
+    const MEDIA_HINT = /^\s*$|^[^a-z]*\b(video|image|photo|picture|document|file|attachment|media)\b[^a-z]*$|\b(save|media|edit|upload|store|keep)\b/i;
+    if (MEDIA_HINT.test(text) && senderContact) {
+      const media = await latestMedia(cfg?.ghl_token || FALLBACK_TOKEN, cfg?.ghl_location_id, senderContact, str(p.message_id), [p.attachments, raw.attachments, raw.message?.attachments]);
+      console.log("media check:", JSON.stringify({ found: media?.kind ?? null, text: text.slice(0, 40) }));
+      if (media) {
+        const { data: team } = await supabase.from("team_members").select("handle, ghl_contact_id, phone, talk_mode, talk_until, gets_financials").eq("tenant_id", tenant_id).neq("active", false);
+        const who = (team ?? []).find((m: any) => m.ghl_contact_id === senderContact || (m.phone && m.phone.replace(/\s+/g, "") === senderPhone));
+        if (!who) return j({ ok: true, reply: "", skipped: "sender not on team" });
+        const wmode = String(who.talk_mode ?? (who.gets_financials ? "all" : "wake")).toLowerCase();
+        const open = who.talk_until && Date.parse(String(who.talk_until)) > Date.now();
+        if (wmode === "off" || (wmode === "wake" && !/^(?:hey\s+|hi\s+|ok\s+)?@?archie\b/i.test(text) && !open)) return j({ ok: true, reply: "", skipped: "media from team member without wake word" });
+        const caption = text.replace(/^(?:hey\s+|hi\s+|ok\s+)?@?archie\b[\s,:!.-]*/i, "").trim();
+        const named = caption.match(/\b(?:as|call it|name it|called)\s+["']?(.+?)["']?\s*$/i)?.[1];
+        const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
+        const name = `${(named || (media.kind === "video" ? "WhatsApp video" : media.kind === "image" ? "WhatsApp photo" : "WhatsApp file")).slice(0, 80)} (${stamp})${media.ext ? `.${media.ext}` : ""}`;
+        // A picture without "save" → Archie reads it and acts (lead, tasks, reply draft)
+        const wantsSave = /\b(save|keep|store|upload|media)\b/i.test(caption) || !!named;
+        if (media.kind === "image" && !wantsSave) {
+          const r = await fetch(`${SUPA_URL}/functions/v1/archie-screens`, {
+            method: "POST", headers: { "Content-Type": "application/json", "x-archie-secret": SECRET },
+            body: JSON.stringify({ action: "screenshot", tenant_id, handle: who.handle, image_url: media.url, instruction: caption }),
+          });
+          const rj: any = await r.json().catch(() => null);
+          return j({ ok: true, reply: String(rj?.text ?? "I couldn't read that one — try again, or say \"save\" to keep it in your media."), has_reply: "yes" });
+        }
+        const saved = await saveToMedia(cfg?.ghl_token || FALLBACK_TOKEN, cfg?.ghl_location_id, media.url, name);
+        const wantsMulti = media.kind === "video" && /week of content|a week|several reels|multiple reels|cut (it|this) (up|into)|into reels|lots of reels/i.test(caption);
+        const wantsEdit = media.kind === "video" && (wantsMulti || /\bedit\b|\breel\b|\bcut\b/i.test(caption));
+        if (wantsEdit) {
+          const r = await fetch(`${SUPA_URL}/functions/v1/archie-screens`, {
+            method: "POST", headers: { "Content-Type": "application/json", "x-archie-secret": SECRET },
+            body: JSON.stringify({ action: "edit_start", tenant_id, handle: who.handle, multi: wantsMulti, video_url: saved.url || media.url, title: named || "", idea_number: Number(caption.match(/\bidea\s*(?:number\s*|no\.?\s*|#)?(\d{1,2})\b/i)?.[1] ?? 0) || undefined, brief: caption.replace(/\b(please|edit( this| it)?|make (this|it) a reel)\b/gi, "").replace(/\b(?:this is\s+)?idea\s*(?:number\s*|no\.?\s*|#)?\d{1,2}\b/gi, "").trim() }),
+          });
+          const rj: any = await r.json().catch(() => null);
+          if (!rj?.ok) return j({ ok: true, reply: `📁 Saved to your media${saved.ok ? "" : " (or tried to)"} — but I couldn't start the edit: ${rj?.error ?? r.status}`, has_reply: "yes" });
+          return j({ ok: true, reply: wantsMulti ? `🎬 Got it — saved to your media. I'm finding the best moments to turn into several reels (and a carousel). They'll arrive one by one over the next 10 minutes.` : `🎬 Got it — saved to your media and editing now${rj.idea_title ? ` (your take on "${rj.idea_title}")` : ""}. I'll send the reel back in a few minutes.${rj.allowance ? ` (${rj.allowance - rj.used} edits left this month)` : ""}`, has_reply: "yes" });
+        }
+        return j({ ok: true, reply: saved.ok ? `📁 Saved to your media: ${name}${media.kind === "video" ? `\nWant a reel from it? Send a video with "edit" and Archie edits it for you.` : ""}` : `I couldn't save that to your media just now (${saved.error}). Try again in a minute.`, has_reply: "yes" });
+      }
+    }
 
     // Voice note → find the audio and transcribe it. It can arrive as: no text, a placeholder like "Voice message",
     // an audio link in the text, attachments in the payload, or only in GHL's copy of the message.
@@ -417,3 +462,47 @@ function str(v: unknown): string {
   return String(v);
 }
 function j(b: unknown, s = 200) { return new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json" } }); }
+
+// Find a video, photo or file in this message (payload, the GHL message, or their latest message). Voice notes are left alone.
+async function latestMedia(token: string, loc: string | undefined, contactId: string, messageId: string, payload: any[]): Promise<{ url: string; kind: "video" | "image" | "file"; ext: string } | null> {
+  const classify = (u: string, hint = ""): { kind: "video" | "image" | "file"; ext: string } | null => {
+    const ext = (u.split("?")[0].match(/\.([a-z0-9]{2,5})$/i)?.[1] ?? "").toLowerCase();
+    if (["mp4", "mov", "m4v", "3gp", "mkv", "avi"].includes(ext) || /video/i.test(hint)) return { kind: "video", ext: ext || "mp4" };
+    if (["jpg", "jpeg", "png", "webp", "heic", "gif"].includes(ext) || /image|photo/i.test(hint)) return { kind: "image", ext: ext || "jpg" };
+    if (["ogg", "oga", "opus", "mp3", "m4a", "aac", "wav", "amr"].includes(ext) || /audio|voice/i.test(hint)) return null; // a voice note
+    if (["pdf", "doc", "docx", "xls", "xlsx", "csv", "ppt", "pptx", "zip"].includes(ext)) return { kind: "file", ext };
+    return null;
+  };
+  const urls = (atts: any[]) => (atts ?? []).flatMap((a) => (Array.isArray(a) ? a : [a])).map((a) => (typeof a === "string" ? a : a?.url ?? "")).filter((u) => /^https?:/.test(u));
+  for (const u of urls(payload.flatMap((x) => (x ? (Array.isArray(x) ? x : [x]) : [])))) { const c = classify(u); if (c) return { url: u, ...c }; }
+  if (messageId) {
+    const m = await ghl(token, `/conversations/messages/${messageId}`, "GET");
+    const msg = m.json?.message ?? m.json ?? {};
+    for (const u of urls(msg.attachments ?? [])) { const c = classify(u, String(msg.contentType ?? msg.messageType ?? "")); if (c) return { url: u, ...c }; }
+  }
+  if (!loc) return null;
+  const cs = await ghl(token, `/conversations/search?locationId=${loc}&contactId=${contactId}&limit=1`, "GET");
+  const conv = (cs.json?.conversations ?? [])[0];
+  if (!conv?.id) return null;
+  const ms = await ghl(token, `/conversations/${conv.id}/messages?limit=5`, "GET");
+  const list: any[] = ms.json?.messages?.messages ?? ms.json?.messages ?? [];
+  const since = Date.now() - 10 * 60 * 1000;
+  for (const m of Array.isArray(list) ? list : []) {
+    if (String(m.direction ?? "").toLowerCase() !== "inbound") continue;
+    if (m.dateAdded && Date.parse(m.dateAdded) < since) continue;
+    for (const u of urls(m.attachments ?? [])) { const c = classify(u, String(m.contentType ?? m.messageType ?? "")); if (c) return { url: u, ...c }; }
+  }
+  return null;
+}
+
+// Save a file into GHL Media by its link (GHL fetches it — nothing is downloaded here)
+async function saveToMedia(token: string, loc: string | undefined, url: string, name: string): Promise<{ ok: boolean; url: string; error?: string }> {
+  try {
+    const fd = new FormData();
+    fd.append("hosted", "true"); fd.append("fileUrl", url); fd.append("name", name);
+    const r = await fetch(`https://services.leadconnectorhq.com/medias/upload-file?altType=location&altId=${loc}`, { method: "POST", headers: { Authorization: `Bearer ${token}`, Version: "2021-07-28" }, body: fd });
+    const js: any = await r.json().catch(() => null);
+    if (!r.ok) return { ok: false, url: "", error: `${r.status} ${JSON.stringify(js).slice(0, 120)}` };
+    return { ok: true, url: String(js?.url ?? js?.fileUrl ?? "") };
+  } catch (e) { return { ok: false, url: "", error: String(e).slice(0, 120) }; }
+}

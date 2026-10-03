@@ -1,4 +1,49 @@
-// archie-screens v6.9 — data and actions for the Archie AI Studio pages.
+// archie-screens v8.0 — data and actions for the Archie AI Studio pages.
+// v8.0: cost alert — each client's projected cost this month (AI runs + reels, carousels, stories, ideas, screenshots,
+//       voice) against their budget (default £105 = £297 − £175 profit − £17 hosting); amber at 70%, red at 100%, on the
+//       Clients page and a WhatsApp to you once per level per month.
+// v7.9: Edit v2 polish — cards start on their cue word and stay 2–3s, a natural 0.8s hold at the end, optional soft card
+//       sound + licensed music bed (Settings), the cut check also catches doubled words, and the final check scores the
+//       reel out of 100 against the editing rules.
+// v7.8: plans — Archie (£297, monthly limits) and Archie Plus (£397, unlimited, fair use). One allowance check for every
+//       limited feature, a friendly message + upgrade line when a limit is reached, usage on Settings and the Clients page.
+// v7.7.1: style breakdown — give Archie reel links; it fetches each reel (Apify), Gemini studies the edit (captions,
+//         pacing, zooms, hook, graphics, sound, colour) and saves a precise style spec (the base for style presets and
+//         "match the vibe"). WhatsApp: "break down these reels: <links>".
+// v7.7: Archie Edit v2 (per client: edit_engine = v2) — a designed card for most sentences, caption styles (karaoke /
+//       bold / single word), framing and zooms centred on the face (face check on a frame), clean audio (ElevenLabs voice
+//       isolator), a no-chopped-words check after rendering (re-transcribe; widen the cuts and re-render once if needed)
+//       and a final quality check (Gemini watches the finished reel) before it's sent.
+// v7.6.2: cancelled or paused clients are refused on every workflow route too (WhatsApp, edits, screenshots,
+//         scheduled jobs) — not just the pages and the toolbox.
+// v7.6.1: screenshots work in the background — WhatsApp gets "reading that now" straight away and the result is messaged
+//         when it's ready (GHL was giving up waiting, so no reply arrived).
+// v7.6: one engine — captions, client messages (follow-ups, check-ins, chases), win-back, call prep, carousel/story copy
+//       and "make it yours" now run through their skills (caption, client-message, win-back, pre-call-brief,
+//       create-carousel editorial mode, create-reel-script make-it-yours mode). The code sends the facts and the answer
+//       format only; the skill holds the writing rules — so improving a skill improves it everywhere.
+// v7.5.2: carousel/story photos fall back to OpenAI's image model when Gemini can't make one (quota, billing or a
+//         renamed model), and every model's error is recorded so it's clear which one failed and why.
+// v7.5.1: forgiving JSON reader for agent replies (line breaks and stray characters inside text no longer break
+//         carousels, edit plans, dumps or win-back); carousels retry the copy once if it still can't be read.
+// v7.5: drop 2 — one ramble → a week of content (several reels + a carousel from one long video), screenshot anything
+//       (Archie reads the picture and acts: lead, task, reply draft), the morning brief as a voice note, and "win back
+//       everyone who left" (personal drafts for every cancelled client, from Stripe and their history).
+// v7.4: drop 1 — IG story builder (9:16 frames, same pipeline as carousels), "what Archie did for you" in £ and hours
+//       (monthly receipt + "your month in 30 seconds" video), quiet alerts for every client, activation numbers per client.
+// v7.3: feature usage + feedback — every skill and feature used (page, WhatsApp, voice) is logged; thumbs up/down and
+//       comments on anything Archie made (page or "that caption was too salesy"); a feature report across all clients:
+//       most and least used, never used (removal candidates), feedback and comments.
+// v7.2: carousel builder — a topic (or your own copy) → a 7-slide editorial campaign: Archie writes each slide (counter,
+//       headline, supporting copy, a photo brief), Gemini makes each photo with NO text, Remotion sets the typography on a
+//       fixed 12-column grid (always crisp, same position every slide), slides go to GHL Media; "post it" → Social Planner.
+// v7.1: Forge auto-scheduling (Motion-style) — reads each person's calendar, finds the free time inside their working
+//       hours, and places tasks into slots (carried-over first, then due date, then must/high/bonus; deep work in the
+//       mornings); re-plans before the brief, every hour when tasks or calendar change, and on "replan my day"; optional
+//       task blocks on their personal calendar (syncs to Google); today's plan in the brief; "won't fit" warnings.
+// v7.0: content loop + auto call prep — "Upload my take" / "edit, this is idea 2": Archie Edit gets the idea's hook and
+//       script, titles the reel, starts from the idea's caption and marks the idea filmed; page uploads also go into GHL
+//       Media. Call prep arrives on WhatsApp ~30 minutes before each booked call (not personal events).
 // v6.9: onboarding coach — for the first 30 days Archie sends the owner one short tip a day (14 tips, then weekly), skipping
 //       anything they've already used; the control panel shows days since they last talked to Archie and alerts you (and
 //       Sara) when a client in their first 30 days goes quiet for 2+ days.
@@ -169,6 +214,11 @@ Deno.serve(async (req) => {
       }
       if (action === "dispatch") return j(await dispatch(p));
       if (!tenant_id) return j({ error: "tenant_id required" }, 400);
+      // Cancelled or paused clients get nothing (the agency's own checks still run through dispatch, which only sees active clients)
+      {
+        const { data: tst } = await supabase.from("tenants").select("status").eq("id", tenant_id).maybeSingle();
+        if (!tst || tst.status !== "active") return j({ ok: true, skipped: `client is ${tst?.status ?? "unknown"}` });
+      }
       if (action === "run_next") return j(await runNext(tenant_id, String(p.kind ?? "")));
       if (action === "run_finish") return j(await runFinish(tenant_id, p));
       if (action === "plan_context") return j(await planContext(tenant_id));
@@ -190,12 +240,28 @@ Deno.serve(async (req) => {
         return j({ ok: true, month: String(p.month ?? "") || new Date().toISOString().slice(0, 7), tenants: out, total_gbp: Math.round(out.reduce((a, x) => a + (x.est_cost_gbp || 0), 0) * 100) / 100 });
       }
       if (action === "edit_start") {
+        startInBackground(logFeature(tenant_id, "edit_start", "whatsapp", String(p.handle ?? "") || null));
         const { data: own } = await supabase.from("team_members").select("handle").eq("tenant_id", tenant_id).eq("gets_financials", true).maybeSingle();
         return j(await editStart(tenant_id, String(p.handle ?? own?.handle ?? "owner"), p));
       }
       if (action === "ideas_run") return j(await ideasFindNow(tenant_id));
       if (action === "ig_sync_run") return j(await igSync(tenant_id));
       if (action === "coach_run") return j(await coachRun(tenant_id, p));
+      if (action === "forge_plan") return j(await forgePlan(tenant_id, { force: true }));
+      if (action === "screenshot") {
+        startInBackground(logFeature(tenant_id, "screenshot", "whatsapp", String(p.handle ?? "") || null));
+        // Answer straight away; read the picture in the background and message the result (GHL won't wait 30s+)
+        startInBackground((async () => {
+          const handle = String(p.handle ?? "");
+          let r: any;
+          try { r = await screenshotAct(tenant_id, handle, String(p.image_url ?? ""), String(p.instruction ?? "")); }
+          catch (e) { r = { ok: false, text: `I couldn't read that screenshot (${String(e).slice(0, 80)}). Try again, or say "save" to keep it in your media.` }; }
+          const { data: m } = await supabase.from("team_members").select("ghl_contact_id").eq("tenant_id", tenant_id).eq("handle", handle).maybeSingle();
+          const { data: c2 } = await supabase.from("tenant_config").select("ghl_token, brief_channel").eq("tenant_id", tenant_id).single();
+          if (m?.ghl_contact_id) await ghl(c2?.ghl_token || FALLBACK_TOKEN, "/conversations/messages", "POST", { type: String(c2?.brief_channel ?? "").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS", contactId: m.ghl_contact_id, message: String(r?.text ?? "Done.") }, "2021-04-15");
+        })());
+        return j({ ok: true, text: "📸 Reading that now — give me a moment." });
+      }
       if (action === "recurring_run") { const r = await recurringRun(tenant_id); return j({ ok: true, ...r }); }
       if (action === "health_run") { startInBackground(memberHealthRun(tenant_id)); return j({ ok: true, started: true }); }
       if (action === "report_nightly_run") { startInBackground(weeklyReport(tenant_id, { week: "this", refresh: "yes" })); return j({ ok: true, started: true }); }
@@ -234,6 +300,10 @@ Deno.serve(async (req) => {
       if (!ok) return j({ ok: false, error: "login_required" }, 401);
     }
     const c = await context(tenant.id);
+    // Usage log for anything that does something (reads aren't counted)
+    if (!/^(overview|.*_list|.*_get|.*_status|settings_get|usage|agency_overview|pin_login|logout|runs|run_get|pick_.*|ideas_accounts|feature_report|groups_list|memory_list)$/.test(action)) {
+      startInBackground(logFeature(tenant.id, action === "run" ? `skill:${String(p.skill ?? p.key ?? "unknown")}` : action, p.session ? "page" : "toolbox", c.owner?.handle ?? null));
+    }
 
     switch (action) {
       case "overview": return j(await overview(c, p));
@@ -266,6 +336,21 @@ Deno.serve(async (req) => {
       case "ig_disconnect": { await supabase.from("ig_connections").delete().eq("tenant_id", c.tid); return j({ ok: true, text: "Instagram disconnected." }); }
       case "ig_sync": return j(await igSync(c.tid));
       case "coach_status": return j(await coachStatus(c.tid));
+      case "forge_plan": return j(await forgePlan(c.tid, { force: true }));
+      case "carousel_start": return j(await carouselStart(c.tid, c.owner?.handle ?? "owner", p));
+      case "carousel_get": return j(await carouselGet(c.tid, String(p.id ?? "")));
+      case "carousel_list": { const { data } = await supabase.from("carousels").select("id, topic, status, slides, created_at, planner_post_id, caption").eq("tenant_id", c.tid).order("created_at", { ascending: false }).limit(20); return j({ ok: true, carousels: data ?? [] }); }
+      case "carousel_redo_slide": return j(await carouselRedoSlide(c.tid, String(p.id ?? ""), Number(p.n ?? 0), p));
+      case "carousel_post": return j(await carouselPost(c.tid, String(p.id ?? "")));
+      case "feedback": return j(await saveFeedback(c.tid, c.owner?.handle ?? null, p));
+      case "plan_usage": return j(await planUsage(c.tid));
+      case "style_breakdown": { const urls = (Array.isArray(p.urls) ? p.urls : String(p.urls ?? "").split(/\s+/)).filter((u: string) => /instagram\.com\/(reel|p)\//.test(u)).slice(0, 6); startInBackground(styleBreakdown(c.tid, urls, true)); return j({ ok: true, text: `Breaking down ${urls.length} reel${urls.length === 1 ? "" : "s"} — about 2–4 minutes.` }); }
+      case "style_specs": { const { data } = await supabase.from("style_specs").select("id, url, spec, created_at").eq("tenant_id", c.tid).order("created_at", { ascending: false }).limit(20); return j({ ok: true, specs: data ?? [] }); }
+      case "screenshot": return j(await screenshotAct(c.tid, c.owner?.handle ?? "owner", String(p.image_url ?? ""), String(p.instruction ?? "")));
+      case "winback": return j(await winBack(c.tid, Number(p.months ?? 12)));
+      case "feature_report": return j(await featureReport(c.tid, Number(p.days ?? 30)));
+      case "forge_plan_get": return j(await forgePlanGet(c.tid, String(p.handle ?? ""), Number(p.days ?? 5)));
+      case "forge_hours_save": return j(await forgeHoursSave(c.tid, p));
       case "ig_results": return j(await igResults(c.tid, Number(p.days ?? 60)));
       case "agency_overview": return j(await agencyOverview(c.tid));
       case "ideas_accounts": { const { data } = await supabase.from("watched_accounts").select("handle, platform, followers, median_views, last_scraped_at, active").eq("tenant_id", c.tid).eq("active", true).order("handle"); return j({ ok: true, accounts: data ?? [] }); }
@@ -853,7 +938,9 @@ async function toPlanner(c: any, p: any) {
   const body: Record<string, unknown> = { type, status: "draft", accountIds: accounts.map((a) => a.id), userId };
   // Stories can't carry a caption, so the text goes in as the follow-up comment instead
   if (type !== "story") body.summary = text.slice(0, 2200);
-  if (mediaUrl) body.media = [{ url: mediaUrl, type: String(p.media_type ?? (type === "post" ? "image/jpeg" : "video/mp4")) }];
+  const many: string[] = Array.isArray(p.media_urls) ? p.media_urls.map(String).filter(Boolean).slice(0, 10) : [];
+  if (many.length) body.media = many.map((u) => ({ url: u, type: String(p.media_type ?? "image/png") }));
+  else if (mediaUrl) body.media = [{ url: mediaUrl, type: String(p.media_type ?? (type === "post" ? "image/jpeg" : "video/mp4")) }];
   if (type === "story" && text) body.followUpComment = text.slice(0, 500);
 
   const r = await ghl(c.ghlToken, `/social-media-posting/${loc}/posts`, "POST", body, "2021-07-28");
@@ -1352,7 +1439,7 @@ async function briefRun(tid: string, p: any) {
     const [{ data: cfg }, { data: t }, { data: team }] = await Promise.all([
       supabase.from("tenant_config").select("ghl_location_id, ghl_token, timezone, brief_channel, csm_handle").eq("tenant_id", tid).single(),
       supabase.from("tenants").select("location_id, status").eq("id", tid).single(),
-      supabase.from("team_members").select("handle, name, gets_financials, ghl_contact_id").eq("tenant_id", tid),
+      supabase.from("team_members").select("handle, name, gets_financials, ghl_contact_id, brief_voice").eq("tenant_id", tid).neq("active", false),
     ]);
     if (t?.status !== "active") return;
     const tz = cfg?.timezone || "Europe/London";
@@ -1447,6 +1534,19 @@ async function briefRun(tid: string, p: any) {
       if (reds.length || yellows.length) healthLine = `Client health (Archie's scoring): ${reds.length} red, ${yellows.length} yellow.${reds.length ? ` Red: ${reds.slice(0, 3).map((m: any) => `${m.name} (${(m.reasons ?? [])[0] ?? ""})`).join("; ")}.` : ""}`;
     } catch { /* bonus */ }
 
+    // Time-blocked plan for today (Forge auto-scheduling) — fresh plan first
+    let planLinesOwner = "", planLinesTeam = "";
+    try {
+      await forgePlan(tid, { force: true });
+      const { data: tmP } = await supabase.from("team_members").select("handle, gets_financials").eq("tenant_id", tid).neq("active", false);
+      for (const m of tmP ?? []) {
+        const g: any = await forgePlanGet(tid, m.handle, 1);
+        if (!g.ok || !g.today_text || /^No /.test(g.today_text)) continue;
+        if (m.gets_financials) planLinesOwner = g.today_text.replace(/\n/g, " | ");
+        else planLinesTeam += `${m.handle}: ${g.today_text.replace(/\n/g, " | ")} `;
+      }
+    } catch { /* bonus */ }
+
     // Task upgrades: slips, stalled, waiting-on, blockers — per person
     let taskLinesOwner = "", taskLinesTeam = "";
     try {
@@ -1503,6 +1603,8 @@ async function briefRun(tid: string, p: any) {
       weekLine ? `Weekly pace (OWNER brief only, never the TEAM brief): add this as one line under Money, exactly: 📊 ${weekLine}` : "",
       [speedLine, waitingLine, pipeLine, healthLine].filter(Boolean).length ? `OWNER brief only — add these under Money/Pipeline as short lines, exactly as facts are given: ${[speedLine, waitingLine, pipeLine, healthLine].filter(Boolean).join(" ")}` : "",
       "FOCUS LINE (owner brief): one action, one name, the highest value first — someone waiting on a reply right now beats a proposal waiting, which beats the top must task. E.g. \"Reply to Steph — she's waited 6 hours.\" Never a generic focus.",
+      planLinesOwner ? `Today's plan (OWNER brief — show as the time-blocked list, in this order, replacing the plain task list where they overlap): ${planLinesOwner}` : "",
+      planLinesTeam ? `Today's plan (TEAM brief — each person's own blocks only): ${planLinesTeam}` : "",
       taskLinesOwner ? `Task check (OWNER brief, short lines near the task list, exactly these facts): ${taskLinesOwner}` : "",
       taskLinesTeam ? `Task check (TEAM brief — each line only in that person's brief): ${taskLinesTeam}` : "",
       csmLines ? `Client success (TEAM brief for the person named, near the top — they own client check-ins; no money totals): ${csmLines}` : "",
@@ -1548,8 +1650,8 @@ async function briefRun(tid: string, p: any) {
       const r = await ghl(token, "/conversations/messages", "POST", { type: channel, contactId, message: body.slice(0, 3500) }, "2021-04-15");
       sent.push(`${who} ${r.ok ? "sent" : `failed ${r.status}`}`);
     };
-    if (owner?.ghl_contact_id && ownerText && ownerText.toUpperCase() !== "QUIET") await send(owner.ghl_contact_id, ownerText, owner.handle);
-    if (other?.ghl_contact_id && teamText && teamText.toUpperCase() !== "QUIET") await send(other.ghl_contact_id, teamText, other.handle);
+    if (owner?.ghl_contact_id && ownerText && ownerText.toUpperCase() !== "QUIET") { await send(owner.ghl_contact_id, ownerText, owner.handle); if (owner.brief_voice) startInBackground(briefVoice(tid, owner, ownerText)); }
+    if (other?.ghl_contact_id && teamText && teamText.toUpperCase() !== "QUIET") { await send(other.ghl_contact_id, teamText, other.handle); if (other.brief_voice) startInBackground(briefVoice(tid, other, teamText)); }
     await log("done", `Brief for ${expected} via API | ${sent.join(" | ") || "nothing to send"}${moneyNote}`);
   } catch (e) {
     await log("failed", "", `brief_run crashed: ${String(e).slice(0, 200)}`);
@@ -1829,6 +1931,14 @@ async function dispatch(_p: any) {
     const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", t.id).maybeSingle();
     try { await editFinishPending(t.id); } catch { /* never block the scheduler */ }
     try { startInBackground(ideasTick(t.id)); } catch { /* never block the scheduler */ }
+    try { if (cfg?.schedules_on && cfg?.auto_prep !== false) startInBackground(autoPrep(t.id, cfg)); } catch { /* never block the scheduler */ }
+    try {
+      if (cfg?.schedules_on && cfg?.forge_auto !== false) {
+        const tzF = cfg?.timezone || "Europe/London";
+        const hourKey = `${localDate(Date.now(), tzF)}-${new Intl.DateTimeFormat("en-GB", { timeZone: tzF, hour: "2-digit", hour12: false }).format(new Date())}`;
+        if (await claim(t.id, "forge_plan", hourKey)) startInBackground(forgePlanIfNeeded(t.id));
+      }
+    } catch { /* never block the scheduler */ }
     try {
       if (cfg?.is_agency) {
         const slot = `${new Date().toISOString().slice(0, 10)}-${Math.floor(new Date().getUTCHours() / 3)}`;
@@ -1902,7 +2012,10 @@ async function monthlyRun(tid: string, p: any) {
     await supabase.from("agent_runs").insert({ tenant_id: tid, agent: "monthly", trigger: "api", status: "failed", started_at: now, finished_at: now, error: `monthly-receipt ${r.status}` });
     return;
   }
-  await sendToTeam(tid, String(r.json?.owner_text ?? ""), "", "monthly");
+  // What Archie did for you last month — in £ and hours — plus the 30-second video
+  let extra = "";
+  try { const prev = new Date(); prev.setUTCDate(0); const st: any = await monthStats(tid, prev.toISOString().slice(0, 7)); extra = `\n\n${st.text}`; startInBackground(monthVideo(tid, st)); } catch { /* bonus */ }
+  await sendToTeam(tid, String(r.json?.owner_text ?? "") + extra, "", "monthly");
 }
 
 async function renewalsRun(tid: string) {
@@ -1992,6 +2105,13 @@ const TALK_RULES = [
   "- archie_memory {action save|list|archive, kind definition|voice|worked|service|fact, key, value} — 'remember…', 'a client means…', 'that doesn't sound like me…', 'forget the … one'. archie_remember also works for plain facts.",
   "- archie_checkup — 'is everything working?'; give the report as it is.",
   "- 'Show my last dump' → the LAST DUMP in the CONTEXT (give the clean note as it is). Dumps themselves are handled before you see them.",
+  "- archie_feedback {rating: 1|-1, comment, feature} — when they react to something Archie just made or did ('that caption was rubbish, too salesy', 'love that reel', '👎 that summary was wrong'): rating 1 or -1, their words as the comment; feature only if obvious (e.g. 'caption', 'reel', 'brief', 'carousel'), otherwise leave it out. Then thank them in a few words and, if negative, offer to redo it.",
+  "- archie_carousel {action: make|post, topic, slides, format: carousel|story} — 'make me a carousel about planning your week' → make (7 slides unless they say). 'Make me a story about…' → format 'story' (3 frames unless they say). 'Post the carousel' / 'post the story' → post (Social Planner drafts).",
+  "- archie_plan_usage {} — 'how many reels have I got left?' / 'what's my plan?' / 'what have I used this month?' → their plan and this month's usage. Give it as it is.",
+  "- archie_style {urls} — 'break down these reels' / 'study the edit style of these' with Instagram reel links → pass the links. Archie studies the editing style and reports back.",
+  "- archie_winback {months} — 'win back everyone who left this year' / 'message my old clients' → months 12 unless they say (e.g. 'since January' → months to then). Shows the drafted messages; they send with 'send them' / 'send 2' (archie_send_draft per number).",
+  "- archie_month {} — 'what did Archie do for me this month?' / 'send me my month video' → this month so far, in £ and hours, plus the 30-second video. Give the result as it is.",
+  "- archie_plan {action: show|replan|push, minutes} — their time-blocked day in Forge: 'what's my plan today?' → show. 'Replan my day' / 'I've lost the morning, redo my day' → replan (from now). 'I'm running 30 minutes late' / 'push everything an hour' → {action:'push', minutes}. Give the result as it is.",
   "- archie_instagram {action: results|sync, days} — their own Instagram: 'how did my posts do?', 'what's my best post this month?', 'how are my reels doing?' → results (days 30 by default). 'Refresh my Instagram' → sync. Give the answer as it is.",
   "- archie_ideas {action: list|find|film|skip, numbers, status} — content ideas: 'what's working?' / 'any ideas this week?' → list (numbered). 'Find me ideas now' → find. 'Film 1 and 3' → {action:'film', numbers:[1,3]}. 'Skip 2' → skip. 'What do I need to film?' → {action:'list', status:'to_film'}.",
   "- archie_reel {action: redo|left|status|post, change} — 'post it' / 'schedule the reel' → {action:'post'} (adds the latest reel to Social Planner as a draft). — reels from Archie Edit: 'make that reel shorter' / 'different hook' / 'drop the list' → {action:'redo', change: what they said}. 'How many edits have I got left?' → {action:'left'}. 'Is my reel ready?' → {action:'status'}. To edit a NEW video they just send it on WhatsApp with 'edit'.",
@@ -2136,6 +2256,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     const plainText = text.replace(/^\(voice note\)\s*/, "");
     const dumpMatch = plainText.match(/^\s*(?:brain\s*dump|dump(?:\s+this)?|note this|capture this)[:,\-\s]+([\s\S]+)/i);
     if (dumpMatch || (isVoice && plainText.split(/\s+/).length >= 90)) {
+      startInBackground(logFeature(tid, "dump", isVoice ? "voice" : "whatsapp", member.handle));
       const d: any = await dumpAnything(tid, member, dumpMatch ? dumpMatch[1] : plainText);
       const sentD = await reply(d.text);
       return log(sentD.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${d.text.slice(0, 80)} | actions: dump`, sentD.ok ? null : `reply not sent (${sentD.status})`);
@@ -2147,6 +2268,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
       const write = /^\s*(?:write|give me|draft|do)\s+(?:me\s+)?(?:a\s+)?caption\b/i.test(plainText);
       const change = plainText.match(/^\s*(?:make|change|rewrite|redo)\s+the\s+caption\s*(.*)$/i);
       if (own || write || change) {
+        startInBackground(logFeature(tid, "reel_caption", "whatsapp", member.handle));
         const r3: any = await reelCaption(tid, own ? { own: own[1] } : { change: change ? change[1] || "a fresh version" : "" });
         const sentC = await reply(r3.text);
         return log(sentC.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${r3.text.slice(0, 80)} | actions: caption`, sentC.ok ? null : `reply not sent (${sentC.status})`);
@@ -2155,6 +2277,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
 
     // "Post it" → the latest finished reel becomes a Social Planner draft
     if (/^\s*(?:please\s+)?(?:post|schedule|queue)\s*(?:it|that|this|the reel|my reel)?\s*(?:please)?[.!]?\s*$/i.test(plainText) && member.gets_financials) {
+      startInBackground(logFeature(tid, "reel_post", "whatsapp", member.handle));
       const r2: any = await reelToPlanner(tid);
       const sentP = await reply(r2.text);
       return log(sentP.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${r2.text.slice(0, 80)} | actions: post reel`, sentP.ok ? null : `reply not sent (${sentP.status})`);
@@ -2206,7 +2329,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep", "archie_data", "archie_reel", "archie_ideas", "archie_instagram"];
+      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep", "archie_data", "archie_reel", "archie_ideas", "archie_instagram", "archie_plan", "archie_carousel", "archie_month", "archie_winback", "archie_style", "archie_plan_usage"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
       const OWNER_ONLY = ["archie_data", "archie_call_prep", "archie_council", "archie_set_trial", "archie_groups", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
@@ -2215,11 +2338,38 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
       if (isCsm && ["archie_draft_followups", "archie_send_draft", "archie_skip_draft", "archie_drafts"].includes(act.tool)) {
         const r2 = await csmDraftAction(tid, member.handle, act.tool, args, accessToken);
         ran.push(`${act.tool}${r2.ok ? "" : " (failed)"}`);
+        startInBackground(logFeature(tid, act.tool, text.startsWith("(voice note)") ? "voice" : "whatsapp", member.handle, r2.ok));
         results.push(`${act.tool} → ${r2.ok ? "OK" : "FAILED"}: ${r2.text.slice(0, 800)}`);
         continue;
       }
       if (!member.gets_financials && OWNER_ONLY.includes(act.tool)) { results.push(`${act.tool}: not available for team members`); continue; }
-      const r = act.tool === "archie_instagram"
+      const r = act.tool === "archie_plan_usage"
+        ? await (async () => { const x: any = await planUsage(tid); return { ok: true, text: x.text }; })()
+        : act.tool === "archie_style"
+        ? await (async () => { const urls = String(args.urls ?? text).match(/https?:\/\/(www\.)?instagram\.com\/(reel|p)\/[A-Za-z0-9_-]+/g) ?? []; if (!urls.length) return { ok: false, text: "Send me the Instagram reel links you want me to study." }; startInBackground(styleBreakdown(tid, urls.slice(0, 6), true)); return { ok: true, text: `🔍 Studying ${urls.length} reel${urls.length === 1 ? "" : "s"} — I'll send you the breakdown in a few minutes.` }; })()
+        : act.tool === "archie_winback"
+        ? await (async () => { const x: any = await winBack(tid, Number(args.months ?? 12)); return { ok: !!x.ok, text: x.text }; })()
+        : act.tool === "archie_month"
+        ? await (async () => { const st: any = await monthStats(tid); startInBackground(monthVideo(tid, st)); return { ok: true, text: `${st.text}\n\n🎬 Making your 30-second month video now — it'll arrive in a few minutes.` }; })()
+        : act.tool === "archie_feedback"
+        ? await (async () => { const x: any = await saveFeedback(tid, member.handle, { ...args, channel: "whatsapp" }); return { ok: !!x.ok, text: x.text }; })()
+        : act.tool === "archie_carousel"
+        ? await (async () => {
+            const a2 = String(args.action ?? "make");
+            const fmt = String(args.format ?? "carousel") === "story" ? "story" : "carousel";
+            if (a2 === "post") { const { data: last } = await supabase.from("carousels").select("id").eq("tenant_id", tid).eq("status", "done").eq("format", fmt).order("created_at", { ascending: false }).limit(1).maybeSingle(); if (!last) return { ok: false, text: `No finished ${fmt} yet.` }; const x: any = await carouselPost(tid, last.id); return { ok: !!x.ok, text: x.text }; }
+            const x: any = await carouselStart(tid, member.handle, { topic: args.topic ?? text, slides_count: args.slides ?? (fmt === "story" ? 3 : 7), format: fmt });
+            return { ok: !!x.ok, text: x.text ?? x.error };
+          })()
+        : act.tool === "archie_plan"
+        ? await (async () => {
+            const a2 = String(args.action ?? "show");
+            if (a2 === "replan") { const x: any = await forgePlan(tid, { force: true, from_now: true }); if (!x.ok) return { ok: false, text: x.text }; }
+            if (a2 === "push") { const mins = Math.max(15, Math.min(240, Number(args.minutes ?? 60))); const x: any = await forgePlan(tid, { force: true, from_now: true, delay_minutes: mins }); if (!x.ok) return { ok: false, text: x.text }; }
+            const g: any = await forgePlanGet(tid, member.handle, 1);
+            return { ok: true, text: g.today_text };
+          })()
+        : act.tool === "archie_instagram"
         ? await (async () => { const x: any = String(args.action ?? "results") === "sync" ? await igSync(tid) : await igResults(tid, Number(args.days ?? 30)); return { ok: !!x.ok, text: x.text }; })()
         : act.tool === "archie_ideas"
         ? await (async () => {
@@ -2284,11 +2434,12 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
           })()
         : await runArchieTool(accessToken, act.tool, args);
       ran.push(`${act.tool}${r.ok ? "" : " (failed)"}`);
+      startInBackground(logFeature(tid, act.tool, text.startsWith("(voice note)") ? "voice" : "whatsapp", member.handle, r.ok));
       results.push(`${act.tool} ${JSON.stringify(args)} → ${r.ok ? "OK" : "FAILED"}: ${r.text.slice(0, act.tool === "archie_run_skill" ? 6000 : 800)}`);
     }
 
     // Some results go straight back as they are (no rewrite): the council and the checkup
-    if (plan.actions.length === 1 && ["archie_council", "archie_checkup", "archie_call_prep", "archie_data", "archie_instagram"].includes(plan.actions[0].tool) && results[0]) {
+    if (plan.actions.length === 1 && ["archie_council", "archie_checkup", "archie_call_prep", "archie_data", "archie_instagram", "archie_plan", "archie_month"].includes(plan.actions[0].tool) && results[0]) {
       const direct = results[0].replace(/^archie_\w+ \{[^\n]*?\} → (OK|FAILED): /, "").trim();
       const sentD = await reply(direct);
       return log(sentD.ok ? "done" : "failed", `${member.handle}: "${text.slice(0, 60)}" → ${direct.slice(0, 80)} | actions: ${ran.join(", ")}`, sentD.ok ? null : `reply not sent (${sentD.status})`);
@@ -2779,9 +2930,7 @@ async function draftFollowups(tid: string, p: any) {
   let written: any[] = [];
   if (agentId) {
     const msg = [
-      `Write a short WhatsApp message (2–4 sentences) from the owner to each person below. Purpose: ${purpose}.`,
-      "Friendly, plain, in the owner's voice (Archie Voice). One easy thing to reply to. No discounts, no pressure. Never invent details.",
-      "Fit each message to where the person is (shown in brackets): only mention a proposal or quote if their stage is a proposal/quote stage; for early-stage leads, re-open the conversation and invite a quick call instead.",
+      `Use your client-message skill to write one message to each person below. Purpose: ${purpose}. Their pipeline stage is shown in brackets.`,
       `Booking link if useful: ${/check.?in|client|renew/i.test(purpose) ? (cfg?.booking_link_client || cfg?.booking_link || "none") : (cfg?.booking_link_lead || cfg?.booking_link || "none")}.`,
       'Return ONLY a JSON array: [{"name":"…","message":"…"}]',
       "",
@@ -3493,6 +3642,7 @@ async function csmWeekly(tid: string, weekStart: string, weekEnd: string): Promi
 
 // ===================== v5.7: second opinion (council) =====================
 async function councilRun(tid: string, p: any) {
+  if (!p.lens && !p.answers) { const gate: any = await allowance(tid, "council"); if (!gate.ok) return { ok: false, text: gate.text }; }
   const question = String(p.question ?? "").trim().slice(0, 600);
   const answers = String(p.answers ?? "").trim().slice(0, 1200);
   const lens = String(p.lens ?? "").trim();
@@ -3554,8 +3704,8 @@ async function callPrep(tid: string, p: any) {
   // 1. Who: today's/tomorrow's booked calls first (match name or time), then contact search
   const { data: owner } = await supabase.from("team_members").select("ghl_user_id, personal_calendar_id").eq("tenant_id", tid).eq("gets_financials", true).limit(1).maybeSingle();
   const userId = owner?.ghl_user_id || cfg?.ghl_user_id;
-  let contactId = "", eventTitle = "", eventTime = "";
-  if (userId) {
+  let contactId = String(p.contact_id ?? ""), eventTitle = String(p.event_title ?? ""), eventTime = String(p.event_time ?? "");
+  if (userId && !contactId) {
     const from = Date.parse(isoAtTz(today, "00:00", tz)), to = from + 2 * 86400000;
     const ev = await ghl(token, `/calendars/events?locationId=${loc}&userId=${userId}&startTime=${from}&endTime=${to}`, "GET", undefined, "2021-04-15");
     const events: any[] = (ev.json?.events ?? []).filter((e: any) => !e.isBlockSlot && e.calendarId !== owner?.personal_calendar_id && String(e.appointmentStatus ?? "").toLowerCase() !== "cancelled" && Date.parse(e.endTime ?? e.startTime) > Date.now());
@@ -3623,7 +3773,7 @@ async function callPrep(tid: string, p: any) {
   const agentId = await agentIdFor(tid, "sales", token, loc);
   if (!agentId) return { ok: false, text: "I can't find the Archie Sales agent." };
   const msg = [
-    "Prepare the owner for this call. Use ONLY the facts below. Plain English, short lines, no markdown symbols. Under ~18 lines.",
+    "Use your pre-call-brief skill — the SHORT version (WhatsApp, under ~18 lines). Use ONLY the facts below.",
     "Output exactly these parts:",
     `CALL PREP — ${name}${eventTime ? `, ${eventTime}` : ""}`,
     "Who: one line (client or lead, how long, where they came from).",
@@ -3663,7 +3813,7 @@ async function dumpAnything(tid: string, member: any, raw: string) {
   const res = await agentExecute(token, agentId, { locationId: loc, message: msg.slice(0, 9500) }, `dump-${tid}-${Date.now()}`);
   const outText = tidy(clean(String(res.json?.finalText ?? "")));
   let parsed: any = null;
-  try { const m = outText.match(/\{[\s\S]*\}/); parsed = m ? JSON.parse(m[0]) : null; } catch { parsed = null; }
+  try { const m = outText.match(/\{[\s\S]*\}/); parsed = m ? looseJson(m[0]) : null; } catch { parsed = null; }
   if (!parsed) {
     await supabase.from("dumps").insert({ tenant_id: tid, handle: member.handle, raw: text, clean: text, summary: "saved as it was" });
     return { ok: true, text: "Saved your note as it was — I couldn't sort it into tasks this time. Say \"show my last dump\" to see it, or tell me the tasks." };
@@ -3833,7 +3983,8 @@ const SETTINGS_FIELDS: Record<string, "text" | "int" | "bool" | "num" | "time" |
   won_creates_invoice: "bool", stale_threshold_days: "int", pipeline_name: "text", trial_stage_name: "text",
   brand_primary: "text", brand_accent: "text", brand_text: "text", brand_logo_url: "text", caption_style: "text",
   outro_text: "text", outro_sub: "text", edit_allowance: "int", instagram_handle: "text", sched_ideas: "time", sched_ideas_day: "int", sched_ig: "time",
-  coach_on: "bool", onboarding_started_at: "text", sched_coach: "time",
+  coach_on: "bool", onboarding_started_at: "text", sched_coach: "time", auto_prep: "bool", prep_calendars: "json", forge_auto: "bool", forge_days: "int",
+  carousel_accent: "text", carousel_wordmark: "text", voice_name: "text", edit_engine: "text", caption_style2: "text", sfx_on: "bool", sfx_url: "text", music_url: "text",
 };
 const SECRET_FIELDS = ["stripe_key", "fathom_api_key", "ghl_token"];
 
@@ -3990,7 +4141,7 @@ async function usage(tid: string, month: string) {
 }
 
 // ===================== v6.4: Archie Edit =====================
-import { renderMediaOnLambda, getRenderProgress } from "npm:@remotion/lambda-client@4.0.532";
+import { renderMediaOnLambda, getRenderProgress, renderStillOnLambda } from "npm:@remotion/lambda-client@4.0.532";
 const CLIPS_BUCKET = "archie-clips";
 
 async function editUploadUrl(tid: string, filename: string) {
@@ -4002,16 +4153,15 @@ async function editUploadUrl(tid: string, filename: string) {
 }
 
 async function editAllowanceLeft(tid: string) {
-  const { data: cfg } = await supabase.from("tenant_config").select("edit_allowance").eq("tenant_id", tid).maybeSingle();
-  const allowance = Number(cfg?.edit_allowance ?? 12) || 12;
-  const monthStart = `${new Date().toISOString().slice(0, 7)}-01T00:00:00Z`;
-  const { count } = await supabase.from("edit_jobs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).gte("created_at", monthStart).neq("status", "failed");
-  return { allowance, used: count ?? 0, left: Math.max(0, allowance - (count ?? 0)) };
+  const a: any = await allowance(tid, "reels");
+  return { allowance: a.limit ?? 9999, used: a.used, left: a.left ?? 9999 };
 }
 
 async function editStart(tid: string, handle: string, p: any) {
+  const isWeek = p.multi === true || String(p.multi) === "true";
+  const gate: any = await allowance(tid, isWeek ? "weeks" : "reels");
+  if (!gate.ok) return { ok: false, error: gate.text };
   const cap = await editAllowanceLeft(tid);
-  if (cap.left <= 0) return { ok: false, error: `You've used all ${cap.allowance} reel edits this month.` };
   let sourceUrl = String(p.video_url ?? "").trim();
   const path = String(p.path ?? "").trim();
   if (!sourceUrl && path) {
@@ -4020,13 +4170,34 @@ async function editStart(tid: string, handle: string, p: any) {
     sourceUrl = data.signedUrl;
   }
   if (!/^https?:\/\//.test(sourceUrl)) return { ok: false, error: "No video — upload a clip or pick one from your media." };
+  // Which idea is this a take of? (from the page's idea_id, or "idea 2" on WhatsApp = number 2 on the filming list)
+  let idea: any = null;
+  if (p.idea_id) idea = (await supabase.from("content_posts").select("id, idea").eq("tenant_id", tid).eq("id", String(p.idea_id)).maybeSingle()).data;
+  else if (p.idea_number) {
+    const n = Number(p.idea_number);
+    const { data: fl } = await supabase.from("content_posts").select("id, idea").eq("tenant_id", tid).eq("status", "to_film").order("score", { ascending: false }).limit(20);
+    const { data: rd } = !fl?.length ? await supabase.from("content_posts").select("id, idea").eq("tenant_id", tid).eq("status", "ready").order("score", { ascending: false }).limit(20) : { data: null };
+    idea = (fl?.length ? fl : rd ?? [])[n - 1] ?? null;
+  }
+  const ideaBrief = idea?.idea ? `This is a take of a planned idea. Title: ${idea.idea.title ?? ""}. The hook they meant to open with: "${idea.idea.hook ?? ""}". Their script: ${(idea.idea.script ?? []).join(" / ")}. Keep the strongest version of that hook first.` : "";
   const { data: job, error } = await supabase.from("edit_jobs").insert({
     tenant_id: tid, handle, source_url: sourceUrl, source_path: path || null, status: "transcribing",
-    title: String(p.title ?? "").slice(0, 120) || null, brief: String(p.brief ?? "").slice(0, 600) || null,
+    title: (String(p.title ?? "").slice(0, 120) || idea?.idea?.title || null),
+    brief: [String(p.brief ?? "").slice(0, 600), ideaBrief].filter(Boolean).join("\n") || null,
+    idea_id: idea?.id ?? null, caption: idea?.idea?.caption ?? null,
+    multi: p.multi === true || String(p.multi) === "true",
   }).select("id").single();
+  if (idea?.id) await supabase.from("content_posts").update({ status: "filmed", updated_at: new Date().toISOString() }).eq("id", idea.id);
+  // Raw clip uploaded on the page → also into GHL Media
+  if (path && !p.video_url) startInBackground((async () => {
+    const { data: cf } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+    const fd = new FormData();
+    fd.append("hosted", "true"); fd.append("fileUrl", sourceUrl); fd.append("name", `${(String(p.title ?? "") || idea?.idea?.title || "Raw clip").slice(0, 80)} (raw ${new Date().toISOString().slice(0, 10)}).mp4`);
+    await fetch(`https://services.leadconnectorhq.com/medias/upload-file?altType=location&altId=${cf?.ghl_location_id}`, { method: "POST", headers: { Authorization: `Bearer ${cf?.ghl_token || FALLBACK_TOKEN}`, Version: "2021-07-28" }, body: fd }).catch(() => null);
+  })());
   if (error || !job) return { ok: false, error: error?.message ?? "couldn't start" };
   startInBackground(editPipeline(tid, job.id));
-  return { ok: true, id: job.id, used: cap.used + 1, allowance: cap.allowance, text: "Got it — transcribing and editing now. Usually ready in 2–4 minutes." };
+  return { ok: true, id: job.id, used: cap.used + 1, allowance: cap.allowance, idea_title: idea?.idea?.title ?? null, text: `Got it — transcribing and editing now${idea?.idea?.title ? ` (your take on "${idea.idea.title}")` : ""}. Usually ready in 2–4 minutes.` };
 }
 
 async function editRedo(tid: string, id: string, change: string) {
@@ -4042,10 +4213,11 @@ async function editFail(id: string, msg: string) {
 }
 
 // Transcribe → plan → build props → start the render
-async function editPipeline(tid: string, id: string, replan = false) {
+async function editPipeline(tid: string, id: string, replan = false, presetPlan: any = null) {
   try {
     const { data: job } = await supabase.from("edit_jobs").select("*").eq("id", id).single();
     const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).single();
+    const engineV2 = String(job.engine ?? cfg?.edit_engine ?? "v1") === "v2";
     // 1. Transcript with word timings (Deepgram reads the video straight from its link)
     let words: { w: string; s: number; e: number }[] = job.transcript?.words ?? [];
     let duration = Number(job.transcript?.duration ?? 0);
@@ -4087,24 +4259,61 @@ async function editPipeline(tid: string, id: string, replan = false) {
       job.change_request ? `CHANGES REQUESTED to the last edit: ${job.change_request}` : "",
       "Return ONLY JSON:",
       '{"title":"short title","keep":[3,1,4,5],"emphasis":{"3":["word","word"]},"overlays":[{"type":"title|callout|stat|list|card","at":3,"text":"…","value":"for stat e.g. 3x","items":["for list"],"position":"top|middle|bottom","seconds":2.5}],"zooms":[4],"outro":{"text":"…","sub":"…"}}',
+      engineV2 ? "Each card also gets \"cue\": the one word in that sentence the card shows (it appears on that word). One idea per card; it stays up for the whole sentence. ALSO add \"cards\": a designed on-screen card for MOST kept sentences (skip ones where the face alone is stronger, e.g. the hook and personal moments). Each card: {\"at\":id,\"type\":\"number|list|steps|quote|compare|keyword|callout\",\"value\":12,\"prefix\":\"£\",\"suffix\":\"%\",\"label\":\"…\",\"title\":\"…\",\"items\":[\"…\"],\"text\":\"…\",\"before\":\"…\",\"after\":\"…\"} — only the fields its type needs. Use ONLY facts actually said. number = a figure they said; list/steps = 2–4 short items they named; compare = a before/after they described; quote = a punchy line of theirs; keyword = one word to slam on screen; callout = a short phrase (under 6 words). Vary the types." : "",
       "keep = sentence ids in the order to play them. emphasis = 1–2 key words per kept sentence to colour. overlays: 2–4 max, short punchy text (under 6 words), only facts actually said. zooms = sentence ids to push in on (1–3). outro optional: a short call to action.",
       "",
       "SENTENCES:",
       ...sentences.map((x) => `${x.id} [${x.s.toFixed(1)}–${x.e.toFixed(1)}s] ${x.text}`),
     ].filter(Boolean).join("\n").slice(0, 9400);
-    const res = await agentExecute(token, agentId, { locationId: loc, message: msg }, `edit-${tid}-${Date.now()}`);
-    let plan: any = null;
-    try { const m = tidy(clean(String(res.json?.finalText ?? ""))).match(/\{[\s\S]*\}/); plan = m ? JSON.parse(m[0]) : null; } catch { plan = null; }
+    let plan: any = presetPlan;
+    if (!plan && job.multi) {
+      // One long ramble → several standalone reels (+ a carousel from the same ideas)
+      const multiMsg = [
+        "This is a long, unscripted video. Find the 3–5 strongest STANDALONE moments — each one becomes its own 20–60 second vertical reel with its own hook (the best opening line from that moment first). Moments must not overlap.",
+        job.brief ? `The owner's brief: ${job.brief}` : "",
+        "Return ONLY JSON: {\"clips\":[{\"title\":\"…\",\"keep\":[ids in play order],\"emphasis\":{\"id\":[\"word\"]},\"overlays\":[{\"type\":\"title|callout|stat|list|card\",\"at\":id,\"text\":\"…\",\"position\":\"top|middle|bottom\",\"seconds\":2.5}],\"zooms\":[ids],\"outro\":{\"text\":\"…\",\"sub\":\"…\"}}],\"carousel_topic\":\"one line: the main idea, for a carousel\"}",
+        "",
+        "SENTENCES:",
+        ...sentences.map((x) => `${x.id} [${x.s.toFixed(1)}–${x.e.toFixed(1)}s] ${x.text}`),
+      ].filter(Boolean).join("\n").slice(0, 9400);
+      const mres = await agentExecute(token, agentId, { locationId: loc, message: multiMsg }, `edit-${tid}-${Date.now()}`);
+      let mp: any = null;
+      try { const mm = tidy(clean(String(mres.json?.finalText ?? ""))).match(/\{[\s\S]*\}/); mp = mm ? looseJson(mm[0]) : null; } catch { mp = null; }
+      const clips: any[] = Array.isArray(mp?.clips) ? mp.clips.filter((c: any) => Array.isArray(c?.keep) && c.keep.length).slice(0, 5) : [];
+      if (clips.length) {
+        plan = clips[0];
+        for (const clip of clips.slice(1)) {
+          const { data: child } = await supabase.from("edit_jobs").insert({
+            tenant_id: tid, handle: job.handle, source_url: job.source_url, source_path: job.source_path, status: "planning",
+            title: String(clip.title ?? "").slice(0, 120) || null, transcript: { words, duration }, parent_id: id, brief: job.brief,
+          }).select("id").single();
+          if (child?.id) startInBackground(editPipeline(tid, child.id, true, clip));
+        }
+        await supabase.from("edit_jobs").update({ title: String(clips[0].title ?? job.title ?? "").slice(0, 120) || null }).eq("id", id);
+        if (mp?.carousel_topic) startInBackground(carouselStart(tid, job.handle ?? "owner", { topic: String(mp.carousel_topic), brief: `Built from the owner's own video. What they said: ${words.map((w) => w.w).join(" ").slice(0, 400)}` }));
+        await sendToTeam(tid, `🎬 Found ${clips.length} reels in your video${mp?.carousel_topic ? " and a carousel idea" : ""} — editing them all now. They'll arrive one by one.`, "", "edit");
+      }
+    }
+    if (!plan) {
+      const res = await agentExecute(token, agentId, { locationId: loc, message: msg }, `edit-${tid}-${Date.now()}`);
+      try { const m = tidy(clean(String(res.json?.finalText ?? ""))).match(/\{[\s\S]*\}/); plan = m ? looseJson(m[0]) : null; } catch { plan = null; }
+    }
     const keep: number[] = (Array.isArray(plan?.keep) ? plan.keep : sentences.map((x) => x.id)).map(Number).filter((n: number) => sentences.some((x) => x.id === n));
     if (!keep.length) return editFail(id, "The edit plan came back empty — try again.");
 
     // 4. Cuts and captions worked out exactly from the word timings (pauses over 0.45s inside a sentence are cut too)
     const cuts: { start: number; end: number }[] = [];
     const captions: { text: string; start: number; end: number; emphasis: string[] }[] = [];
+    const groups2: { words: { w: string; start: number; end: number }[]; emphasis: string[] }[] = [];
     const sentStart = new Map<number, number>();
+    const sentEnd = new Map<number, number>();
+    const sentWords = new Map<number, { w: string; start: number }[]>();
     let t = 0;
+    let prevSid: number | null = null;
     for (const sid of keep) {
       const snt = sentences.find((x) => x.id === sid)!;
+      if (prevSid !== null) sentEnd.set(prevSid, t);
+      prevSid = sid;
       sentStart.set(sid, t);
       const emph: string[] = (plan?.emphasis?.[String(sid)] ?? []).map(String);
       // Fillers (um, uh, erm…) are cut out completely
@@ -4112,7 +4321,8 @@ async function editPipeline(tid: string, id: string, replan = false) {
       const idx: number[] = [];
       for (let k = snt.from; k <= snt.to; k++) if (!FILLER.test(words[k].w)) idx.push(k);
       if (!idx.length) continue;
-      let segStart = Math.max(0, words[idx[0]].s - 0.06), groupStart = t, group: string[] = [];
+      const PRE = 0.06 + Number(job.pad_extra ?? 0), POST = 0.08 + Number(job.pad_extra ?? 0);
+      let segStart = Math.max(0, words[idx[0]].s - PRE), groupStart = t, group: string[] = [], groupWords: { w: string; start: number; end: number }[] = [];
       for (let q = 0; q < idx.length; q++) {
         const k = idx[q];
         const w = words[k];
@@ -4121,20 +4331,25 @@ async function editPipeline(tid: string, id: string, replan = false) {
         const pause = next ? next.s - w.e : 0;
         const segEndHere = !next || pause > 0.45 || skipped;
         group.push(w.w);
-        const wordEndOut = t + (w.e + (segEndHere ? 0.08 : 0) - segStart);
+        groupWords.push({ w: w.w.replace(/[.]$/, ""), start: Number((t + (w.s - segStart)).toFixed(3)), end: Number((t + (w.e - segStart)).toFixed(3)) });
+        (sentWords.get(sid) ?? sentWords.set(sid, []).get(sid)!).push({ w: w.w, start: Number((t + (w.s - segStart)).toFixed(3)) });
+        const wordEndOut = t + (w.e + (segEndHere ? POST : 0) - segStart);
         if (group.length >= 4 || segEndHere || /[,.!?]$/.test(w.w)) {
           captions.push({ text: group.join(" ").replace(/[.]$/, ""), start: groupStart, end: wordEndOut, emphasis: emph });
-          group = []; groupStart = wordEndOut;
+          groups2.push({ words: groupWords, emphasis: emph });
+          group = []; groupWords = []; groupStart = wordEndOut;
         }
         if (segEndHere) {
-          const segEnd = Math.min(duration || w.e + 0.1, w.e + 0.08);
+          const lastOfAll = !next && sid === keep[keep.length - 1];
+          const segEnd = Math.min(duration || w.e + 0.1, w.e + (lastOfAll && engineV2 ? 0.8 : POST));
           cuts.push({ start: Number(segStart.toFixed(3)), end: Number(segEnd.toFixed(3)) });
           t += segEnd - segStart;
-          if (next) { segStart = Math.max(0, next.s - 0.06); groupStart = t; }
+          if (next) { segStart = Math.max(0, next.s - PRE); groupStart = t; }
         }
       }
     }
     const total = t;
+    if (prevSid !== null) sentEnd.set(prevSid, total);
     const overlays = (Array.isArray(plan?.overlays) ? plan.overlays : []).slice(0, 4).map((o: any) => {
       const at = sentStart.get(Number(o.at)) ?? 0;
       return { type: ["title", "callout", "stat", "list", "card"].includes(o.type) ? o.type : "callout", text: String(o.text ?? "").slice(0, 60), value: o.value ? String(o.value).slice(0, 10) : undefined, items: Array.isArray(o.items) ? o.items.map(String).slice(0, 4) : undefined, start: at + 0.2, end: Math.min(total, at + 0.2 + (Number(o.seconds) || 2.5)), position: ["top", "middle", "bottom"].includes(o.position) ? o.position : "top" };
@@ -4148,18 +4363,44 @@ async function editPipeline(tid: string, id: string, replan = false) {
       ...(plan?.outro?.text || cfg?.outro_text ? { outro: { text: String(cfg?.outro_text || plan.outro.text).slice(0, 40), sub: String(cfg?.outro_sub || plan?.outro?.sub || "").slice(0, 60), seconds: outroSecs } } : {}),
     };
 
+    // v2: face check, clean audio, a card per sentence, caption styles
+    let composition = "ArchieReel", inputProps: any = props;
+    if (engineV2) {
+      const focus = job.focus ?? await faceFocus(job.source_url, duration);
+      const audioUrl = job.clean_audio_url ?? await cleanAudio(tid, id, job.source_url);
+      const cards = (Array.isArray(plan?.cards) ? plan.cards : []).map((c: any) => {
+        const st0 = sentStart.get(Number(c.at)); if (st0 === undefined) return null;
+        // Land on the word it shows (the cue word), and stay up for the sentence — at least 2 seconds
+        const cue = normWord(String(c.cue ?? ""));
+        const hit = cue ? (sentWords.get(Number(c.at)) ?? []).find((x) => normWord(x.w) === cue) : undefined;
+        const st = hit ? Math.max(st0, hit.start - 0.1) : st0 + 0.15;
+        const en = Math.min(total, Math.max(st + 2.0, (sentEnd.get(Number(c.at)) ?? st + 2.5) - 0.1));
+        const base = { start: Number(st.toFixed(2)), end: Number(en.toFixed(2)) };
+        const ty = String(c.type);
+        if (ty === "number" && Number.isFinite(Number(c.value))) return { ...base, type: "number", value: Number(c.value), prefix: c.prefix ? String(c.prefix).slice(0, 3) : undefined, suffix: c.suffix ? String(c.suffix).slice(0, 6) : undefined, label: String(c.label ?? "").slice(0, 40) };
+        if ((ty === "list" || ty === "steps") && Array.isArray(c.items) && c.items.length) return { ...base, type: ty, title: c.title ? String(c.title).slice(0, 30) : undefined, items: c.items.map((x: any) => String(x).slice(0, 34)).slice(0, 4) };
+        if (ty === "compare" && c.before && c.after) return { ...base, type: "compare", before: String(c.before).slice(0, 50), after: String(c.after).slice(0, 50) };
+        if (["quote", "keyword", "callout", "title"].includes(ty) && c.text) return { ...base, type: ty, text: String(c.text).slice(ty === "keyword" ? 0 : 0, ty === "keyword" ? 16 : 80) };
+        return null;
+      }).filter(Boolean);
+      const style = ["karaoke", "bold", "single"].includes(String(cfg?.caption_style2)) ? String(cfg?.caption_style2) : "karaoke";
+      inputProps = { videoUrl: job.source_url, audioUrl: audioUrl || undefined, sfxUrl: cfg?.sfx_on ? (cfg?.sfx_url || undefined) : undefined, musicUrl: cfg?.music_url || undefined, cuts, captions: groups2, captionStyle: style, cards, zooms, focus, brand: props.brand, progressBar: true, ...(props as any).outro ? { outro: (props as any).outro } : {} };
+      composition = "ArchieReel2";
+      await supabase.from("edit_jobs").update({ focus, clean_audio_url: audioUrl || null, engine: "v2" }).eq("id", id);
+    }
+
     // 5. Render on Remotion Lambda (few chunks — new AWS accounts allow ~10 at once)
     const frames = Math.max(30, Math.round(total * 30));
     const render = await renderMediaOnLambda({
       region: (Deno.env.get("REMOTION_REGION") ?? "eu-west-2") as any,
       functionName: Deno.env.get("REMOTION_FUNCTION")!,
       serveUrl: Deno.env.get("REMOTION_SERVE_URL")!,
-      composition: "ArchieReel", inputProps: props, codec: "h264", privacy: "no-acl",
+      composition, inputProps, codec: "h264", privacy: "no-acl",
       framesPerLambda: Math.max(90, Math.ceil(frames / 4)),
-      outName: `archie-${tid.slice(0, 8)}-${id.slice(0, 8)}.mp4`,
+      outName: `archie-${tid.slice(0, 8)}-${id.slice(0, 8)}${job.pad_extra ? "-fix" : ""}.mp4`,
     } as any);
     await supabase.from("edit_jobs").update({
-      status: "rendering", plan, props, render_id: render.renderId, bucket: render.bucketName,
+      status: "rendering", plan, props: inputProps, render_id: render.renderId, bucket: render.bucketName,
       title: job.title || String(plan?.title ?? "").slice(0, 120) || null, seconds: Math.round(total), updated_at: new Date().toISOString(),
     }).eq("id", id);
   } catch (e) {
@@ -4182,6 +4423,12 @@ async function editCheck(tid: string, job: any) {
     if (pr.fatalErrorEncountered) return editFail(job.id, `Render failed: ${String(pr.errors?.[0]?.message ?? "unknown").slice(0, 300)}`);
     if (!pr.done) { await supabase.from("edit_jobs").update({ progress: Math.round((pr.overallProgress ?? 0) * 100) }).eq("id", job.id); return; }
     const url = String(pr.outputFile ?? "");
+    // v2: check before it goes out (no chopped words; a quick quality look) — runs once, in the background
+    if (job.engine === "v2" && !job.checked_at) {
+      await supabase.from("edit_jobs").update({ status: "checking", checked_at: new Date().toISOString(), output_url: url, progress: 99 }).eq("id", job.id);
+      startInBackground(v2Check(tid, job, url));
+      return;
+    }
     // Into their GHL media library (by link, so nothing is downloaded here)
     const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id").eq("tenant_id", tid).single();
     let mediaUrl = "";
@@ -4194,14 +4441,17 @@ async function editCheck(tid: string, job: any) {
     } catch { /* the S3 link still works */ }
     await supabase.from("edit_jobs").update({ status: "done", output_url: url, ghl_media_url: mediaUrl || null, progress: 100, updated_at: new Date().toISOString() }).eq("id", job.id);
     const { data: m } = await supabase.from("team_members").select("ghl_contact_id").eq("tenant_id", tid).eq("handle", job.handle).maybeSingle();
+    if (job.kind === "month") { await sendToTeam(tid, `🎬 Your month in 30 seconds:\n${mediaUrl || url}\n\nShare it on your story if you're proud of it 👊`, "", "month"); return; }
     if (m?.ghl_contact_id) {
       const { data: c2 } = await supabase.from("tenant_config").select("ghl_token, brief_channel").eq("tenant_id", tid).single();
-      await ghl(c2?.ghl_token || FALLBACK_TOKEN, "/conversations/messages", "POST", { type: String(c2?.brief_channel ?? "").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS", contactId: m.ghl_contact_id, message: `📹 Your reel's ready${job.title ? `: ${job.title}` : ""} (${job.seconds ?? "?"}s)\n${mediaUrl || url}\n\nReply "post it" to add it to Social Planner as a draft (I'll write the caption), "write a caption" to see it first, or tell me what to change ("shorter", "different hook", "no list").` }, "2021-04-15");
+      await ghl(c2?.ghl_token || FALLBACK_TOKEN, "/conversations/messages", "POST", { type: String(c2?.brief_channel ?? "").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS", contactId: m.ghl_contact_id, message: `📹 Your reel's ready${job.title ? `: ${job.title}` : ""} (${job.seconds ?? "?"}s)\n${mediaUrl || url}${(job.qa?.notes ?? []).length ? `\n\n${(job.qa.notes as string[]).join("\n")}` : ""}\n\nReply "post it" to add it to Social Planner as a draft (I'll write the caption), "write a caption" to see it first, or tell me what to change ("shorter", "different hook", "no list").` }, "2021-04-15");
     }
   } catch (e) { await supabase.from("edit_jobs").update({ error: `progress check: ${String(e).slice(0, 200)}` }).eq("id", job.id); }
 }
 
 async function editFinishPending(tid: string) {
+  // A v2 check that got stuck (over 10 minutes) — deliver the reel anyway
+  await supabase.from("edit_jobs").update({ status: "rendering" }).eq("tenant_id", tid).eq("status", "checking").lt("checked_at", new Date(Date.now() - 10 * 60000).toISOString());
   const { data: jobs } = await supabase.from("edit_jobs").select("*").eq("tenant_id", tid).eq("status", "rendering").limit(5);
   for (const j of jobs ?? []) await editCheck(tid, j);
 }
@@ -4211,6 +4461,8 @@ const APIFY = "https://api.apify.com/v2";
 const apifyToken = () => Deno.env.get("APIFY_API_TOKEN") ?? "";
 
 async function ideasAccountAdd(tid: string, raw: string) {
+  const gate: any = await allowance(tid, "accounts");
+  if (!gate.ok) return { ok: false, error: gate.text };
   const handle = raw.trim().replace(/^https?:\/\/(www\.)?instagram\.com\//i, "").replace(/[/?#].*$/, "").replace(/^@/, "").toLowerCase();
   if (!/^[a-z0-9._]{2,30}$/.test(handle)) return { ok: false, error: "That doesn't look like an Instagram handle." };
   const { error } = await supabase.from("watched_accounts").upsert({ tenant_id: tid, handle, platform: "instagram", active: true }, { onConflict: "tenant_id,handle" });
@@ -4420,8 +4672,8 @@ async function analyseOutlier(tid: string, post: any) {
     else {
       const msg = [
         post.source === "own"
-          ? "This is the OWNER'S OWN post and it did better than their normal. Work out a follow-up idea that builds on why it worked — a part 2, the next question people will have, or the same format on a new topic. In their voice."
-          : "Turn this post that's working for someone else into an ORIGINAL idea for this business — the same reason it works, but their own topic, words and story. Never copy lines or claim their results.",
+          ? "Use your create-reel-script skill in \"make it yours\" mode. This is the OWNER'S OWN post and it did better than their normal — write the follow-up idea."
+          : "Use your create-reel-script skill in \"make it yours\" mode. This is someone else's post that's working — write an ORIGINAL idea for this business.",
         `It got ${post.views} views — ${post.score}x that account's normal (@${post.handle}).`,
         `Why it worked: ${JSON.stringify({ hook: breakdown.hook, format: breakdown.format, steps: breakdown.steps, why_it_worked: breakdown.why_it_worked, payoff: breakdown.payoff, said: breakdown.spoken_summary }).slice(0, 2500)}`,
         "",
@@ -4508,6 +4760,9 @@ async function agencyOverview(agencyTid: string) {
       clients_red: (mh ?? []).filter((m: any) => m.status === "red").length, clients_yellow: (mh ?? []).filter((m: any) => m.status === "yellow").length,
       failed_24h: fails ?? 0,
       ...(await quietInfo(t.id)),
+      ...(await activationInfo(t.id)),
+      plan: String((await supabase.from("tenant_config").select("plan").eq("tenant_id", t.id).maybeSingle()).data?.plan ?? "archie"),
+      ...(await costInfo(t.id)),
     };
   }));
   const total = rows.reduce((a, r) => a + (r.cost_month_gbp || 0), 0);
@@ -4528,6 +4783,17 @@ async function agencySweep(agencyTid: string) {
       const q = await quietInfo(t.id);
       if (q.in_first_30 && q.quiet_days !== null && q.quiet_days >= 2 && (await claim(agencyTid, `quiet:${t.id}`, new Date().toISOString().slice(0, 10)))) {
         quiet.push(`🤫 ${t.business_name}: hasn't talked to Archie for ${q.quiet_days} days (day ${q.onboarding_day} of onboarding) — worth a nudge.`);
+      } else if (!q.in_first_30 && q.quiet_days !== null && q.quiet_days >= 4 && t.id !== agencyTid) {
+        // Everyone else: 4+ quiet days is an early churn sign — once a week per client
+        const wk = `${new Date().getUTCFullYear()}-w${Math.ceil(((Date.now() - Date.UTC(new Date().getUTCFullYear(), 0, 1)) / 86400000 + 1) / 7)}`;
+        if (await claim(agencyTid, `quiet-any:${t.id}`, wk)) quiet.push(`🤫 ${t.business_name}: quiet for ${q.quiet_days} days — check in with something useful.`);
+      }
+      // Cost alert: projected spend vs budget — once per level per month
+      if (t.id !== agencyTid) {
+        const ci = await costInfo(t.id);
+        if (ci.cost_level !== "green" && (await claim(agencyTid, `cost-${ci.cost_level}:${t.id}`, new Date().toISOString().slice(0, 7)))) {
+          quiet.push(`${ci.cost_level === "red" ? "🔴" : "🟠"} ${t.business_name}: on track to cost £${ci.cost_projected_gbp} this month (${ci.cost_pct}% of the £${ci.cost_budget_gbp} budget). Biggest: ${ci.cost_top}.`);
+        }
       }
       if (r.status === "red" && (await claim(agencyTid, `alert:${t.id}`, new Date().toISOString().slice(0, 10)))) {
         alerts.push(`🔴 ${t.business_name}: ${(r.problems ?? []).slice(0, 3).join(" · ")}${prev.data?.status && prev.data.status !== "red" ? " (was " + prev.data.status + ")" : ""}`);
@@ -4561,8 +4827,7 @@ async function reelCaption(tid: string, p: any) {
   if (!agentId || !said) return { ok: false, text: "I couldn't write a caption for that one — send me your own with \"caption: …\"." };
   const change = String(p.change ?? "").trim();
   const msg = [
-    "Write an Instagram caption for this reel, in the owner's voice.",
-    "Shape: a first line that makes people stop (it shows before 'more'), 2–4 short lines that add to the video (don't just repeat it), one clear call to action, then up to 5 relevant hashtags on the last line. Plain text, no markdown, no emojis at the start of every line.",
+    "Use your caption skill to write the caption for this reel.",
     job.caption && change ? `THE CURRENT CAPTION:\n${job.caption}\n\nCHANGE IT LIKE THIS: ${change}` : change ? `Also: ${change}` : "",
     "Only the caption.",
     "",
@@ -4762,6 +5027,950 @@ async function coachStatus(tid: string) {
   const { data: cfg } = await supabase.from("tenant_config").select("coach_on, onboarding_started_at, coach_sent").eq("tenant_id", tid).maybeSingle();
   const q = await quietInfo(tid);
   return { ok: true, coach_on: !!cfg?.coach_on, started: cfg?.onboarding_started_at ?? null, day: q.onboarding_day, sent: cfg?.coach_sent ?? [], quiet_days: q.quiet_days, tips: COACH_TIPS.map((t) => ({ key: t.key, title: t.title })) };
+}
+
+// ===================== v7.0: auto call prep =====================
+async function autoPrep(tid: string, cfg: any) {
+  const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
+  const tz = cfg?.timezone || "Europe/London";
+  const { data: owner } = await supabase.from("team_members").select("ghl_user_id, personal_calendar_id").eq("tenant_id", tid).eq("gets_financials", true).limit(1).maybeSingle();
+  const userId = owner?.ghl_user_id || cfg?.ghl_user_id;
+  if (!userId) return;
+  const from = Date.now() + 20 * 60000, to = Date.now() + 45 * 60000;
+  const ev = await ghl(token, `/calendars/events?locationId=${loc}&userId=${userId}&startTime=${from}&endTime=${to}`, "GET", undefined, "2021-04-15");
+  const only: string[] = Array.isArray(cfg?.prep_calendars) ? cfg.prep_calendars : [];
+  const events: any[] = (ev.json?.events ?? []).filter((e: any) =>
+    !e.isBlockSlot && e.contactId && e.calendarId !== owner?.personal_calendar_id &&
+    !["cancelled", "invalid"].includes(String(e.appointmentStatus ?? "").toLowerCase()) &&
+    (!only.length || only.includes(e.calendarId)) &&
+    Date.parse(e.startTime) >= from && Date.parse(e.startTime) <= to);
+  for (const e of events.slice(0, 3)) {
+    if (!(await claim(tid, `prep:${e.id}`, String(e.startTime).slice(0, 10)))) continue;
+    const at = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(e.startTime));
+    const r: any = await callPrep(tid, { contact_id: e.contactId, event_title: String(e.title ?? ""), event_time: at });
+    if (r.ok) await sendToTeam(tid, `📋 Your ${at} call — ready when you are:\n\n${r.text}`, "", "prep");
+  }
+}
+
+// ===================== v7.1: Forge auto-scheduling =====================
+type Slot = { start: number; end: number };
+const TIER_RANK: Record<string, number> = { must: 0, high: 1, bonus: 2 };
+
+function hm(v: unknown, fb: string) { const m = String(v ?? fb).match(/^(\d{1,2}):(\d{2})/); return m ? `${m[1].padStart(2, "0")}:${m[2]}` : fb; }
+
+async function forgeHoursSave(tid: string, p: any) {
+  const handle = String(p.handle ?? "").toLowerCase();
+  const patch: Record<string, unknown> = {};
+  for (const k of ["work_start", "work_end", "lunch_start", "lunch_end"]) if (p[k] !== undefined) patch[k] = hm(p[k], "09:00");
+  if (p.work_days !== undefined) patch.work_days = String(p.work_days);
+  if (p.calendar_blocks !== undefined) patch.calendar_blocks = p.calendar_blocks === true || String(p.calendar_blocks) === "true";
+  if (p.max_task_hours !== undefined) patch.max_task_hours = Math.max(1, Math.min(10, Number(p.max_task_hours) || 6));
+  const q = supabase.from("team_members").update(patch).eq("tenant_id", tid);
+  const { error } = handle ? await q.eq("handle", handle) : await q.eq("gets_financials", true);
+  if (!error) await forgePlan(tid, { force: true });
+  return error ? { ok: false, error: error.message } : { ok: true, text: "Working hours saved — your plan's been redone." };
+}
+
+// Re-plan only if something changed since the last plan (tasks edited/added, or a new hour on a work day)
+async function forgePlanIfNeeded(tid: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("forge_planned_at").eq("tenant_id", tid).maybeSingle();
+  const since = cfg?.forge_planned_at ?? "1970-01-01";
+  const { count } = await supabase.from("tasks").select("id", { count: "exact", head: true }).eq("tenant_id", tid).gt("updated_at", since);
+  const stale = Date.now() - Date.parse(since) > 3 * 3600000; // calendars change too — at least every 3 hours
+  if ((count ?? 0) > 0 || stale) await forgePlan(tid, { from_now: true });
+}
+
+async function forgePlan(tid: string, opt: { force?: boolean; from_now?: boolean; delay_minutes?: number } = {}) {
+  const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id, timezone, forge_days").eq("tenant_id", tid).single();
+  const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
+  const tz = cfg?.timezone || "Europe/London";
+  const horizon = Math.max(1, Math.min(10, Number(cfg?.forge_days ?? 5)));
+  const today = localDate(Date.now(), tz);
+  const now = Date.now() + (opt.delay_minutes ?? 0) * 60000;
+  const { data: team } = await supabase.from("team_members").select("*").eq("tenant_id", tid).neq("active", false);
+  const summary: string[] = [];
+  for (const m of team ?? []) {
+    const workDays = String(m.work_days ?? "1,2,3,4,5").split(",").map((x: string) => Number(x.trim())).filter((x: number) => !isNaN(x));
+    const ws = hm(m.work_start, "09:00"), we = hm(m.work_end, "17:30");
+    const ls = m.lunch_start ? hm(m.lunch_start, "12:30") : null, le = m.lunch_end ? hm(m.lunch_end, "13:15") : null;
+    const maxMin = Math.round((Number(m.max_task_hours ?? 6) || 6) * 60);
+    // Days off (from Archie's days-off records) are skipped
+    const { data: off } = await supabase.from("days_off").select("day").eq("tenant_id", tid).eq("handle", m.handle).gte("day", today).limit(30);
+    const offSet = new Set((off ?? []).map((o: any) => String(o.day)));
+    // Calendar busy times (their GHL calendars incl. the personal one that syncs Google) — minus Archie's own task blocks
+    const busy: Slot[] = [];
+    const { data: myBlocks } = await supabase.from("tasks").select("block_event_id").eq("tenant_id", tid).eq("owner", m.handle).not("block_event_id", "is", null);
+    const ownBlockIds = new Set((myBlocks ?? []).map((b: any) => b.block_event_id));
+    if (m.ghl_user_id) {
+      const from = Date.parse(isoAtTz(today, "00:00", tz)), to = from + (horizon + 3) * 86400000;
+      const ev = await ghl(token, `/calendars/events?locationId=${loc}&userId=${m.ghl_user_id}&startTime=${from}&endTime=${to}`, "GET", undefined, "2021-04-15");
+      for (const e of ev.json?.events ?? []) {
+        if (ownBlockIds.has(e.id) || String(e.title ?? "").startsWith("🔨")) continue;
+        if (["cancelled", "invalid"].includes(String(e.appointmentStatus ?? "").toLowerCase())) continue;
+        busy.push({ start: Date.parse(e.startTime) - 5 * 60000, end: Date.parse(e.endTime) + 5 * 60000 });
+      }
+    }
+    // Free slots per working day
+    const days: { date: string; slots: Slot[]; used: number }[] = [];
+    let d = today, guard = 0;
+    while (days.length < horizon && guard++ < 21) {
+      const dow = new Date(`${d}T12:00:00Z`).getUTCDay();
+      if (workDays.includes(dow) && !offSet.has(d)) {
+        let slots: Slot[] = [{ start: Date.parse(isoAtTz(d, ws, tz)), end: Date.parse(isoAtTz(d, we, tz)) }];
+        if (ls && le) busy.push({ start: Date.parse(isoAtTz(d, ls, tz)), end: Date.parse(isoAtTz(d, le, tz)) });
+        if (d === today) slots = slots.map((sl) => ({ start: Math.max(sl.start, Math.ceil(now / 900000) * 900000), end: sl.end })).filter((sl) => sl.end - sl.start >= 15 * 60000);
+        for (const b of busy) {
+          const next: Slot[] = [];
+          for (const sl of slots) {
+            if (b.end <= sl.start || b.start >= sl.end) { next.push(sl); continue; }
+            if (b.start > sl.start) next.push({ start: sl.start, end: b.start });
+            if (b.end < sl.end) next.push({ start: b.end, end: sl.end });
+          }
+          slots = next.filter((sl) => sl.end - sl.start >= 15 * 60000);
+        }
+        days.push({ date: d, slots, used: 0 });
+      }
+      d = addDays(d, 1);
+    }
+    // Tasks to place: carried-over first, then overdue/due soonest, then tier, then oldest
+    const { data: tasks } = await supabase.from("tasks").select("id, title, tier, kind, effort_minutes, due_date, scheduled_start, created_at, move_count, block_event_id")
+      .eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).limit(200);
+    const startOfToday = Date.parse(isoAtTz(today, "00:00", tz));
+    const list = (tasks ?? []).map((t: any) => ({ ...t, carried: !!t.scheduled_start && Date.parse(t.scheduled_start) < startOfToday }))
+      .sort((a: any, b: any) =>
+        (b.carried ? 1 : 0) - (a.carried ? 1 : 0) ||
+        String(a.due_date ?? "9999").localeCompare(String(b.due_date ?? "9999")) ||
+        (TIER_RANK[a.tier] ?? 1) - (TIER_RANK[b.tier] ?? 1) ||
+        String(a.created_at).localeCompare(String(b.created_at)));
+    const placed: { id: string; start: number; end: number; date: string }[] = [];
+    const wontFit: string[] = [];
+    for (const t of list) {
+      const need = Math.max(15, Number(t.effort_minutes) || 30) * 60000;
+      const deadline = t.due_date ? String(t.due_date) : null;
+      let done = false;
+      for (const day of days) {
+        if (day.used + need / 60000 > maxMin && t.tier !== "must") continue; // don't overfill a day (musts can stretch it)
+        // Deep work prefers the earliest slot; shallow work prefers later in the day
+        const order = [...day.slots].sort((a, b) => (t.kind === "deep" ? a.start - b.start : b.start - a.start));
+        const sl = order.find((x) => x.end - x.start >= need);
+        if (!sl) continue;
+        const start = t.kind === "deep" ? sl.start : sl.end - need;
+        const end = start + need;
+        // carve it out of the slot
+        const i = day.slots.indexOf(sl);
+        const rest: Slot[] = [];
+        if (start - sl.start >= 15 * 60000) rest.push({ start: sl.start, end: start });
+        if (sl.end - end >= 15 * 60000) rest.push({ start: end, end: sl.end });
+        day.slots.splice(i, 1, ...rest);
+        day.slots.sort((a, b) => a.start - b.start);
+        day.used += need / 60000;
+        placed.push({ id: t.id, start, end, date: day.date });
+        if (deadline && day.date > deadline) wontFit.push(`"${t.title}" (due ${deadline})`);
+        done = true; break;
+      }
+      if (!done) wontFit.push(`"${t.title}"${deadline ? ` (due ${deadline})` : ""}`);
+    }
+    // Save: scheduled times; today's list = today's blocks; carried-over tasks count as a move
+    const carriedIds = new Set(list.filter((t: any) => t.carried).map((t: any) => t.id));
+    for (const pl of placed) {
+      const upd: Record<string, unknown> = { scheduled_start: new Date(pl.start).toISOString(), scheduled_end: new Date(pl.end).toISOString(), today: pl.date === today };
+      if (pl.date === today) upd.today_set_on = today;
+      if (carriedIds.has(pl.id)) { const t = list.find((x: any) => x.id === pl.id); upd.move_count = (Number(t?.move_count) || 0) + 1; }
+      await supabase.from("tasks").update(upd).eq("id", pl.id);
+    }
+    const placedIds = new Set(placed.map((p) => p.id));
+    const unplaced = list.filter((t: any) => !placedIds.has(t.id)).map((t: any) => t.id);
+    if (unplaced.length) await supabase.from("tasks").update({ scheduled_start: null, scheduled_end: null }).in("id", unplaced);
+    // Optional: task blocks on their personal calendar for today and tomorrow (syncs to Google)
+    if (m.calendar_blocks && m.personal_calendar_id) {
+      const horizonEnd = Date.parse(isoAtTz(addDays(today, 2), "00:00", tz));
+      for (const t of list) {
+        const pl = placed.find((x) => x.id === t.id);
+        if (t.block_event_id) await ghl(token, `/calendars/events/${t.block_event_id}`, "DELETE", undefined, "2021-04-15").catch(() => null);
+        let blockId: string | null = null;
+        if (pl && pl.start < horizonEnd) {
+          const r = await ghl(token, "/calendars/events/block-slots", "POST", { locationId: loc, calendarId: m.personal_calendar_id, title: `🔨 ${String(t.title).slice(0, 80)}`, startTime: new Date(pl.start).toISOString(), endTime: new Date(pl.end).toISOString(), assignedUserId: m.ghl_user_id }, "2021-04-15");
+          blockId = r.json?.id ?? r.json?.event?.id ?? null;
+        }
+        if (blockId !== t.block_event_id) await supabase.from("tasks").update({ block_event_id: blockId }).eq("id", t.id);
+      }
+    }
+    await supabase.from("team_members").update({ forge_wont_fit: wontFit.slice(0, 10) }).eq("tenant_id", tid).eq("handle", m.handle);
+    summary.push(`${m.handle}: ${placed.length} placed${wontFit.length ? `, ${wontFit.length} won't fit` : ""}`);
+  }
+  await supabase.from("tenant_config").update({ forge_planned_at: new Date().toISOString() }).eq("tenant_id", tid);
+  return { ok: true, text: `Plan updated — ${summary.join(" · ")}.` };
+}
+
+async function forgePlanGet(tid: string, handle: string, days = 5) {
+  const { data: cfg } = await supabase.from("tenant_config").select("timezone, ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+  const tz = cfg?.timezone || "Europe/London";
+  const today = localDate(Date.now(), tz);
+  const { data: m } = handle
+    ? await supabase.from("team_members").select("*").eq("tenant_id", tid).eq("handle", handle).maybeSingle()
+    : await supabase.from("team_members").select("*").eq("tenant_id", tid).eq("gets_financials", true).maybeSingle();
+  if (!m) return { ok: false, error: "no such person" };
+  const until = Date.parse(isoAtTz(addDays(today, Math.max(1, Math.min(10, days))), "00:00", tz));
+  const { data: tasks } = await supabase.from("tasks").select("id, title, tier, kind, effort_minutes, due_date, scheduled_start, scheduled_end, move_count").eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).not("scheduled_start", "is", null).lt("scheduled_start", new Date(until).toISOString()).order("scheduled_start");
+  // Calendar events for the same days (to show around the blocks)
+  let events: any[] = [];
+  if (m.ghl_user_id) {
+    const from = Date.parse(isoAtTz(today, "00:00", tz));
+    const ev = await ghl(cfg?.ghl_token || FALLBACK_TOKEN, `/calendars/events?locationId=${cfg?.ghl_location_id}&userId=${m.ghl_user_id}&startTime=${from}&endTime=${until}`, "GET", undefined, "2021-04-15");
+    events = (ev.json?.events ?? []).filter((e: any) => !String(e.title ?? "").startsWith("🔨") && !["cancelled", "invalid"].includes(String(e.appointmentStatus ?? "").toLowerCase()))
+      .map((e: any) => ({ title: e.title, start: e.startTime, end: e.endTime, personal: e.calendarId === m.personal_calendar_id }));
+  }
+  const t2 = (iso: string) => new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(iso));
+  const byDay: Record<string, any> = {};
+  for (const t of tasks ?? []) { const dd = localDate(Date.parse(t.scheduled_start), tz); (byDay[dd] ??= { date: dd, blocks: [], events: [] }).blocks.push({ ...t, from: t2(t.scheduled_start), to: t2(t.scheduled_end) }); }
+  for (const e of events) { const dd = localDate(Date.parse(e.start), tz); (byDay[dd] ??= { date: dd, blocks: [], events: [] }).events.push({ ...e, from: t2(e.start), to: t2(e.end) }); }
+  const todays = byDay[today];
+  const items = todays ? [...todays.events.map((e: any) => ({ at: e.from, line: `${e.from}–${e.to} ${e.title} (calendar)` })), ...todays.blocks.map((b: any) => ({ at: b.from, line: `${b.from}–${b.to} ${b.title}${b.tier === "must" ? " (must)" : ""}${Number(b.move_count) >= 2 ? ` (moved ${b.move_count}x)` : ""}` }))].sort((a, b) => a.at.localeCompare(b.at)) : [];
+  const wont: string[] = Array.isArray(m.forge_wont_fit) ? m.forge_wont_fit : [];
+  const today_text = items.length ? `Today's plan:\n${items.map((x) => x.line).join("\n")}${wont.length ? `\n\nWon't fit this week: ${wont.slice(0, 3).join(", ")} — move one, give it away, or drop it?` : ""}` : `No tasks planned for today${wont.length ? ` — and these won't fit this week: ${wont.slice(0, 3).join(", ")}` : "."}`;
+  return {
+    ok: true, handle: m.handle, today, days: Object.values(byDay).sort((a: any, b: any) => a.date.localeCompare(b.date)), wont_fit: wont, today_text,
+    hours: { work_start: hm(m.work_start, "09:00"), work_end: hm(m.work_end, "17:30"), lunch_start: m.lunch_start ?? null, lunch_end: m.lunch_end ?? null, work_days: m.work_days ?? "1,2,3,4,5", calendar_blocks: !!m.calendar_blocks, max_task_hours: Number(m.max_task_hours ?? 6) },
+  };
+}
+
+// ===================== v7.2: carousel builder =====================
+const CAROUSEL_STYLE = [
+  "Premium editorial software campaign photography for a vertical 4:5 social post.",
+  "Charcoal-black, dark room, soft directional window light from one side, realistic shadows, subtle film grain, natural skin texture, candid and real — editorial art direction, not advertising.",
+  "Minimal, restrained, sophisticated. One restrained red accent (#E53935) only if it appears naturally in the scene; otherwise none.",
+  "ABSOLUTELY NO TEXT, letters, numbers, logos, watermarks, captions or interface copy anywhere in the image. Any screens must be abstract, precise and minimal with no readable text.",
+  "No icons, badges, emojis, neon, glow, gradients, sparks, smoke, robots, AI brains, buttons, decorative elements, clutter or fake dashboards.",
+  "A single photograph — never a collage, contact sheet, split panels or multiple frames.",
+].join(" ");
+
+async function geminiImage(prompt: string, aspect = "4:5"): Promise<{ ok: boolean; bytes?: Uint8Array; mime?: string; error?: string; model?: string }> {
+  const key = Deno.env.get("GEMINI_API_KEY") ?? "";
+  if (!key) return { ok: false, error: "GEMINI_API_KEY missing" };
+  const models = [...new Set([Deno.env.get("GEMINI_IMAGE_MODEL"), "gemini-3.1-flash-image", "gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"].filter(Boolean) as string[])];
+  let lastErr = "";
+  for (const model of models) {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseModalities: ["IMAGE"], imageConfig: { aspectRatio: aspect } } }),
+    });
+    const js: any = await r.json().catch(() => null);
+    if (!r.ok) { lastErr += `${lastErr ? " | " : ""}${model}: ${r.status} ${String(js?.error?.message ?? "").slice(0, 80)}`; continue; }
+    const part = (js?.candidates?.[0]?.content?.parts ?? []).find((pp: any) => pp.inlineData?.data || pp.inline_data?.data);
+    const d = part?.inlineData ?? part?.inline_data;
+    if (!d?.data) { lastErr += `${lastErr ? " | " : ""}${model}: no image returned`; continue; }
+    const bin = atob(d.data); const bytes = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return { ok: true, bytes, mime: d.mimeType ?? d.mime_type ?? "image/png", model };
+  }
+  // Fallback: OpenAI's image model (portrait; the template crops to fit)
+  const oKey = Deno.env.get("OPENAI_API_KEY");
+  if (oKey) {
+    const r = await fetch("https://api.openai.com/v1/images/generations", {
+      method: "POST", headers: { Authorization: `Bearer ${oKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: Deno.env.get("OPENAI_IMAGE_MODEL") || "gpt-image-1", prompt: prompt.slice(0, 3900), size: aspect === "16:9" ? "1536x1024" : "1024x1536", quality: "medium", n: 1 }),
+    });
+    const js: any = await r.json().catch(() => null);
+    const b64 = js?.data?.[0]?.b64_json;
+    if (r.ok && b64) {
+      const bin = atob(b64); const bytes = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return { ok: true, bytes, mime: "image/png", model: Deno.env.get("OPENAI_IMAGE_MODEL") || "gpt-image-1" };
+    }
+    lastErr += ` | openai: ${r.status} ${String(js?.error?.message ?? "").slice(0, 100)}`;
+  }
+  return { ok: false, error: lastErr };
+}
+
+async function carouselStart(tid: string, handle: string, p: any) {
+  const topic = String(p.topic ?? "").trim().slice(0, 600);
+  const given: any[] = Array.isArray(p.slides) ? p.slides : [];
+  if (!topic && !given.length) return { ok: false, error: "What's the carousel about?" };
+  const gateC: any = await allowance(tid, "carousels");
+  if (!gateC.ok) return { ok: false, error: gateC.text, text: gateC.text };
+  const format = String(p.format ?? "carousel") === "story" ? "story" : "carousel";
+  const n = Math.max(format === "story" ? 1 : 3, Math.min(10, Number(p.slides_count ?? (given.length || (format === "story" ? 3 : 7)))));
+  const { data: row, error } = await supabase.from("carousels").insert({ tenant_id: tid, handle, format, topic: topic || String(given[0]?.headline ?? "Carousel"), status: "writing", slides: given.length ? given : null, brief: String(p.brief ?? "").slice(0, 600) || null }).select("id").single();
+  if (error || !row) return { ok: false, error: error?.message ?? "couldn't start" };
+  startInBackground(carouselPipeline(tid, row.id, n));
+  return { ok: true, id: row.id, text: `On it — writing and designing ${given.length || n} ${format === "story" ? "story frames" : "slides"}. Usually ready in 3–5 minutes; I'll message you when it's done.` };
+}
+
+async function carouselPipeline(tid: string, id: string, n: number) {
+  try {
+    const { data: car } = await supabase.from("carousels").select("*").eq("id", id).single();
+    const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).single();
+    const { data: t } = await supabase.from("tenants").select("business_name").eq("id", tid).maybeSingle();
+    let slides: any[] = Array.isArray(car.slides) ? car.slides : [];
+    // 1. Write the campaign (unless they gave their own copy)
+    if (!slides.length) {
+      const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
+      const agentId = await agentIdFor(tid, "content", token, loc);
+      if (!agentId) throw new Error("Archie Content agent not found");
+      const msg = [
+        `Use your create-carousel skill in EDITORIAL MODE (Archie's carousel builder). Write a ${n}-${car.format === "story" ? "frame Instagram STORY sequence" : "slide Instagram carousel"} about: ${car.topic}`,
+        car.brief ? `Notes from the owner: ${car.brief}` : "",
+        "Return ONLY JSON: {\"slides\":[{\"headline\":[\"LINE\",\"LINE\"],\"support\":\"SHORT LINE\",\"accent_word\":\"WORD or empty\",\"photo\":\"the photo brief\"}],\"caption\":\"the caption, written with your caption skill\"}",
+        "",
+        await businessContext(tid),
+      ].filter(Boolean).join("\n");
+      let parsed: any = null;
+      for (let attempt = 0; attempt < 2 && !parsed?.slides?.length; attempt++) {
+        const res = await agentExecute(token, agentId, { locationId: loc, message: (attempt ? "Reply with VALID JSON only — no line breaks inside any text value.\n\n" : "") + msg.slice(0, 9400) }, `carousel-${tid}-${Date.now()}`);
+        const m = tidy(clean(String(res.json?.finalText ?? ""))).match(/\{[\s\S]*\}/);
+        try { parsed = m ? looseJson(m[0]) : null; } catch { parsed = null; }
+      }
+      slides = (parsed?.slides ?? []).slice(0, n);
+      if (!slides.length) throw new Error("the copy didn't come back — try again");
+      await supabase.from("carousels").update({ caption: String(parsed?.caption ?? "").slice(0, 2200) || null }).eq("id", id);
+    }
+    const total = slides.length;
+    slides = slides.map((sl: any, i: number) => ({
+      n: i + 1, counter: car.format === "story" ? `${i + 1}/${total}` : `${String(i + 1).padStart(2, "0")}/${String(total).padStart(2, "0")}`,
+      headline: (Array.isArray(sl.headline) ? sl.headline : String(sl.headline ?? "").split(/\n|\s*\/\s*/)).map((x: string) => String(x).toUpperCase().trim()).filter(Boolean).slice(0, 5),
+      support: String(sl.support ?? "").toUpperCase().slice(0, 80), accent_word: String(sl.accent_word ?? sl.accentWord ?? "").trim(),
+      photo: String(sl.photo ?? sl.visual ?? ""), status: "queued",
+    }));
+    await supabase.from("carousels").update({ slides, status: "designing", updated_at: new Date().toISOString() }).eq("id", id);
+    // 2. Each slide: photo (no text) → typography on the grid
+    for (const sl of slides) await carouselMakeSlide(tid, id, sl, cfg, t?.business_name, car.format);
+    const { data: fin } = await supabase.from("carousels").select("slides").eq("id", id).single();
+    const okCount = (fin?.slides ?? []).filter((x: any) => x.status === "done").length;
+    await supabase.from("carousels").update({ status: okCount ? "done" : "failed", updated_at: new Date().toISOString() }).eq("id", id);
+    if (okCount) await sendToTeam(tid, car.format === "story" ? `📱 Your story's ready: "${(slides[0]?.headline ?? []).join(" ")}" (${okCount} frames). Open Content to check it, or reply "post the story" to put the frames in Social Planner as drafts.` : `🖼️ Your carousel's ready: "${(slides[0]?.headline ?? []).join(" ")}" (${okCount} slides). Open Content → Carousels to check it, or reply "post the carousel" to put it in Social Planner as a draft.`, "", "carousel");
+  } catch (e) {
+    await supabase.from("carousels").update({ status: "failed", error: String(e).slice(0, 300), updated_at: new Date().toISOString() }).eq("id", id);
+  }
+}
+
+async function carouselMakeSlide(tid: string, id: string, sl: any, cfg: any, businessName?: string, format = "carousel") {
+  const save = async (patch: any) => {
+    const { data: cur } = await supabase.from("carousels").select("slides").eq("id", id).single();
+    const arr = (cur?.slides ?? []).map((x: any) => (x.n === sl.n ? { ...x, ...patch } : x));
+    await supabase.from("carousels").update({ slides: arr, updated_at: new Date().toISOString() }).eq("id", id);
+  };
+  try {
+    await save({ status: "photo" });
+    const img = format === "story"
+      ? await geminiImage(`${CAROUSEL_STYLE.replace("vertical 4:5 social post", "vertical 9:16 Instagram story")}\n\nSCENE: ${sl.photo || "a business owner at a desk early in the morning, laptop open, coffee beside them"}.\nCompose for a 4:5 frame: subject centred, nothing important at the very top or bottom.`, "4:5")
+      : await geminiImage(`${CAROUSEL_STYLE}\n\nSCENE: ${sl.photo || "a business owner at a desk early in the morning, laptop open, coffee beside them, quietly focused"}.\nCompose with the subject entirely in the RIGHT third of the frame; keep the left two-thirds dark and mostly empty.`);
+    if (!img.ok || !img.bytes) throw new Error(`photo: ${img.error}`);
+    const path = `carousels/${tid}/${id}/${sl.n}-photo.${(img.mime ?? "").includes("jpeg") ? "jpg" : "png"}`;
+    const up = await supabase.storage.from(CLIPS_BUCKET).upload(path, img.bytes, { contentType: img.mime, upsert: true });
+    if (up.error) throw new Error(`storage: ${up.error.message}`);
+    const { data: signed } = await supabase.storage.from(CLIPS_BUCKET).createSignedUrl(path, 3600);
+    await save({ status: "typesetting", photo_path: path });
+    const brandAccent = cfg?.carousel_accent || "#E53935";
+    const still: any = await renderStillOnLambda({
+      region: (Deno.env.get("REMOTION_REGION") ?? "eu-west-2") as any, functionName: Deno.env.get("REMOTION_FUNCTION")!, serveUrl: Deno.env.get("REMOTION_SERVE_URL")!,
+      composition: format === "story" ? "ArchieStory" : "ArchieSlide", imageFormat: "png", privacy: "no-acl",
+      inputProps: { imageUrl: signed?.signedUrl, counter: sl.counter, headline: sl.headline, support: sl.support, wordmark: String(cfg?.carousel_wordmark || businessName || "ARCHIE"), accent: brandAccent, accentWord: sl.accent_word, imageSide: "right" },
+    } as any);
+    const url = String(still?.url ?? "");
+    if (!url) throw new Error("typesetting returned no image");
+    // Into GHL Media (by link)
+    let mediaUrl = "";
+    try {
+      const fd = new FormData();
+      fd.append("hosted", "true"); fd.append("fileUrl", url); fd.append("name", `Carousel ${sl.counter.replace("/", " of ")} — ${(sl.headline ?? []).join(" ").slice(0, 40)}.png`);
+      const r = await fetch(`https://services.leadconnectorhq.com/medias/upload-file?altType=location&altId=${cfg?.ghl_location_id}`, { method: "POST", headers: { Authorization: `Bearer ${cfg?.ghl_token || FALLBACK_TOKEN}`, Version: "2021-07-28" }, body: fd });
+      const js: any = await r.json().catch(() => null);
+      mediaUrl = String(js?.url ?? js?.fileUrl ?? "");
+    } catch { /* the S3 link still works */ }
+    await save({ status: "done", image_url: url, media_url: mediaUrl || null, model: img.model, error: null });
+  } catch (e) {
+    await save({ status: "failed", error: String(e).slice(0, 200) });
+  }
+}
+
+async function carouselGet(tid: string, id: string) {
+  const { data } = await supabase.from("carousels").select("*").eq("tenant_id", tid).eq("id", id).maybeSingle();
+  return data ? { ok: true, carousel: data } : { ok: false, error: "not found" };
+}
+
+// Redo one slide: new photo, or new words ({headline:[], support, accent_word, photo})
+async function carouselRedoSlide(tid: string, id: string, n: number, p: any) {
+  const { data: car } = await supabase.from("carousels").select("*").eq("tenant_id", tid).eq("id", id).maybeSingle();
+  if (!car) return { ok: false, error: "not found" };
+  const sl = (car.slides ?? []).find((x: any) => x.n === n);
+  if (!sl) return { ok: false, error: "no such slide" };
+  const next = {
+    ...sl,
+    headline: Array.isArray(p.headline) ? p.headline.map((x: string) => String(x).toUpperCase()) : sl.headline,
+    support: p.support !== undefined ? String(p.support).toUpperCase() : sl.support,
+    accent_word: p.accent_word !== undefined ? String(p.accent_word) : sl.accent_word,
+    photo: p.photo ? String(p.photo) : sl.photo,
+  };
+  const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).single();
+  const { data: t } = await supabase.from("tenants").select("business_name").eq("id", tid).maybeSingle();
+  await supabase.from("carousels").update({ slides: (car.slides ?? []).map((x: any) => (x.n === n ? next : x)), planner_post_id: null }).eq("id", id);
+  startInBackground(carouselMakeSlide(tid, id, next, cfg, t?.business_name, car.format));
+  return { ok: true, text: `Redoing slide ${n} — about a minute.` };
+}
+
+async function carouselPost(tid: string, id: string) {
+  const { data: car } = await supabase.from("carousels").select("*").eq("tenant_id", tid).eq("id", id).maybeSingle();
+  if (!car) return { ok: false, text: "Carousel not found." };
+  if (car.planner_post_id) return { ok: true, text: "That carousel's already in Social Planner as a draft." };
+  const urls = (car.slides ?? []).filter((x: any) => x.status === "done").sort((a: any, b: any) => a.n - b.n).map((x: any) => x.media_url || x.image_url);
+  if (urls.length < (car.format === "story" ? 1 : 2)) return { ok: false, text: "It isn't finished yet." };
+  const { data: cfg } = await supabase.from("tenant_config").select("ghl_token").eq("tenant_id", tid).single();
+  if (car.format === "story") {
+    let made = 0, lastErr = "", accs: string[] = [];
+    for (const u of urls) { const rs: any = await toPlanner({ tid, ghlToken: cfg?.ghl_token || FALLBACK_TOKEN }, { type: "story", media_url: u, media_type: "image/png" }); if (rs.ok) { made++; accs = rs.accounts ?? accs; } else lastErr = rs.error; }
+    if (!made) return { ok: false, text: `I couldn't add the story to Social Planner: ${lastErr}` };
+    await supabase.from("carousels").update({ planner_post_id: "story" }).eq("id", id);
+    return { ok: true, text: `✅ ${made} story frame${made === 1 ? "" : "s"} added to Social Planner as drafts${accs.length ? ` for ${accs.join(", ")}` : ""}. Schedule them a few minutes apart, in order.` };
+  }
+  const r: any = await toPlanner({ tid, ghlToken: cfg?.ghl_token || FALLBACK_TOKEN }, { type: "post", text: car.caption || car.topic, media_urls: urls, media_type: "image/png" });
+  if (!r.ok) return { ok: false, text: `I couldn't add it to Social Planner: ${r.error}` };
+  await supabase.from("carousels").update({ planner_post_id: r.post_id ?? "added" }).eq("id", id);
+  return { ok: true, text: `✅ Carousel added to Social Planner as a draft (${urls.length} slides)${r.accounts?.length ? ` for ${r.accounts.join(", ")}` : ""}. Open Social Planner to pick the time.` };
+}
+
+// ===================== v7.3: feature usage + feedback =====================
+async function logFeature(tid: string, feature: string, channel: string, handle: string | null, ok = true) {
+  try { await supabase.from("feature_events").insert({ tenant_id: tid, feature: String(feature).slice(0, 80), channel, handle, ok }); } catch { /* never block */ }
+}
+
+async function saveFeedback(tid: string, handle: string | null, p: any) {
+  const rating = Number(p.rating) > 0 ? 1 : Number(p.rating) < 0 ? -1 : 0;
+  let feature = String(p.feature ?? "").trim();
+  if (!feature) {
+    // What were they reacting to? Their last feature used in the past 2 hours
+    const { data: last } = await supabase.from("feature_events").select("feature").eq("tenant_id", tid).gte("created_at", new Date(Date.now() - 2 * 3600000).toISOString()).order("created_at", { ascending: false }).limit(1).maybeSingle();
+    feature = last?.feature ?? "general";
+  }
+  const { error } = await supabase.from("feature_feedback").insert({ tenant_id: tid, handle, feature, rating, comment: String(p.comment ?? "").slice(0, 1000) || null, ref_id: p.ref_id ? String(p.ref_id) : null, channel: String(p.channel ?? "page") });
+  return error ? { ok: false, text: "Couldn't save that feedback." } : { ok: true, feature, text: rating < 0 ? "Thanks — noted. Want me to redo it?" : "Thanks — noted." };
+}
+
+// Across all clients (agency account) or just this one: what's used, what isn't, what people think
+async function featureReport(tid: string, days = 30) {
+  const { data: me } = await supabase.from("tenant_config").select("is_agency").eq("tenant_id", tid).maybeSingle();
+  const all = !!me?.is_agency;
+  const since = new Date(Date.now() - Math.max(7, Math.min(365, days)) * 86400000).toISOString();
+  let q = supabase.from("feature_events").select("tenant_id, feature, channel, handle, created_at").gte("created_at", since).limit(50000);
+  if (!all) q = q.eq("tenant_id", tid);
+  const { data: ev } = await q;
+  let fq = supabase.from("feature_feedback").select("tenant_id, feature, rating, comment, created_at").gte("created_at", since).order("created_at", { ascending: false }).limit(2000);
+  if (!all) fq = fq.eq("tenant_id", tid);
+  const { data: fb } = await fq;
+  // Skill runs live in screen_runs too
+  let sq = supabase.from("screen_runs").select("tenant_id, skill, created_at").gte("created_at", since).not("skill", "is", null).limit(20000);
+  if (!all) sq = sq.eq("tenant_id", tid);
+  const { data: runs } = await sq;
+  const rows = new Map<string, { feature: string; uses: number; tenants: Set<string>; people: Set<string>; channels: Record<string, number>; last: string; up: number; down: number; comments: string[] }>();
+  const get = (f: string) => { let r = rows.get(f); if (!r) { r = { feature: f, uses: 0, tenants: new Set(), people: new Set(), channels: {}, last: "", up: 0, down: 0, comments: [] }; rows.set(f, r); } return r; };
+  for (const e of ev ?? []) { const r = get(e.feature); r.uses++; r.tenants.add(e.tenant_id); if (e.handle) r.people.add(`${e.tenant_id}:${e.handle}`); r.channels[e.channel] = (r.channels[e.channel] ?? 0) + 1; if (e.created_at > r.last) r.last = e.created_at; }
+  for (const s of runs ?? []) { const f = `skill:${s.skill}`; if ((ev ?? []).some((e: any) => e.feature === f && e.tenant_id === s.tenant_id && Math.abs(Date.parse(e.created_at) - Date.parse(s.created_at)) < 60000)) continue; const r = get(f); r.uses++; r.tenants.add(s.tenant_id); r.channels["skill run"] = (r.channels["skill run"] ?? 0) + 1; if (s.created_at > r.last) r.last = s.created_at; }
+  for (const f of fb ?? []) { const r = get(f.feature); if (f.rating > 0) r.up++; else if (f.rating < 0) r.down++; if (f.comment && r.comments.length < 5) r.comments.push(f.comment); }
+  // Skills that exist but nobody used = candidates to cut
+  const { data: catalog } = await supabase.from("skills_catalog").select("key, name, enabled").eq("enabled", true);
+  const unused = (catalog ?? []).filter((k: any) => !rows.has(`skill:${k.key}`)).map((k: any) => k.key);
+  const list = [...rows.values()].map((r) => ({ feature: r.feature, uses: r.uses, clients: r.tenants.size, people: r.people.size, channels: r.channels, last_used: r.last || null, thumbs_up: r.up, thumbs_down: r.down, comments: r.comments }))
+    .sort((a, b) => b.uses - a.uses);
+  const top = list.slice(0, 5).map((x) => `${x.feature} (${x.uses})`).join(", ");
+  const low = list.filter((x) => x.uses <= 2).map((x) => x.feature).slice(0, 8).join(", ");
+  const disliked = list.filter((x) => x.thumbs_down > x.thumbs_up && x.thumbs_down >= 2).map((x) => `${x.feature} (${x.thumbs_down} 👎)`).join(", ");
+  return {
+    ok: true, scope: all ? "all clients" : "this account", days, features: list, unused_skills: unused,
+    text: [`Last ${days} days${all ? " across all clients" : ""}:`, top ? `Most used: ${top}.` : "No usage yet.", low ? `Barely used: ${low}.` : "", unused.length ? `Never used: ${unused.slice(0, 10).join(", ")}.` : "", disliked ? `Needs work (more 👎 than 👍): ${disliked}.` : ""].filter(Boolean).join("\n"),
+  };
+}
+
+// ===================== v7.4: activation, "what Archie did for you", month video =====================
+async function activationInfo(tid: string) {
+  const since = new Date(Date.now() - 7 * 86400000).toISOString();
+  const [{ data: msgs }, { data: feats }, { count: reels }, { count: ig }] = await Promise.all([
+    supabase.from("talk_messages").select("created_at").eq("tenant_id", tid).eq("role", "user").gte("created_at", since).limit(500),
+    supabase.from("feature_events").select("feature").eq("tenant_id", tid).gte("created_at", since).limit(2000),
+    supabase.from("edit_jobs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("status", "done"),
+    supabase.from("ig_connections").select("tenant_id", { count: "exact", head: true }).eq("tenant_id", tid),
+  ]);
+  return {
+    active_days_7: new Set((msgs ?? []).map((m: any) => String(m.created_at).slice(0, 10))).size,
+    features_7: new Set((feats ?? []).map((f: any) => f.feature)).size,
+    first_reel: (reels ?? 0) > 0, instagram_connected: (ig ?? 0) > 0,
+  };
+}
+
+// What Archie did this month — in pounds and hours. Hours use fixed, conservative minutes per job (shown in the text).
+const MINUTES_SAVED: Record<string, number> = { brief: 15, checkin: 5, reel: 45, carousel: 60, story: 20, dump: 10, prep: 10, draft: 5, plan: 10 };
+async function monthStats(tid: string, month?: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("stripe_key, timezone").eq("tenant_id", tid).maybeSingle();
+  const m = /^\d{4}-\d{2}$/.test(String(month ?? "")) ? String(month) : new Date().toISOString().slice(0, 7);
+  const [y, mo] = m.split("-").map(Number);
+  const from = new Date(Date.UTC(y, mo - 1, 1)).toISOString(), to = new Date(Date.UTC(y, mo, 1)).toISOString();
+  const between = (q: any, col = "created_at") => q.gte(col, from).lt(col, to);
+  const [briefs, checkins, reels, posted, carousels, dumps, preps, drafts, tasksDone, plans] = await Promise.all([
+    between(supabase.from("briefs").select("brief_date", { count: "exact", head: true }).eq("tenant_id", tid), "brief_date").then((r: any) => r.count ?? 0),
+    between(supabase.from("message_drafts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("status", "sent"), "sent_at").then((r: any) => r.count ?? 0),
+    between(supabase.from("edit_jobs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("status", "done").or("kind.is.null,kind.neq.month")).then((r: any) => r.count ?? 0),
+    between(supabase.from("edit_jobs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).not("planner_post_id", "is", null)).then((r: any) => r.count ?? 0),
+    between(supabase.from("carousels").select("format").eq("tenant_id", tid).eq("status", "done")).then((r: any) => r.data ?? []),
+    between(supabase.from("dumps").select("id", { count: "exact", head: true }).eq("tenant_id", tid)).then((r: any) => r.count ?? 0),
+    between(supabase.from("agent_usage").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("job", "prep")).then((r: any) => r.count ?? 0),
+    between(supabase.from("message_drafts").select("id", { count: "exact", head: true }).eq("tenant_id", tid)).then((r: any) => r.count ?? 0),
+    between(supabase.from("tasks").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("status", "done"), "updated_at").then((r: any) => r.count ?? 0),
+    between(supabase.from("feature_events").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("feature", "archie_plan")).then((r: any) => r.count ?? 0),
+  ]);
+  const carCount = carousels.filter((c: any) => c.format !== "story").length, storyCount = carousels.filter((c: any) => c.format === "story").length;
+  // Money recovered: Stripe invoices that failed at least once and were then paid this month
+  let recovered = 0, recoveredCount = 0;
+  if (cfg?.stripe_key) {
+    try {
+      const page: any = await stripeGet(cfg.stripe_key, `invoices?status=paid&limit=100&created[gte]=${Math.floor(Date.parse(from) / 1000) - 45 * 86400}`);
+      for (const inv of page?.data ?? []) {
+        const paidAt = Number(inv.status_transitions?.paid_at ?? 0) * 1000;
+        if (Number(inv.attempt_count ?? 1) > 1 && paidAt >= Date.parse(from) && paidAt < Date.parse(to)) { recovered += Number(inv.amount_paid ?? 0) / 100; recoveredCount++; }
+      }
+    } catch { /* optional */ }
+  }
+  const minutes = briefs * MINUTES_SAVED.brief + checkins * MINUTES_SAVED.checkin + reels * MINUTES_SAVED.reel + carCount * MINUTES_SAVED.carousel + storyCount * MINUTES_SAVED.story + dumps * MINUTES_SAVED.dump + preps * MINUTES_SAVED.prep + Math.max(0, drafts - checkins) * MINUTES_SAVED.draft + plans * MINUTES_SAVED.plan;
+  const hours = Math.round(minutes / 60);
+  const monthName = new Date(Date.UTC(y, mo - 1, 15)).toLocaleDateString("en-GB", { month: "long" });
+  const lines = [
+    `What Archie did for you in ${monthName}:`,
+    recovered ? `£${Math.round(recovered).toLocaleString("en-GB")} recovered from ${recoveredCount} failed payment${recoveredCount === 1 ? "" : "s"}` : "",
+    `About ${hours} hours saved`,
+    checkins ? `${checkins} check-ins and follow-ups sent` : "",
+    reels ? `${reels} reel${reels === 1 ? "" : "s"} edited${posted ? `, ${posted} posted` : ""}` : "",
+    carCount || storyCount ? `${carCount ? `${carCount} carousel${carCount === 1 ? "" : "s"}` : ""}${carCount && storyCount ? " and " : ""}${storyCount ? `${storyCount} stor${storyCount === 1 ? "y" : "ies"}` : ""} designed` : "",
+    briefs ? `${briefs} morning briefs` : "",
+    tasksDone ? `${tasksDone} tasks done` : "",
+    `(Hours are worked out at ${MINUTES_SAVED.brief} min a brief, ${MINUTES_SAVED.reel} min a reel, ${MINUTES_SAVED.carousel} min a carousel, ${MINUTES_SAVED.checkin} min a check-in.)`,
+  ].filter(Boolean);
+  const stats = [
+    recovered ? { value: Math.round(recovered), prefix: "£", label: "RECOVERED", sub: `from ${recoveredCount} failed payment${recoveredCount === 1 ? "" : "s"}` } : null,
+    { value: hours, suffix: " HRS", label: "SAVED", sub: "admin Archie did for you" },
+    checkins ? { value: checkins, label: "CHECK-INS SENT", sub: "to clients who needed one" } : null,
+    reels ? { value: reels, label: "REELS EDITED", sub: posted ? `${posted} posted` : "" } : null,
+    tasksDone ? { value: tasksDone, label: "TASKS DONE", sub: "" } : null,
+  ].filter(Boolean).slice(0, 5);
+  return { ok: true, month: m, month_name: monthName, recovered, recovered_count: recoveredCount, hours, checkins, reels, posted, carousels: carCount, stories: storyCount, briefs, tasks_done: tasksDone, stats, text: lines.join("\n") };
+}
+
+async function monthVideo(tid: string, st: any) {
+  if (!st?.stats?.length) return;
+  const { data: cfg } = await supabase.from("tenant_config").select("carousel_wordmark, carousel_accent, brand_primary").eq("tenant_id", tid).maybeSingle();
+  const { data: t } = await supabase.from("tenants").select("business_name").eq("id", tid).maybeSingle();
+  const { data: owner } = await supabase.from("team_members").select("handle").eq("tenant_id", tid).eq("gets_financials", true).maybeSingle();
+  const nextMonth = new Date(Date.UTC(Number(st.month.slice(0, 4)), Number(st.month.slice(5, 7)), 15)).toLocaleDateString("en-GB", { month: "long" }).toUpperCase();
+  const props = { month: String(st.month_name).toUpperCase(), business: t?.business_name ?? "", wordmark: cfg?.carousel_wordmark || "ARCHIE", accent: cfg?.carousel_accent || "#E53935", stats: st.stats, closing: `HERE'S TO ${nextMonth}.` };
+  const render: any = await renderMediaOnLambda({
+    region: (Deno.env.get("REMOTION_REGION") ?? "eu-west-2") as any, functionName: Deno.env.get("REMOTION_FUNCTION")!, serveUrl: Deno.env.get("REMOTION_SERVE_URL")!,
+    composition: "ArchieMonth", inputProps: props, codec: "h264", privacy: "no-acl", framesPerLambda: 300, outName: `month-${tid.slice(0, 8)}-${st.month}.mp4`,
+  } as any);
+  await supabase.from("edit_jobs").insert({ tenant_id: tid, handle: owner?.handle ?? "owner", kind: "month", title: `${st.month_name} with Archie`, status: "rendering", render_id: render.renderId, bucket: render.bucketName, source_url: "month", seconds: Math.round((3 + st.stats.length * 4 + 3)) });
+}
+
+// ===================== v7.5: voice brief, screenshot anything, win back =====================
+async function openai(path: string, body: unknown) {
+  const key = Deno.env.get("OPENAI_API_KEY") ?? "";
+  return await fetch(`https://api.openai.com/v1/${path}`, { method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+
+// The brief as a ~60–90 second voice note (Archie's own voice — never a clone of anyone's)
+async function briefVoice(tid: string, member: any, briefText: string) {
+  try {
+    const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, brief_channel, voice_name, timezone").eq("tenant_id", tid).single();
+    const sr = await openai("chat/completions", { model: "gpt-4o-mini", temperature: 0.5, messages: [
+      { role: "system", content: "Turn this WhatsApp morning brief into a spoken script for a 60–90 second voice note from Archie, a friendly, direct assistant. Speak to them by first name. Lead with the one focus, then the 3–4 things that matter most, then one line to close. No lists, no emojis, no symbols, no URLs — just natural spoken sentences. Say amounts like 'two hundred and ninety-seven pounds'. Under 220 words." },
+      { role: "user", content: `Name: ${member.name ?? member.handle}\n\n${briefText.slice(0, 4000)}` },
+    ] });
+    const sj: any = await sr.json().catch(() => null);
+    const script = String(sj?.choices?.[0]?.message?.content ?? "").trim();
+    if (!script) return;
+    const ar = await openai("audio/speech", { model: "gpt-4o-mini-tts", voice: cfg?.voice_name || "onyx", input: script, response_format: "mp3", instructions: "Warm, upbeat, clear British-friendly delivery, like a capable assistant giving a morning rundown." });
+    if (!ar.ok) return;
+    const bytes = new Uint8Array(await ar.arrayBuffer());
+    const path = `voice/${tid}/${new Date().toISOString().slice(0, 10)}-${member.handle}.mp3`;
+    const up = await supabase.storage.from(CLIPS_BUCKET).upload(path, bytes, { contentType: "audio/mpeg", upsert: true });
+    if (up.error) return;
+    const { data: signed } = await supabase.storage.from(CLIPS_BUCKET).createSignedUrl(path, 7 * 86400);
+    const channel = String(cfg?.brief_channel ?? "").toLowerCase().includes("whatsapp") ? "WhatsApp" : "SMS";
+    await ghl(cfg?.ghl_token || FALLBACK_TOKEN, "/conversations/messages", "POST", { type: channel, contactId: member.ghl_contact_id, message: "🎧 Your brief as a voice note", attachments: [signed?.signedUrl] }, "2021-04-15");
+  } catch { /* the text brief already went */ }
+}
+
+// Screenshot anything: Archie reads the picture and acts — lead, tasks, a reply draft
+async function screenshotAct(tid: string, handle: string, imageUrl: string, instruction: string) {
+  { const gate: any = await allowance(tid, "screenshots"); if (!gate.ok) return { ok: false, text: gate.text }; }
+  const key = Deno.env.get("GEMINI_API_KEY") ?? "";
+  if (!key) return { ok: false, text: "I can't read screenshots yet (GEMINI_API_KEY missing)." };
+  const img = await fetch(imageUrl);
+  if (!img.ok) return { ok: false, text: "I couldn't open that image — try sending it again." };
+  const buf = new Uint8Array(await img.arrayBuffer());
+  let bin = ""; for (let i = 0; i < buf.length; i += 8192) bin += String.fromCharCode(...buf.subarray(i, i + 8192));
+  const mime = img.headers.get("content-type")?.split(";")[0] || "image/jpeg";
+  const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id, timezone").eq("tenant_id", tid).single();
+  const today = localDate(Date.now(), cfg?.timezone || "Europe/London");
+  const ask = [
+    "You are Archie, a business owner's assistant. They've sent you a screenshot (a DM, a WhatsApp, an email, a booking request, a spreadsheet, a note…). Work out what it is and what they need doing.",
+    instruction ? `What they said with it: ${instruction}` : "They sent it with no message — decide the useful action yourself.",
+    `Today is ${today}.`,
+    "Only use what's actually in the image. Don't invent names, numbers or dates.",
+    "Return ONLY JSON:",
+    '{"what":"one line: what this is","person":{"name":"","phone":"","email":"","instagram":""},"is_new_lead":true|false,"they_want":"one line","reply":"a short reply in a warm, direct, human tone the owner can send (empty if none needed)","tasks":[{"title":"","due_date":"YYYY-MM-DD or empty","tier":"must|high|bonus","minutes":15}],"note":"anything worth remembering about this person (empty if none)"}',
+    "",
+    await businessContext(tid),
+  ].join("\n");
+  const models = [...new Set([Deno.env.get("GEMINI_MODEL"), "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash"].filter(Boolean) as string[])];
+  let out: any = null, lastErr = "";
+  for (const model of models) {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ inline_data: { mime_type: mime, data: btoa(bin) } }, { text: ask }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.3 } }) });
+    const js: any = await r.json().catch(() => null);
+    if (!r.ok) { lastErr = `${model} ${r.status}`; continue; }
+    try { out = JSON.parse(String(js?.candidates?.[0]?.content?.parts?.map((x: any) => x.text ?? "").join("") ?? "").replace(/^```(?:json)?|```$/g, "").trim()); break; } catch { lastErr = `${model}: not JSON`; }
+  }
+  if (!out) return { ok: false, text: `I couldn't read that one (${lastErr}). Try a clearer screenshot.` };
+  const done: string[] = [];
+  const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
+  // New lead → into GHL contacts (only with something real to go on)
+  const pr = out.person ?? {};
+  if (out.is_new_lead && (pr.phone || pr.email || pr.instagram || pr.name)) {
+    const [first, ...rest] = String(pr.name ?? "").trim().split(/\s+/);
+    const r = await ghl(token, "/contacts/upsert", "POST", { locationId: loc, firstName: first || undefined, lastName: rest.join(" ") || undefined, phone: pr.phone || undefined, email: pr.email || undefined, source: "Screenshot via Archie", tags: ["archie-lead"] }, "2021-07-28");
+    const cid = r.json?.contact?.id;
+    if (cid) {
+      done.push(`added ${pr.name || pr.instagram || "them"} to your contacts as a lead`);
+      const noteBody = [out.they_want ? `Wants: ${out.they_want}` : "", pr.instagram ? `Instagram: ${pr.instagram}` : "", out.note || ""].filter(Boolean).join(" · ");
+      if (noteBody) await ghl(token, `/contacts/${cid}/notes`, "POST", { body: `[from a screenshot] ${today} — ${noteBody}` }, "2021-07-28");
+    }
+  }
+  // Tasks
+  for (const t of (Array.isArray(out.tasks) ? out.tasks : []).slice(0, 5)) {
+    const title = String(t?.title ?? "").trim(); if (!title) continue;
+    const due = /^\d{4}-\d{2}-\d{2}$/.test(String(t?.due_date ?? "")) ? String(t.due_date) : null;
+    const { error } = await supabase.from("tasks").insert({ tenant_id: tid, title: title.slice(0, 200), tier: ["must", "high", "bonus"].includes(t?.tier) ? t.tier : "high", kind: "shallow", effort_minutes: Math.max(15, Number(t?.minutes) || 15), status: "open", owner: handle || null, source: "screenshot", source_ref: `shot:${crypto.randomUUID()}`, due_date: due, accepted_by: handle || null, accepted_at: new Date().toISOString() });
+    if (!error) done.push(`task: ${title}${due ? ` (${due === today ? "today" : due})` : ""}`);
+  }
+  const reply = String(out.reply ?? "").trim();
+  return {
+    ok: true, read: out,
+    text: [`📸 ${out.what ?? "Got it"}.`, done.length ? `Done: ${done.join("; ")}.` : "", reply ? `\nReply you can send:\n${reply}` : "", `\nSay "save it" if you want the screenshot kept in your media too.`].filter(Boolean).join("\n"),
+  };
+}
+
+// Win back everyone who left: cancelled Stripe subscriptions → personal drafts for each, in their voice
+async function winBack(tid: string, months = 12) {
+  { const gate: any = await allowance(tid, "winback"); if (!gate.ok) return { ok: false, text: gate.text }; }
+  const { data: cfg } = await supabase.from("tenant_config").select("*").eq("tenant_id", tid).single();
+  if (!cfg?.stripe_key) return { ok: false, text: "I need Stripe connected to find who's left (Settings → Connections)." };
+  const since = Math.floor((Date.now() - Math.max(1, Math.min(36, months)) * 30 * 86400000) / 1000);
+  const page: any = await stripeGet(cfg.stripe_key, `subscriptions?status=canceled&limit=100&expand[]=data.customer`);
+  const subs: any[] = (page?.data ?? []).filter((sb: any) => Number(sb.canceled_at ?? sb.ended_at ?? 0) >= since);
+  if (!subs.length) return { ok: true, text: `Nobody cancelled in the last ${months} months — nice.` };
+  // One per person (latest cancellation), with how long they stayed and what they paid
+  const people = new Map<string, any>();
+  for (const sb of subs) {
+    const c = sb.customer ?? {}; const email = String(c.email ?? "").toLowerCase(); if (!email || people.has(email)) continue;
+    const amt = (sb.items?.data ?? []).reduce((a: number, it: any) => a + Number(it.price?.unit_amount ?? 0) / 100 * Number(it.quantity ?? 1), 0);
+    people.set(email, { email, name: c.name ?? "", started: new Date(Number(sb.start_date) * 1000).toISOString().slice(0, 10), ended: new Date(Number(sb.canceled_at ?? sb.ended_at) * 1000).toISOString().slice(0, 10), months: Math.max(1, Math.round((Number(sb.canceled_at ?? sb.ended_at) - Number(sb.start_date)) / (30 * 86400))), amount: Math.round(amt), reason: sb.cancellation_details?.feedback ?? sb.cancellation_details?.comment ?? "" });
+  }
+  const token = cfg.ghl_token || FALLBACK_TOKEN, loc = cfg.ghl_location_id;
+  const found: any[] = [];
+  for (const pp of [...people.values()].slice(0, 25)) {
+    const r = await ghl(token, `/contacts/?locationId=${loc}&query=${encodeURIComponent(pp.email)}&limit=1`, "GET", undefined, "2021-07-28");
+    const ct = r.json?.contacts?.[0];
+    if (!ct?.id) continue;
+    const nt = await ghl(token, `/contacts/${ct.id}/notes`, "GET", undefined, "2021-07-28");
+    const notes = (nt.json?.notes ?? []).slice(0, 3).map((n: any) => String(n.body ?? "").replace(/\s+/g, " ").slice(0, 200)).join(" | ");
+    found.push({ ...pp, id: ct.id, first: ct.firstName || String(pp.name).split(" ")[0] || "there", name: [ct.firstName, ct.lastName].filter(Boolean).join(" ") || pp.name, phone: ct.phone, notes });
+  }
+  if (!found.length) return { ok: true, text: `${people.size} people cancelled, but I couldn't match them to contacts in GHL (by email).` };
+  const agentId = await agentIdFor(tid, "sales", token, loc) || await agentIdFor(tid, "content", token, loc);
+  if (!agentId) return { ok: false, text: "Couldn't find the Sales agent to write the messages." };
+  const msg = [
+    "Use your win-back skill to write one message to each past client below.",
+    'Return ONLY JSON: {"messages":[{"email":"","message":""}]}',
+    "",
+    "PAST CLIENTS:",
+    ...found.map((f) => `- ${f.name} (${f.email}): with us ${f.months} month${f.months === 1 ? "" : "s"} (${f.started} to ${f.ended}), £${f.amount}/month${f.reason ? `, reason given: ${f.reason}` : ""}${f.notes ? `. Notes: ${f.notes}` : ""}`),
+    "",
+    await businessContext(tid),
+  ].join("\n").slice(0, 9500);
+  const res = await agentExecute(token, agentId, { locationId: loc, message: msg }, `winback-${tid}-${Date.now()}`);
+  let written: any[] = [];
+  try { const mm = tidy(clean(String(res.json?.finalText ?? ""))).match(/\{[\s\S]*\}/); written = mm ? looseJson(mm[0]).messages ?? [] : []; } catch { written = []; }
+  const today = localDate(Date.now(), cfg.timezone || "Europe/London");
+  const { data: existing } = await supabase.from("message_drafts").select("rank").eq("tenant_id", tid).eq("status", "pending").eq("created_on", today);
+  let rank = Math.max(0, ...(existing ?? []).map((r: any) => Number(r.rank) || 0));
+  const channel = String(cfg.brief_channel ?? "").toLowerCase().includes("whatsapp") ? "WA" : "SMS";
+  const made: string[] = [];
+  for (const f of found) {
+    const w = written.find((x: any) => String(x?.email ?? "").toLowerCase() === f.email);
+    const body = String(w?.message ?? "").trim();
+    if (!body) continue;
+    rank++;
+    const { error } = await supabase.from("message_drafts").insert({ tenant_id: tid, created_on: today, rank, status: "pending", source: "winback", contact_id: f.id, name: f.name, channel, body: body.slice(0, 1000) });
+    if (error) rank--; else made.push(`${rank}. ${f.name} (left ${f.ended}): ${body.slice(0, 110)}…`);
+  }
+  return { ok: true, count: made.length, text: made.length ? `💌 ${made.length} past client${made.length === 1 ? "" : "s"} to win back — each message written for them:\n${made.join("\n")}\n\nSay "send them" to send all, "send 2" for one, or "bin 3".` : "I found them but the messages didn't come back — try again in a minute." };
+}
+
+// Read JSON from an agent reply, forgiving the usual mistakes: real line breaks / tabs inside strings, smart quotes,
+// trailing commas, and text before or after the object.
+function looseJson(raw: string): any {
+  const text = String(raw ?? "").trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+  try { return JSON.parse(text); } catch { /* fix it below */ }
+  let out = "", inStr = false, esc = false;
+  for (const ch of text) {
+    if (inStr) {
+      if (esc) { out += ch; esc = false; continue; }
+      if (ch === "\\") { out += ch; esc = true; continue; }
+      if (ch === '"') { out += ch; inStr = false; continue; }
+      if (ch === "\n") { out += "\\n"; continue; }
+      if (ch === "\r") { continue; }
+      if (ch === "\t") { out += "\\t"; continue; }
+      if (ch.charCodeAt(0) < 32) { continue; }
+      out += ch;
+    } else {
+      if (ch === '"') inStr = true;
+      out += ch;
+    }
+  }
+  out = out.replace(/[\u201C\u201D]/g, '\\"').replace(/,\s*([}\]])/g, "$1");
+  return JSON.parse(out);
+}
+
+// ===================== v7.7: Archie Edit v2 checks =====================
+// Where is the face? Render one frame of the raw clip, ask Gemini for the face centre (0..1).
+async function faceFocus(videoUrl: string, duration: number): Promise<{ x: number; y: number }> {
+  const fallback = { x: 0.5, y: 0.38 };
+  try {
+    const still: any = await renderStillOnLambda({ region: (Deno.env.get("REMOTION_REGION") ?? "eu-west-2") as any, functionName: Deno.env.get("REMOTION_FUNCTION")!, serveUrl: Deno.env.get("REMOTION_SERVE_URL")!, composition: "ArchieFrame", imageFormat: "jpeg", privacy: "no-acl", inputProps: { videoUrl, at: Math.max(0.5, (duration || 10) * 0.3) } } as any);
+    const img = await fetch(String(still?.url ?? "")); if (!img.ok) return fallback;
+    const buf = new Uint8Array(await img.arrayBuffer()); let bin = ""; for (let i = 0; i < buf.length; i += 8192) bin += String.fromCharCode(...buf.subarray(i, i + 8192));
+    const key = Deno.env.get("GEMINI_API_KEY") ?? "";
+    for (const model of [...new Set([Deno.env.get("GEMINI_MODEL"), "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash"].filter(Boolean) as string[])]) {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ inline_data: { mime_type: "image/jpeg", data: btoa(bin) } }, { text: 'Find the main person\'s face in this vertical video frame. Return ONLY JSON {"x":0.5,"y":0.4} — the face centre as fractions of width and height (0 to 1). If there is no face, return {"x":0.5,"y":0.4}.' }] }], generationConfig: { responseMimeType: "application/json", temperature: 0 } }) });
+      if (!r.ok) continue;
+      const js: any = await r.json().catch(() => null);
+      const o = looseJson(String(js?.candidates?.[0]?.content?.parts?.map((x: any) => x.text ?? "").join("") ?? "{}"));
+      const x = Number(o?.x), y = Number(o?.y);
+      if (x >= 0 && x <= 1 && y >= 0 && y <= 1) return { x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100 };
+    }
+  } catch { /* fallback */ }
+  return fallback;
+}
+
+// Clean audio: ElevenLabs voice isolator on the raw clip (skipped for very large files or if no key)
+async function cleanAudio(tid: string, id: string, videoUrl: string): Promise<string> {
+  const key = Deno.env.get("ELEVENLABS_API_KEY");
+  if (!key) return "";
+  try {
+    const head = await fetch(videoUrl, { method: "HEAD" });
+    const size = Number(head.headers.get("content-length") ?? 0);
+    if (size && size > 90 * 1024 * 1024) return "";
+    const vid = await fetch(videoUrl); if (!vid.ok) return "";
+    const blob = await vid.blob();
+    const fd = new FormData(); fd.append("audio", blob, "clip.mp4");
+    const r = await fetch("https://api.elevenlabs.io/v1/audio-isolation", { method: "POST", headers: { "xi-api-key": key }, body: fd });
+    if (!r.ok) { console.log("audio isolation", r.status, (await r.text()).slice(0, 200)); return ""; }
+    const bytes = new Uint8Array(await r.arrayBuffer());
+    const path = `clean/${tid}/${id}.mp3`;
+    const up = await supabase.storage.from(CLIPS_BUCKET).upload(path, bytes, { contentType: "audio/mpeg", upsert: true });
+    if (up.error) return "";
+    const { data: signed } = await supabase.storage.from(CLIPS_BUCKET).createSignedUrl(path, 3 * 86400);
+    return signed?.signedUrl ?? "";
+  } catch { return ""; }
+}
+
+const normWord = (w: string) => w.toLowerCase().replace(/[^a-z0-9']/g, "");
+
+// After rendering: no chopped words (re-transcribe and compare) + a quick quality look, then deliver
+async function v2Check(tid: string, job: any, url: string) {
+  const notes: string[] = [];
+  try {
+    // 1. No chopped words
+    const expected = (job.props?.captions ?? []).flatMap((g: any) => (g.words ?? []).map((w: any) => normWord(w.w))).filter(Boolean);
+    const key = Deno.env.get("DEEPGRAM_API_KEY");
+    if (key && expected.length) {
+      const r = await fetch("https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&language=en", { method: "POST", headers: { Authorization: `Token ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ url }) });
+      const js: any = await r.json().catch(() => null);
+      const heard = (js?.results?.channels?.[0]?.alternatives?.[0]?.words ?? []).map((w: any) => normWord(String(w.punctuated_word ?? w.word))).filter(Boolean);
+      const bag = new Map<string, number>(); for (const h of heard) bag.set(h, (bag.get(h) ?? 0) + 1);
+      let missing = 0; const missed: string[] = [];
+      for (const e of expected) { const n = bag.get(e) ?? 0; if (n > 0) bag.set(e, n - 1); else { missing++; if (missed.length < 5) missed.push(e); } }
+      const doubled = [...bag.values()].reduce((a, n) => a + n, 0) - Math.max(0, heard.length - expected.length - [...bag.values()].reduce((a, n) => a + n, 0));
+      const extra = Math.max(0, heard.length - (expected.length - missing));
+      const rate = missing / expected.length;
+      if (rate > 0.04 && !(Number(job.pad_extra) > 0)) {
+        // Widen every cut slightly and re-render once
+        await supabase.from("edit_jobs").update({ status: "planning", pad_extra: 0.06, checked_at: null, render_id: null, output_url: null, qa: { cut_check: `re-cut: ${missing} words looked clipped (${missed.join(", ")})` } }).eq("id", job.id);
+        startInBackground(editPipeline(tid, job.id, true, job.plan));
+        return;
+      }
+      void doubled;
+      notes.push(missing ? `Cut check: ${missing} word${missing === 1 ? "" : "s"} may be soft (${missed.join(", ")}).` : extra > 2 ? `Cut check: every word's there, but ${extra} extra word${extra === 1 ? "" : "s"} (a repeat?) slipped in.` : "Cut check: every word's there.");
+    }
+    // 2. Quick quality look (Gemini watches the finished reel)
+    const gkey = Deno.env.get("GEMINI_API_KEY");
+    if (gkey) {
+      const vid = await fetch(url);
+      if (vid.ok) {
+        const buf = new Uint8Array(await vid.arrayBuffer());
+        if (buf.length < 60 * 1024 * 1024) {
+          const up = await fetch(`https://generativelanguage.googleapis.com/upload/v1beta/files?key=${gkey}`, { method: "POST", headers: { "X-Goog-Upload-Command": "start, upload, finalize", "X-Goog-Upload-Header-Content-Length": String(buf.length), "X-Goog-Upload-Header-Content-Type": "video/mp4", "Content-Type": "video/mp4" }, body: buf });
+          const uj: any = await up.json().catch(() => null);
+          if (uj?.file?.name) {
+            for (let i = 0; i < 20; i++) { const f: any = await fetch(`https://generativelanguage.googleapis.com/v1beta/${uj.file.name}?key=${gkey}`).then((x) => x.json()).catch(() => null); if (f?.state === "ACTIVE" || f?.state === "FAILED") break; await new Promise((ok) => setTimeout(ok, 3000)); }
+            for (const model of [...new Set([Deno.env.get("GEMINI_MODEL"), "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash"].filter(Boolean) as string[])]) {
+              const g = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${gkey}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ file_data: { mime_type: "video/mp4", file_uri: uj.file.uri } }, { text: 'You are checking a finished vertical reel before it goes to the owner. Score it out of 100 against these rules: captions are ONE line and match the speech; nothing covers the speaker\'s face; on-screen text is short, readable and spelled right; each card shows one idea and stays up 2-3 seconds (not flickering); cards appear on the word they show; no empty, blank or frozen frames; key text sits between roughly 15% and 78% of the height (clear of Instagram\'s buttons); audio clear and even; the first second has a hook; the ending is not cut off. Return ONLY JSON {"score":0,"ok":true|false,"issues":["short plain-English issue"]} (max 3 issues, only real ones).' }] }], generationConfig: { responseMimeType: "application/json", temperature: 0 } }) });
+              if (!g.ok) continue;
+              const gj: any = await g.json().catch(() => null);
+              const q = looseJson(String(gj?.candidates?.[0]?.content?.parts?.map((x: any) => x.text ?? "").join("") ?? "{}"));
+              const issues: string[] = Array.isArray(q?.issues) ? q.issues.map(String).slice(0, 3) : [];
+              const score = Number(q?.score);
+              notes.push(`${Number.isFinite(score) ? `Archie's check: ${Math.round(score)}/100` : "Archie's check"}${issues.length ? ` — spotted: ${issues.join("; ")}. Say "change something" to fix it.` : " — looks good."}`);
+              break;
+            }
+          }
+        }
+      }
+    }
+  } catch (e) { notes.push(`(Check skipped: ${String(e).slice(0, 60)})`); }
+  await supabase.from("edit_jobs").update({ status: "rendering", qa: { notes } }).eq("id", job.id);
+  // Hand back to the normal delivery (GHL Media + WhatsApp), now marked as checked
+  const { data: fresh } = await supabase.from("edit_jobs").select("*").eq("id", job.id).single();
+  if (fresh) await editCheck(tid, fresh);
+}
+
+// ===================== v7.7.1: style breakdown =====================
+const STYLE_ASK = [
+  "You are a senior short-form video editor. Study ONLY the editing style of this reel (not the topic) so another editor can recreate the look exactly. Be precise and measurable.",
+  "Return ONLY JSON:",
+  '{"vibe":"3-6 words","captions":{"style":"karaoke|word-by-word|2-4 word groups|full sentences|none","words_per_screen":0,"position":"top|middle|lower-third|bottom","size":"small|medium|large|huge","weight":"regular|bold|black","case":"upper|sentence|mixed","font_feel":"e.g. condensed sans, rounded, serif, handwritten","colours":"text colour, highlight colour, outline/shadow/box","animation":"how words appear (pop, slide, fade, typewriter, bounce) and how the highlight moves","emphasis":"how key words are treated"},"pacing":{"avg_shot_seconds":0,"jump_cuts":"none|some|constant","silences":"kept|trimmed|removed completely","speed_feel":"calm|steady|fast|frantic"},"zooms":{"per_10_seconds":0,"scale":"subtle 5-10%|medium 10-20%|punchy 20%+","style":"smooth push|snap punch-in|whip","triggers":"what makes it zoom"},"hook":{"on_screen_text":"yes/no + style","seconds":0,"position":"","tricks":"pattern interrupts in the first 2s"},"graphics":[{"type":"e.g. emoji, icon, number, list card, arrow, screenshot, b-roll, sticker","how_often":"","style":""}],"sound":{"music":"none|soft bed|prominent","sfx":"none|on cuts|on zooms|on text","voice":"raw|cleaned|compressed"},"look":{"colour_grade":"","framing":"tight face|chest up|wide|mixed","background":""},"cover":"","replicate":["5-8 concrete instructions to recreate this style in a template: e.g. captions 2-3 words, white 900 weight uppercase, yellow highlight on keyword, pop scale 0.8→1 over 6 frames; snap zoom 1.18 on every key claim; whoosh SFX on zooms"]}',
+].join("\n");
+
+async function styleBreakdown(tid: string, urls: string[], notify: boolean) {
+  { const gate: any = await allowance(tid, "styles"); if (!gate.ok) { if (notify) await sendToTeam(tid, gate.text, "", "style"); return; } }
+  const token = Deno.env.get("APIFY_API_TOKEN"), gkey = Deno.env.get("GEMINI_API_KEY");
+  if (!token || !gkey || !urls.length) return;
+  const done: string[] = [];
+  for (const url of urls) {
+    try {
+      const r = await fetch(`https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items?token=${token}&timeout=240`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ directUrls: [url.split("?")[0]], resultsType: "posts", resultsLimit: 1 }) });
+      const items: any[] = await r.json().catch(() => []);
+      const it = Array.isArray(items) ? items.find((x) => x?.videoUrl) : null;
+      if (!it?.videoUrl) { done.push(`${url.split("?")[0]} — couldn't fetch the video`); continue; }
+      const vid = await fetch(it.videoUrl); if (!vid.ok) { done.push(`${url.split("?")[0]} — video download failed`); continue; }
+      const buf = new Uint8Array(await vid.arrayBuffer());
+      const up = await fetch(`https://generativelanguage.googleapis.com/upload/v1beta/files?key=${gkey}`, { method: "POST", headers: { "X-Goog-Upload-Command": "start, upload, finalize", "X-Goog-Upload-Header-Content-Length": String(buf.length), "X-Goog-Upload-Header-Content-Type": "video/mp4", "Content-Type": "video/mp4" }, body: buf });
+      const uj: any = await up.json().catch(() => null);
+      if (!uj?.file?.name) { done.push(`${url.split("?")[0]} — upload to Gemini failed`); continue; }
+      for (let i = 0; i < 30; i++) { const f: any = await fetch(`https://generativelanguage.googleapis.com/v1beta/${uj.file.name}?key=${gkey}`).then((x) => x.json()).catch(() => null); if (f?.state === "ACTIVE" || f?.state === "FAILED") break; await new Promise((ok) => setTimeout(ok, 3000)); }
+      let spec: any = null;
+      for (const model of [...new Set([Deno.env.get("GEMINI_MODEL"), "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash"].filter(Boolean) as string[])]) {
+        const g = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${gkey}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ file_data: { mime_type: "video/mp4", file_uri: uj.file.uri } }, { text: STYLE_ASK }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.2 } }) });
+        if (!g.ok) continue;
+        const gj: any = await g.json().catch(() => null);
+        try { spec = looseJson(String(gj?.candidates?.[0]?.content?.parts?.map((x: any) => x.text ?? "").join("") ?? "")); spec.model = model; break; } catch { spec = null; }
+      }
+      if (!spec) { done.push(`${url.split("?")[0]} — couldn't read the style`); continue; }
+      spec.creator = it.ownerUsername ?? null; spec.views = it.videoPlayCount ?? it.videoViewCount ?? null;
+      await supabase.from("style_specs").insert({ tenant_id: tid, url: url.split("?")[0], spec });
+      done.push(`${spec.creator ? "@" + spec.creator + " — " : ""}${spec.vibe ?? "studied"}: captions ${spec.captions?.style ?? "?"} (${spec.captions?.case ?? ""}, ${spec.captions?.position ?? ""}), ${spec.pacing?.speed_feel ?? "?"} pace, zooms ${spec.zooms?.style ?? "?"}`);
+    } catch (e) { done.push(`${url.split("?")[0]} — ${String(e).slice(0, 60)}`); }
+  }
+  if (notify) await sendToTeam(tid, `🔍 Style breakdown done:\n${done.map((d, i) => `${i + 1}. ${d}`).join("\n")}\n\nThe full specs are saved — they'll become your style presets.`, "", "style");
+}
+
+// ===================== v7.8: plans and allowances =====================
+// Archie = monthly limits on the heavier "wow" features; Plus = unlimited (fair use). Daily essentials are never limited.
+const PLAN_LIMITS: Record<string, Record<string, number | null>> = {
+  archie: { reels: 12, weeks: 2, carousels: 8, accounts: 6, screenshots: 30, winback: 1, council: 4, styles: 0 },
+  plus:   { reels: null, weeks: null, carousels: null, accounts: 15, screenshots: null, winback: null, council: null, styles: 3 },
+};
+const ALLOW_LABEL: Record<string, string> = { reels: "reel edits", weeks: "weeks of content", carousels: "carousels and stories", accounts: "accounts to learn from", screenshots: "screenshots", winback: "win-back campaigns", council: "second opinions", styles: "custom reel styles" };
+
+async function allowanceUsed(tid: string, key: string): Promise<number> {
+  const monthStart = `${new Date().toISOString().slice(0, 7)}-01T00:00:00Z`;
+  const cnt = async (q: any) => ((await q).count ?? 0);
+  switch (key) {
+    case "reels": return cnt(supabase.from("edit_jobs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).gte("created_at", monthStart).neq("status", "failed").is("parent_id", null).or("multi.is.null,multi.eq.false").or("kind.is.null,kind.neq.month"));
+    case "weeks": return cnt(supabase.from("edit_jobs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).gte("created_at", monthStart).eq("multi", true));
+    case "carousels": return cnt(supabase.from("carousels").select("id", { count: "exact", head: true }).eq("tenant_id", tid).gte("created_at", monthStart).neq("status", "failed"));
+    case "accounts": return cnt(supabase.from("watched_accounts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("active", true));
+    case "screenshots": return cnt(supabase.from("feature_events").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("feature", "screenshot").gte("created_at", monthStart));
+    case "winback": return cnt(supabase.from("agent_usage").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("job", "winback").gte("created_at", monthStart));
+    case "council": return cnt(supabase.from("agent_usage").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("job", "council").gte("created_at", monthStart));
+    case "styles": return cnt(supabase.from("style_specs").select("id", { count: "exact", head: true }).eq("tenant_id", tid));
+  }
+  return 0;
+}
+
+async function allowance(tid: string, key: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("plan, is_agency").eq("tenant_id", tid).maybeSingle();
+  if (cfg?.is_agency) return { ok: true, plan: "agency", used: 0, limit: null, left: null };
+  const plan = String(cfg?.plan ?? "archie") === "plus" ? "plus" : "archie";
+  const limit = PLAN_LIMITS[plan][key];
+  if (limit === null || limit === undefined) return { ok: true, plan, used: 0, limit: null, left: null };
+  const used = await allowanceUsed(tid, key);
+  const left = Math.max(0, limit - used);
+  if (left > 0) return { ok: true, plan, used, limit, left };
+  const reset = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() + 1, 1)).toLocaleDateString("en-GB", { day: "numeric", month: "long" });
+  const text = limit === 0
+    ? `${ALLOW_LABEL[key][0].toUpperCase()}${ALLOW_LABEL[key].slice(1)} come with Archie Plus — upgrade any time for unlimited reels, carousels and more.`
+    : key === "accounts"
+      ? `You're learning from ${limit} accounts — the most on your plan. Remove one to add another, or upgrade to Archie Plus for up to 15.`
+      : `That's all ${limit} ${ALLOW_LABEL[key]} for this month — great going! They reset on ${reset}, or upgrade to Archie Plus for unlimited.`;
+  return { ok: false, plan, used, limit, left: 0, text };
+}
+
+async function planUsage(tid: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("plan, is_agency").eq("tenant_id", tid).maybeSingle();
+  const plan = cfg?.is_agency ? "agency" : String(cfg?.plan ?? "archie") === "plus" ? "plus" : "archie";
+  const rows: any[] = [];
+  for (const key of Object.keys(PLAN_LIMITS.archie)) {
+    const limit = plan === "agency" ? null : PLAN_LIMITS[plan][key];
+    rows.push({ key, label: ALLOW_LABEL[key], used: await allowanceUsed(tid, key), limit });
+  }
+  const name = plan === "plus" ? "Archie Plus" : plan === "agency" ? "Agency (no limits)" : "Archie";
+  const text = `Your plan: ${name}.\nThis month: ${rows.filter((r) => r.limit !== 0).map((r) => `${r.label} ${r.used}${r.limit === null ? "" : ` of ${r.limit}`}`).join(" · ")}.\n${plan === "archie" ? "Archie Plus makes these unlimited." : ""}`.trim();
+  return { ok: true, plan, rows, text };
+}
+
+// ===================== v8.0: cost alert =====================
+// Rough unit costs (£) for the non-chat work — tune these once real bills are in.
+const UNIT_COST: Record<string, number> = { reel_v1: 0.06, reel_v2: 0.18, carousel_slide: 0.05, story_frame: 0.05, idea: 0.03, screenshot: 0.01, voice_brief: 0.02, style: 0.05 };
+async function costInfo(tid: string) {
+  const month = new Date().toISOString().slice(0, 7);
+  const from = `${month}-01T00:00:00Z`;
+  const { data: cfg } = await supabase.from("tenant_config").select("cost_budget_gbp").eq("tenant_id", tid).maybeSingle();
+  const budget = Number(cfg?.cost_budget_gbp ?? 105) || 105;
+  const u: any = await usage(tid, month);                     // AI agent runs (rate per run from tenant_config)
+  const cnt = async (q: any) => ((await q).count ?? 0);
+  const [r1, r2, cars, ideas, shots, voice, styles] = await Promise.all([
+    cnt(supabase.from("edit_jobs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).gte("created_at", from).or("engine.is.null,engine.neq.v2").neq("status", "failed")),
+    cnt(supabase.from("edit_jobs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).gte("created_at", from).eq("engine", "v2").neq("status", "failed")),
+    supabase.from("carousels").select("format, slides").eq("tenant_id", tid).gte("created_at", from).then((r: any) => r.data ?? []),
+    cnt(supabase.from("content_posts").select("id", { count: "exact", head: true }).eq("tenant_id", tid).in("status", ["ready", "to_film", "filmed", "skipped", "failed"]).gte("updated_at", from)),
+    cnt(supabase.from("feature_events").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("feature", "screenshot").gte("created_at", from)),
+    cnt(supabase.from("team_members").select("id", { count: "exact", head: true }).eq("tenant_id", tid).eq("brief_voice", true)),
+    cnt(supabase.from("style_specs").select("id", { count: "exact", head: true }).eq("tenant_id", tid).gte("created_at", from)),
+  ]);
+  const frames = (cars as any[]).reduce((a, c) => a + (Array.isArray(c.slides) ? c.slides.length : 0), 0);
+  const day = new Date().getUTCDate(), days = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() + 1, 0)).getUTCDate();
+  const parts: Record<string, number> = {
+    "AI runs": Number(u.est_cost_gbp ?? 0),
+    reels: r1 * UNIT_COST.reel_v1 + r2 * UNIT_COST.reel_v2,
+    "carousels/stories": frames * UNIT_COST.carousel_slide,
+    ideas: ideas * UNIT_COST.idea,
+    screenshots: shots * UNIT_COST.screenshot,
+    "voice briefs": voice * day * UNIT_COST.voice_brief,
+    styles: styles * UNIT_COST.style,
+  };
+  const soFar = Object.values(parts).reduce((a, b) => a + b, 0);
+  const projected = Math.round((soFar / Math.max(1, day)) * days * 100) / 100;
+  const pct = Math.round((projected / budget) * 100);
+  const top = Object.entries(parts).sort((a, b) => b[1] - a[1])[0];
+  return {
+    cost_so_far_gbp: Math.round(soFar * 100) / 100, cost_projected_gbp: projected, cost_budget_gbp: budget, cost_pct: pct,
+    cost_level: pct >= 100 ? "red" : pct >= 70 ? "amber" : "green",
+    cost_top: top ? `${top[0]} (£${Math.round(top[1] * 100) / 100} so far)` : "—",
+    cost_parts: Object.fromEntries(Object.entries(parts).map(([k, v]) => [k, Math.round(v * 100) / 100])),
+  };
 }
 
 // ===================== workflow side =====================
