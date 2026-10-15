@@ -1,4 +1,7 @@
-// capture v7.1 — everything the owner or team texts (or voice-notes) to Archie.
+// capture v7.3 — everything the owner or team texts (or voice-notes) to Archie.
+// v7.3: B-roll by WhatsApp — a photo/clip sent with "B-roll" (or "add these to my B-roll" after sending several) is
+//       named properly, saved into GHL Media → B-roll and added to Archie's B-roll library.
+// v7.2: multi-clip edits — send several clips (one line or scene each), then "edit these" → one reel from all of them.
 // v7.1: screenshots/photos with no "save" → Archie reads them and acts; videos with "a week of content" / "cut into reels" → several reels + a carousel.
 // v7.0: "edit, this is idea 2" links the video to number 2 on the filming list.
 // v6.9: videos and photos sent on WhatsApp are saved into GHL Media; say "edit" with a video and Archie Edit makes it a reel.
@@ -55,7 +58,7 @@ async function secretOk(header: string | null, tenantId: string): Promise<boolea
 }
 
 Deno.serve(async (req) => {
-  console.log("capture v7.1 start");
+  console.log("capture v7.3 start");
   try {
     const raw = await req.json();
     const p = { ...raw, ...(raw.customData ?? {}) };
@@ -67,6 +70,29 @@ Deno.serve(async (req) => {
     if (!tenant_id) return j({ ok: true, reply: "" });
 
     const { data: cfg } = await supabase.from("tenant_config").select("timezone, ghl_token, ghl_location_id").eq("tenant_id", tenant_id).single();
+
+    // "Add these to my B-roll" after sending several photos/clips → all of them into B-roll
+    if (senderContact && /\b(add|put|save|upload)\b.*\b(these|them|those|all|this|it)\b.*\bb[\s-]?roll\b|\bb[\s-]?roll\b.*\b(these|them|those)\b/i.test(text)) {
+      const items = await recentMedia(cfg?.ghl_token || FALLBACK_TOKEN, cfg?.ghl_location_id, senderContact, 40);
+      if (items.length) {
+        const r = await fetch(`${SUPA_URL}/functions/v1/archie-screens`, { method: "POST", headers: { "Content-Type": "application/json", "x-archie-secret": SECRET }, body: JSON.stringify({ action: "broll_add", tenant_id, urls: items }) });
+        const rj: any = await r.json().catch(() => null);
+        return j({ ok: true, reply: String(rj?.text ?? `Adding ${items.length} to your B-roll — I'll message you when they're named and saved.`), has_reply: "yes" });
+      }
+    }
+
+    // Several clips sent one after another, then "edit these" → one reel from all of them
+    if (senderContact && /^\s*(edit (these|them|those|all (of )?(them|these)|the clips|these clips|my clips)|that'?s (all|it)[,.! ]*(now )?edit( (these|them))?|make (a|one) reel (from|out of) (these|them))\b/i.test(text)) {
+      const vids = await recentVideos(cfg?.ghl_token || FALLBACK_TOKEN, cfg?.ghl_location_id, senderContact, 40);
+      console.log("multi-clip:", vids.length);
+      if (vids.length < 2) return j({ ok: true, reply: vids.length ? "I only see one clip from the last 40 minutes — send it with \"edit\", or send the rest first." : "I can't see any clips from the last 40 minutes — send them, then say \"edit these\".", has_reply: "yes" });
+      const { data: team0 } = await supabase.from("team_members").select("handle, ghl_contact_id, phone").eq("tenant_id", tenant_id).neq("active", false);
+      const who = (team0 ?? []).find((m: any) => m.ghl_contact_id === senderContact || (m.phone && m.phone.replace(/\s+/g, "") === senderPhone));
+      if (!who) return j({ ok: true, reply: "", skipped: "sender not on team" });
+      const r = await fetch(`${SUPA_URL}/functions/v1/archie-screens`, { method: "POST", headers: { "Content-Type": "application/json", "x-archie-secret": SECRET }, body: JSON.stringify({ action: "edit_start", tenant_id, handle: who?.handle ?? "owner", video_urls: vids, brief: text }) });
+      const rj: any = await r.json().catch(() => null);
+      return j({ ok: true, reply: rj?.ok ? `🎬 Got all ${vids.length} clips — making one reel from them, a new scene on each line. About 6–10 minutes.` : `I couldn't start that edit: ${rj?.error ?? "unknown error"}`, has_reply: "yes" });
+    }
 
     // Videos and photos → save to GHL Media (and "edit" → Archie Edit). Checked only when the message could be media.
     const MEDIA_HINT = /^\s*$|^[^a-z]*\b(video|image|photo|picture|document|file|attachment|media)\b[^a-z]*$|\b(save|media|edit|upload|store|keep)\b/i;
@@ -84,6 +110,12 @@ Deno.serve(async (req) => {
         const named = caption.match(/\b(?:as|call it|name it|called)\s+["']?(.+?)["']?\s*$/i)?.[1];
         const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
         const name = `${(named || (media.kind === "video" ? "WhatsApp video" : media.kind === "image" ? "WhatsApp photo" : "WhatsApp file")).slice(0, 80)} (${stamp})${media.ext ? `.${media.ext}` : ""}`;
+        // "B-roll" with a photo or clip → straight into the B-roll folder, named properly
+        if (/\bb[\s-]?roll\b/i.test(caption) && (media.kind === "image" || media.kind === "video")) {
+          const r = await fetch(`${SUPA_URL}/functions/v1/archie-screens`, { method: "POST", headers: { "Content-Type": "application/json", "x-archie-secret": SECRET }, body: JSON.stringify({ action: "broll_add", tenant_id, urls: [{ url: media.url, kind: media.kind }] }) });
+          const rj: any = await r.json().catch(() => null);
+          return j({ ok: true, reply: String(rj?.text ?? "Adding it to your B-roll."), has_reply: "yes" });
+        }
         // A picture without "save" → Archie reads it and acts (lead, tasks, reply draft)
         const wantsSave = /\b(save|keep|store|upload|media)\b/i.test(caption) || !!named;
         if (media.kind === "image" && !wantsSave) {
@@ -505,4 +537,51 @@ async function saveToMedia(token: string, loc: string | undefined, url: string, 
     if (!r.ok) return { ok: false, url: "", error: `${r.status} ${JSON.stringify(js).slice(0, 120)}` };
     return { ok: true, url: String(js?.url ?? js?.fileUrl ?? "") };
   } catch (e) { return { ok: false, url: "", error: String(e).slice(0, 120) }; }
+}
+
+// The videos this person sent in the last N minutes, oldest first (for "edit these")
+async function recentVideos(token: string, loc: string | undefined, contactId: string, minutes: number): Promise<string[]> {
+  if (!loc) return [];
+  const cs = await ghl(token, `/conversations/search?locationId=${loc}&contactId=${contactId}&limit=1`, "GET");
+  const conv = (cs.json?.conversations ?? [])[0];
+  if (!conv?.id) return [];
+  const ms = await ghl(token, `/conversations/${conv.id}/messages?limit=60`, "GET");
+  const list: any[] = ms.json?.messages?.messages ?? ms.json?.messages ?? [];
+  const since = Date.now() - minutes * 60 * 1000;
+  const out: { url: string; at: number }[] = [];
+  for (const m of Array.isArray(list) ? list : []) {
+    if (String(m.direction ?? "").toLowerCase() !== "inbound") continue;
+    const at = m.dateAdded ? Date.parse(m.dateAdded) : Date.now();
+    if (at < since) continue;
+    for (const a of (m.attachments ?? []).flatMap((x: any) => (Array.isArray(x) ? x : [x]))) {
+      const u = typeof a === "string" ? a : a?.url ?? "";
+      const ext = (String(u).split("?")[0].match(/\.([a-z0-9]{2,5})$/i)?.[1] ?? "").toLowerCase();
+      if (/^https?:/.test(u) && (["mp4", "mov", "m4v", "3gp", "mkv"].includes(ext) || /video/i.test(String(m.contentType ?? m.messageType ?? "")))) out.push({ url: u, at });
+    }
+  }
+  return out.sort((a, b) => a.at - b.at).map((x) => x.url).slice(0, 15);
+}
+
+// Photos and clips this person sent in the last N minutes, oldest first (for "add these to my B-roll")
+async function recentMedia(token: string, loc: string | undefined, contactId: string, minutes: number): Promise<{ url: string; kind: string }[]> {
+  if (!loc) return [];
+  const cs = await ghl(token, `/conversations/search?locationId=${loc}&contactId=${contactId}&limit=1`, "GET");
+  const conv = (cs.json?.conversations ?? [])[0];
+  if (!conv?.id) return [];
+  const ms = await ghl(token, `/conversations/${conv.id}/messages?limit=80`, "GET");
+  const list: any[] = ms.json?.messages?.messages ?? ms.json?.messages ?? [];
+  const since = Date.now() - minutes * 60 * 1000;
+  const out: { url: string; kind: string; at: number }[] = [];
+  for (const m of Array.isArray(list) ? list : []) {
+    if (String(m.direction ?? "").toLowerCase() !== "inbound") continue;
+    const at = m.dateAdded ? Date.parse(m.dateAdded) : Date.now();
+    if (at < since) continue;
+    for (const a of (m.attachments ?? []).flatMap((x: any) => (Array.isArray(x) ? x : [x]))) {
+      const u = typeof a === "string" ? a : a?.url ?? "";
+      const ext = (String(u).split("?")[0].match(/\.([a-z0-9]{2,5})$/i)?.[1] ?? "").toLowerCase();
+      const kind = ["mp4", "mov", "m4v", "3gp", "mkv"].includes(ext) ? "video" : ["jpg", "jpeg", "png", "webp", "heic"].includes(ext) ? "image" : /video/i.test(String(m.contentType ?? "")) ? "video" : /image/i.test(String(m.contentType ?? "")) ? "image" : "";
+      if (/^https?:/.test(u) && kind) out.push({ url: u, kind, at });
+    }
+  }
+  return out.sort((a, b) => a.at - b.at).map(({ url, kind }) => ({ url, kind })).slice(0, 20);
 }
