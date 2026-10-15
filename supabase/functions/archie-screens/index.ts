@@ -534,12 +534,16 @@ Deno.serve(async (req) => {
         const tz = cfgT?.timezone || "Europe/London";
         const today = localDate(Date.now(), tz);
         const { data } = await supabase.from("tasks").select("id, title, tier, plan_slot, due_date, pinned_date, scheduled_start, scheduled_end, effort_minutes, owner, created_at, hold, detail, kind, block_event_id, area, client_id").eq("tenant_id", c.tid).eq("owner", c.owner?.handle ?? "").in("status", ["open", "doing"]).order("created_at", { ascending: true }).limit(300);
+        // v9.11.3: client names for the task sheet
+        const tlIds = [...new Set((data ?? []).map((t: any) => t.client_id).filter(Boolean))];
+        const tlNames: Record<string, string> = {};
+        if (tlIds.length) { const { data: cs } = await supabase.from("clients").select("id, name").eq("tenant_id", c.tid).in("id", tlIds); for (const cl of cs ?? []) tlNames[cl.id] = cl.name; }
         const tasks = (data ?? []).map((t: any) => {
           const rawDay = t.scheduled_start ? localDate(Date.parse(t.scheduled_start), tz) : t.pinned_date ?? null;
           // v9.9.8: anything left on a past day rolls onto today (it used to fall out of every list)
           const carried = !!rawDay && rawDay < today;
           const day = carried ? today : rawDay;
-          return { id: t.id, title: t.title, held: !!t.hold, carried, carried_from: carried ? rawDay : null, priority: t.plan_slot ?? t.tier ?? "high", day: t.hold ? null : day, time: t.scheduled_start ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_start)) : null, pinned: !!t.pinned_date, due: t.due_date ?? null, overdue: !!t.due_date && t.due_date < today, notes: t.detail ?? "", area: ["growth", "clients", "admin"].includes(t.area) ? t.area : null, client_id: t.client_id ?? null, minutes: Math.max(15, Number(t.effort_minutes) || 30), kind: t.kind === "deep" ? "deep" : "shallow", end_time: t.scheduled_end ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_end)) : null, on_calendar: !!t.block_event_id };
+          return { id: t.id, title: t.title, held: !!t.hold, carried, carried_from: carried ? rawDay : null, priority: t.plan_slot ?? t.tier ?? "high", day: t.hold ? null : day, time: t.scheduled_start ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_start)) : null, pinned: !!t.pinned_date, due: t.due_date ?? null, overdue: !!t.due_date && t.due_date < today, notes: t.detail ?? "", area: ["growth", "clients", "admin"].includes(t.area) ? t.area : null, client_id: t.client_id ?? null, client_name: t.client_id ? tlNames[t.client_id] ?? null : null, tier: t.tier ?? "high", minutes: Math.max(15, Number(t.effort_minutes) || 30), kind: t.kind === "deep" ? "deep" : "shallow", end_time: t.scheduled_end ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_end)) : null, on_calendar: !!t.block_event_id };
         });
         const days: string[] = []; for (let i = 0; i < 7; i++) days.push(addDays(today, i));
         // Capacity per day: planned task time vs the hours set for tasks (max_task_hours), only on working days
@@ -2679,7 +2683,7 @@ async function ytFinishPending(tid: string) {
 }
 
 // ===================== v9.9.6: status check — what's actually live =====================
-const ARCHIE_VERSION = "9.11.2";
+const ARCHIE_VERSION = "9.11.3";
 async function statusCheck(tid: string) {
   const out: Record<string, unknown> = { version: ARCHIE_VERSION, checked_at: new Date().toISOString() };
   // 1. Secrets: set or not (never the values)
@@ -6816,7 +6820,12 @@ async function forgePlanGet(tid: string, handle: string, days = 5) {
     : await supabase.from("team_members").select("*").eq("tenant_id", tid).eq("gets_financials", true).maybeSingle();
   if (!m) return { ok: false, error: "no such person" };
   const until = Date.parse(isoAtTz(addDays(today, Math.max(1, Math.min(10, days))), "00:00", tz));
-  const { data: tasks } = await supabase.from("tasks").select("id, title, tier, plan_slot, kind, effort_minutes, due_date, scheduled_start, scheduled_end, move_count, pinned_date").eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).not("scheduled_start", "is", null).lt("scheduled_start", new Date(until).toISOString()).order("scheduled_start");
+  const { data: tasks } = await supabase.from("tasks").select("id, title, tier, plan_slot, kind, effort_minutes, due_date, scheduled_start, scheduled_end, move_count, pinned_date, detail, area, client_id").eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).not("scheduled_start", "is", null).lt("scheduled_start", new Date(until).toISOString()).order("scheduled_start");
+  // v9.11.3: client names for the task sheet
+  const cIds = [...new Set((tasks ?? []).map((t: any) => t.client_id).filter(Boolean))];
+  const cName: Record<string, string> = {};
+  if (cIds.length) { const { data: cs } = await supabase.from("clients").select("id, name").eq("tenant_id", tid).in("id", cIds); for (const c of cs ?? []) cName[c.id] = c.name; }
+  const sheet = (b: any) => ({ tier: b.tier ?? "high", notes: b.detail ?? "", area: ["growth", "clients", "admin"].includes(b.area) ? b.area : null, client_id: b.client_id ?? null, client_name: b.client_id ? cName[b.client_id] ?? null : null, minutes: Math.max(15, Number(b.effort_minutes) || 30) });
   // Calendar events for the same days (to show around the blocks)
   let events: any[] = [];
   if (m.ghl_user_id) {
@@ -6832,7 +6841,7 @@ async function forgePlanGet(tid: string, handle: string, days = 5) {
   const todays = byDay[today];
   // Today as a 3:3:3 board
   const board: Record<string, any[]> = { must: [], high: [], bonus: [] };
-  for (const b of todays?.blocks ?? []) (board[b.plan_slot ?? b.tier] ?? board.high).push({ id: b.id, title: b.title, from: b.from, to: b.to, effort_minutes: b.effort_minutes, moved: Number(b.move_count) || 0, lifted: !!b.plan_slot && b.plan_slot !== b.tier });
+  for (const b of todays?.blocks ?? []) (board[b.plan_slot ?? b.tier] ?? board.high).push({ id: b.id, title: b.title, from: b.from, to: b.to, effort_minutes: b.effort_minutes, moved: Number(b.move_count) || 0, lifted: !!b.plan_slot && b.plan_slot !== b.tier, ...sheet(b) });
   const { data: doneToday } = await supabase.from("tasks").select("title, tier, plan_slot").eq("tenant_id", tid).eq("owner", m.handle).eq("status", "done").gte("updated_at", isoAtTz(today, "00:00", tz));
   const items = todays ? [...todays.events.map((e: any) => ({ at: e.from, line: `${e.from}–${e.to} ${e.title} (calendar)` })), ...todays.blocks.map((b: any) => ({ at: b.from, line: `${b.from}–${b.to} ${b.title}${b.tier === "must" ? " (must)" : ""}${Number(b.move_count) >= 2 ? ` (moved ${b.move_count}x)` : ""}` }))].sort((a, b) => a.at.localeCompare(b.at)) : [];
   const wont: string[] = Array.isArray(m.forge_wont_fit) ? m.forge_wont_fit : [];
@@ -6845,7 +6854,7 @@ async function forgePlanGet(tid: string, handle: string, days = 5) {
     day_complete: board.must.length + board.high.length + board.bonus.length === 0 && (doneToday ?? []).length > 0,
     days: Object.values(byDay).sort((a: any, b: any) => a.date.localeCompare(b.date)).map((d: any) => {
       const bd: Record<string, any[]> = { must: [], high: [], bonus: [] };
-      for (const b of d.blocks ?? []) (bd[b.plan_slot ?? b.tier] ?? bd.high).push({ id: b.id, title: b.title, from: b.from, to: b.to, effort_minutes: b.effort_minutes, pinned: !!b.pinned_date, lifted: !!b.plan_slot && b.plan_slot !== b.tier });
+      for (const b of d.blocks ?? []) (bd[b.plan_slot ?? b.tier] ?? bd.high).push({ id: b.id, title: b.title, from: b.from, to: b.to, effort_minutes: b.effort_minutes, pinned: !!b.pinned_date, lifted: !!b.plan_slot && b.plan_slot !== b.tier, ...sheet(b) });
       return { ...d, board: bd };
     }),
     wont_fit: wont, today_text,
