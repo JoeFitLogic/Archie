@@ -765,6 +765,7 @@ Deno.serve(async (req) => {
       case "dump_anything": return j(await dumpAnything(c.tid, { handle: c.owner?.handle ?? "owner", gets_financials: true }, String(p.text ?? "")));
       case "dumps": { const { data } = await supabase.from("dumps").select("id, handle, clean, summary, created_at").eq("tenant_id", c.tid).order("created_at", { ascending: false }).limit(20); return j({ ok: true, dumps: data ?? [] }); }
       case "member_health": return j(await memberHealthList(c.tid, String(p.status ?? "")));
+      case "member_touch": return j(await memberTouch(c.tid, p));
       case "member_health_run": { startInBackground(memberHealthRun(c.tid)); return j({ ok: true, text: "Re-scoring your clients — give it a minute, then refresh." }); }
       case "groups_suggest": return j(await groupsSuggest(c.tid));
       case "groups_link": return j(await groupsLink(c.tid, p));
@@ -2683,7 +2684,7 @@ async function ytFinishPending(tid: string) {
 }
 
 // ===================== v9.9.6: status check — what's actually live =====================
-const ARCHIE_VERSION = "9.11.3";
+const ARCHIE_VERSION = "9.11.4";
 async function statusCheck(tid: string) {
   const out: Record<string, unknown> = { version: ARCHIE_VERSION, checked_at: new Date().toISOString() };
   // 1. Secrets: set or not (never the values)
@@ -4437,8 +4438,33 @@ async function memberHealthRun(tid: string) {
   }
 }
 
+// v9.11.4: "I've spoken to them, they're all good" — resets the quiet clock now and on every nightly re-score
+async function memberTouch(tid: string, p: any) {
+  let clientId = String(p.client_id ?? "").trim();
+  if (!clientId && p.name) {
+    const { data: hit } = await supabase.from("member_health").select("client_id").eq("tenant_id", tid).ilike("name", String(p.name).trim()).limit(1).maybeSingle();
+    clientId = hit?.client_id ?? "";
+  }
+  if (!clientId) return { ok: false, text: "Couldn't find that client." };
+  const nowIso = new Date().toISOString();
+  const { error } = await supabase.from("clients").update({ last_contact_at: nowIso }).eq("tenant_id", tid).eq("id", clientId);
+  if (error) return { ok: false, text: error.message };
+  const { data: row } = await supabase.from("member_health").select("name, reasons").eq("tenant_id", tid).eq("client_id", clientId).maybeSingle();
+  // Keep anything talking can't fix (failed card, at-risk tag); clear the quiet / waiting-on-reply reasons
+  const keep = ((row?.reasons ?? []) as string[]).filter((r) => /card failed|tagged/i.test(r));
+  const { data: cfgT } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", tid).maybeSingle();
+  const day = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: cfgT?.timezone || "Europe/London" });
+  await supabase.from("member_health").update({
+    status: keep.length ? "red" : "green",
+    reasons: keep.length ? keep : [`you spoke to them ${day}`],
+    last_contact: nowIso,
+  }).eq("tenant_id", tid).eq("client_id", clientId);
+  const who = row?.name ?? "them";
+  return { ok: true, status: keep.length ? "red" : "green", text: keep.length ? `Noted you've spoken to ${who}, so the clock's reset. Still flagged: ${keep.join("; ")}.` : `Noted you've spoken to ${who}. They're back to all good and the clock's reset.` };
+}
+
 async function memberHealthList(tid: string, status: string) {
-  let q = supabase.from("member_health").select("name, status, reasons, last_contact, next_booking, computed_at").eq("tenant_id", tid);
+  let q = supabase.from("member_health").select("client_id, name, status, reasons, last_contact, next_booking, computed_at").eq("tenant_id", tid);
   if (["red", "yellow", "green"].includes(status)) q = q.eq("status", status);
   const { data } = await q.order("status", { ascending: true }).order("name").limit(300);
   const items = (data ?? []).sort((a: any, b: any) => ["red", "yellow", "green"].indexOf(a.status) - ["red", "yellow", "green"].indexOf(b.status));
