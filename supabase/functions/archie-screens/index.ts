@@ -2690,7 +2690,7 @@ async function ytFinishPending(tid: string) {
 }
 
 // ===================== v9.9.6: status check — what's actually live =====================
-const ARCHIE_VERSION = "9.13.0";
+const ARCHIE_VERSION = "9.13.1";
 async function statusCheck(tid: string) {
   const out: Record<string, unknown> = { version: ARCHIE_VERSION, checked_at: new Date().toISOString() };
   // 1. Secrets: set or not (never the values)
@@ -6930,14 +6930,18 @@ async function forgePlanRun(tid: string, opt: { force?: boolean; from_now?: bool
       "id, title, tier, kind, effort_minutes, due_date, scheduled_start, scheduled_end, created_at, move_count, block_event_id, pinned_date, hold, area, critical, block_start, block_end");
     const startOfToday = Date.parse(isoAtTz(today, "00:00", tz));
     const soon = addDays(today, 1);
+    // v9.13.1: once today's working hours are used up (or it's after finish time), "today" isn't somewhere a task can go —
+    // anything pinned to today or carried over rolls to the first day that still has free time.
+    const firstOpen = days.find((dd) => dd.slots.length)?.date ?? days.find((dd) => dd.date > today)?.date ?? days[0]?.date ?? today;
+    const todayOver = !days.some((dd) => dd.date === today && dd.slots.length);
     const list = (tasks ?? []).filter((t: any) => !t.hold).map((t: any) => {
       const tier = ["must", "high", "bonus"].includes(t.tier) ? t.tier : "high";
       const critical = !!t.critical;
       const urgent = !critical && !!t.due_date && String(t.due_date) <= soon && tier !== "must";
       // Anything not done on its day (past pin, or planned on a past day) rolls to the NEXT working day — never further
       const carried = !!t.scheduled_start && Date.parse(t.scheduled_start) < startOfToday;
-      const rolled = (!!t.pinned_date && String(t.pinned_date) < today) || (carried && !t.pinned_date);
-      const pin = rolled ? (days[0]?.date ?? today) : (t.pinned_date ?? null);
+      const rolled = (!!t.pinned_date && String(t.pinned_date) < today) || (carried && !t.pinned_date) || (todayOver && String(t.pinned_date ?? "") === today);
+      const pin = rolled ? firstOpen : (t.pinned_date ?? null);
       return { ...t, tier, critical, urgent, carried, rolled, pin };
     })
       .sort((a: any, b: any) =>
