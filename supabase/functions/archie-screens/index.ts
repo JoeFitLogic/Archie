@@ -533,7 +533,7 @@ Deno.serve(async (req) => {
         const { data: cfgT } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", c.tid).maybeSingle();
         const tz = cfgT?.timezone || "Europe/London";
         const today = localDate(Date.now(), tz);
-        const { data } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", c.tid).eq("owner", c.owner?.handle ?? "").in("status", ["open", "doing"]).order("created_at", { ascending: true }).limit(300), "id, title, tier, plan_slot, due_date, pinned_date, scheduled_start, scheduled_end, effort_minutes, owner, created_at, hold, detail, kind, block_event_id, area, client_id, critical, move_count");
+        const { data } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", c.tid).eq("owner", c.owner?.handle ?? "").in("status", ["open", "doing"]).order("created_at", { ascending: true }).limit(300), "id, title, tier, plan_slot, due_date, pinned_date, scheduled_start, scheduled_end, effort_minutes, owner, created_at, hold, detail, kind, block_event_id, area, client_id, critical, move_count, project_id, checklist, waiting_on");
         // v9.11.3: client names for the task sheet
         const tlIds = [...new Set((data ?? []).map((t: any) => t.client_id).filter(Boolean))];
         const tlNames: Record<string, string> = {};
@@ -543,7 +543,7 @@ Deno.serve(async (req) => {
           // v9.9.8: anything left on a past day rolls onto today (it used to fall out of every list)
           const carried = !!rawDay && rawDay < today;
           const day = carried ? today : rawDay;
-          return { id: t.id, title: t.title, held: !!t.hold, carried, carried_from: carried ? rawDay : null, priority: t.plan_slot ?? t.tier ?? "high", day: t.hold ? null : day, time: t.scheduled_start ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_start)) : null, pinned: !!t.pinned_date, due: t.due_date ?? null, overdue: !!t.due_date && t.due_date < today, notes: t.detail ?? "", area: ["growth", "clients", "admin"].includes(t.area) ? t.area : null, client_id: t.client_id ?? null, client_name: t.client_id ? tlNames[t.client_id] ?? null : null, tier: t.tier ?? "high", critical: !!t.critical, move_count: Number(t.move_count) || 0, minutes: Math.max(15, Number(t.effort_minutes) || 30), kind: t.kind === "deep" ? "deep" : "shallow", end_time: t.scheduled_end ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_end)) : null, on_calendar: !!t.block_event_id };
+          return { id: t.id, title: t.title, held: !!t.hold, carried, carried_from: carried ? rawDay : null, priority: t.plan_slot ?? t.tier ?? "high", day: t.hold ? null : day, time: t.scheduled_start ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_start)) : null, pinned: !!t.pinned_date, due: t.due_date ?? null, overdue: !!t.due_date && t.due_date < today, notes: t.detail ?? "", area: ["growth", "clients", "admin"].includes(t.area) ? t.area : null, client_id: t.client_id ?? null, client_name: t.client_id ? tlNames[t.client_id] ?? null : null, tier: t.tier ?? "high", critical: !!t.critical, move_count: Number(t.move_count) || 0, project_id: t.project_id ?? null, checklist: Array.isArray(t.checklist) ? t.checklist : [], waiting_on: t.waiting_on ?? null, minutes: Math.max(15, Number(t.effort_minutes) || 30), kind: t.kind === "deep" ? "deep" : "shallow", end_time: t.scheduled_end ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_end)) : null, on_calendar: !!t.block_event_id };
         });
         const days: string[] = []; for (let i = 0; i < 7; i++) days.push(addDays(today, i));
         // Capacity per day: planned task time vs the hours set for tasks (max_task_hours), only on working days
@@ -569,7 +569,7 @@ Deno.serve(async (req) => {
         // v9.10: no time given → Archie estimates how long it takes and whether it needs focus
         const est: any = Number(p.minutes) > 0 ? { ...(await taskEstimate(c.tid, title, notes, true)), minutes: Number(p.minutes), kind: p.kind === "deep" ? "deep" : (p.kind === "shallow" ? "shallow" : "shallow") } : await taskEstimate(c.tid, title, notes);
         const minutes = Math.max(15, Math.min(480, Math.round(est.minutes / 15) * 15 || 30));
-        const { data: row, error } = await supabase.from("tasks").insert({ tenant_id: c.tid, title: title.slice(0, 200), detail: notes || null, due_date: due, tier, kind: est.kind, ...(p.critical === true || String(p.critical) === "true" ? { critical: true } : {}), area: ["growth", "clients", "admin"].includes(String(p.area)) ? String(p.area) : est.area, client_id: p.client_id ? String(p.client_id) : est.client_id, effort_minutes: minutes, status: "open", owner: c.owner?.handle ?? null, source: "forge", source_ref: `forge:${crypto.randomUUID()}`, pinned_date: date, accepted_by: c.owner?.handle ?? null, accepted_at: new Date().toISOString() }).select("id").single();
+        const { data: row, error } = await supabase.from("tasks").insert({ tenant_id: c.tid, title: title.slice(0, 200), detail: notes || null, due_date: due, tier, kind: est.kind, ...(p.critical === true || String(p.critical) === "true" ? { critical: true } : {}), ...(p.project_id ? { project_id: String(p.project_id) } : {}), ...(Array.isArray(p.checklist) ? { checklist: cleanChecklist(p.checklist) } : {}), area: ["growth", "clients", "admin"].includes(String(p.area)) ? String(p.area) : est.area, client_id: p.client_id ? String(p.client_id) : est.client_id, effort_minutes: minutes, status: "open", owner: c.owner?.handle ?? null, source: "forge", source_ref: `forge:${crypto.randomUUID()}`, pinned_date: date, accepted_by: c.owner?.handle ?? null, accepted_at: new Date().toISOString() }).select("id").single();
         if (error) return j({ ok: false, text: `Couldn't add it: ${error.message}` });
         await forgePlan(c.tid, { force: true, from_now: true });
         return j(await taskLanded(c.tid, c.owner?.handle ?? "", row!.id, date));
@@ -583,6 +583,14 @@ Deno.serve(async (req) => {
         if (p.client_id !== undefined) upd.client_id = p.client_id ? String(p.client_id) : null;
         if (p.minutes !== undefined) upd.effort_minutes = Math.max(15, Math.min(480, Math.round((Number(p.minutes) || 30) / 15) * 15));
         if (p.critical !== undefined) upd.critical = p.critical === true || String(p.critical) === "true";
+        // v9.14: project, checklist (subtasks), waiting on the client
+        if (p.project_id !== undefined) upd.project_id = p.project_id ? String(p.project_id) : null;
+        if (p.checklist !== undefined) upd.checklist = cleanChecklist(p.checklist);
+        if (p.waiting !== undefined) {
+          if (p.waiting === true || String(p.waiting) === "true") { upd.status = "waiting"; upd.scheduled_start = null; upd.scheduled_end = null; upd.today = false; }
+          else { const { data: cur } = await supabase.from("tasks").select("status").eq("tenant_id", c.tid).eq("id", String(p.id ?? "")).maybeSingle(); if (cur?.status === "waiting") upd.status = "open"; }
+        }
+        if (p.waiting_on !== undefined) upd.waiting_on = String(p.waiting_on ?? "").trim().slice(0, 200) || null;
         if (p.kind !== undefined) upd.kind = p.kind === "deep" ? "deep" : "shallow";
         if (["must", "high", "bonus"].includes(String(p.tier ?? ""))) upd.tier = String(p.tier);
         if (p.due !== undefined || p.due_date !== undefined) { const d = String(p.due ?? p.due_date ?? ""); upd.due_date = /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null; }
@@ -767,6 +775,15 @@ Deno.serve(async (req) => {
       case "dumps": { const { data } = await supabase.from("dumps").select("id, handle, clean, summary, created_at").eq("tenant_id", c.tid).order("created_at", { ascending: false }).limit(20); return j({ ok: true, dumps: data ?? [] }); }
       case "member_health": return j(await memberHealthList(c.tid, String(p.status ?? "")));
       case "member_touch": return j(await memberTouch(c.tid, p));
+      // v9.14 (Forge Phase 2): projects, the client request inbox, the Overview
+      case "projects_list": return j(await projectsList(c.tid, p));
+      case "project_get": return j(await projectGet(c.tid, String(p.id ?? "")));
+      case "project_save": return j(await projectSave(c.tid, c.owner?.handle ?? "", p));
+      case "requests_list": return j(await requestsList(c.tid));
+      case "request_add": return j(await requestAdd(c.tid, c.owner?.handle ?? "", p));
+      case "request_accept": return j(await requestAccept(c.tid, c.owner?.handle ?? "", p));
+      case "request_decline": { const { data: t } = await supabase.from("tasks").update({ status: "dismissed", dismissed_reason: "declined request", proposal_rank: null }).eq("tenant_id", c.tid).eq("id", String(p.id ?? "")).eq("status", "proposed").select("title").maybeSingle(); return j({ ok: !!t, text: t ? `Declined: ${t.title}` : "That request has already been dealt with." }); }
+      case "forge_overview": return j(await forgeOverview(c.tid, c.owner?.handle ?? ""));
       case "voice_add": return j(await voiceAdd(c.tid, p));
       case "voice_list": return j(await voiceList(c.tid));
       case "voice_remove": { const { error } = await supabase.from("voice_examples").update({ active: false }).eq("tenant_id", c.tid).eq("id", String(p.id ?? "")); return j(error ? { ok: false, text: error.message } : { ok: true, text: "Removed." }); }
@@ -2690,7 +2707,7 @@ async function ytFinishPending(tid: string) {
 }
 
 // ===================== v9.9.6: status check — what's actually live =====================
-const ARCHIE_VERSION = "9.13.1";
+const ARCHIE_VERSION = "9.14.0";
 async function statusCheck(tid: string) {
   const out: Record<string, unknown> = { version: ARCHIE_VERSION, checked_at: new Date().toISOString() };
   // 1. Secrets: set or not (never the values)
@@ -2699,12 +2716,12 @@ async function statusCheck(tid: string) {
   out.secrets = secrets;
   // 2. Database: each table and the columns later versions added
   const schema: [string, string][] = [
-    ["tasks", "id, hold, plan_slot, pinned_date, proposal_rank, area, client_id, critical, block_start, block_end"], ["briefs", "id, short_body, read_at"], ["council_sessions", "id"],
+    ["tasks", "id, hold, plan_slot, pinned_date, proposal_rank, area, client_id, critical, block_start, block_end, project_id, checklist, waiting_on"], ["projects", "id, status, major, deadline, waiting_on, archived"], ["briefs", "id, short_body, read_at"], ["council_sessions", "id"],
     ["broll_library", "id"], ["content_stacks", "id, handed_to"], ["custom_styles", "id"], ["style_specs", "id"],
     ["edit_jobs", "id, engine, sources, cover_url, render_retried, scheduled_for"], ["feature_events", "id"], ["feature_feedback", "id"],
     ["client_groups", "conversation_id, client_id"], ["yt_jobs", "id, renders, thumbs, outputs, split"], ["agent_runs", "id"], ["carousels", "id, source"],
     ["team_members", "id, forge_caps, brief_voice, buffer_minutes, block_days, growth_start, growth_end, personal_blocks, personal_block_ids, work_hours, growth_windows, forge_unplaced, forge_days_cache, forge_calendar_ok, forge_calendar_error"], ["clients", "id, monthly_value"],
-    ["tenant_config", "tenant_id, thumb_faces, forge_caps, forge_lock_until, broll_synced_at, evening_wrap, cost_budget_gbp, plan, reel_style, cta_keyword, brief_style, group_suggestions"],
+    ["tenant_config", "tenant_id, thumb_faces, forge_caps, forge_lock_until, max_major_builds, broll_synced_at, evening_wrap, cost_budget_gbp, plan, reel_style, cta_keyword, brief_style, group_suggestions"],
   ];
   const db: Record<string, string> = {};
   for (const [t, cols] of schema) {
@@ -3036,6 +3053,7 @@ const TALK_RULES = [
   "- archie_carousel {action: make|post, topic, slides, format: carousel|story} — 'make me a carousel about planning your week' → make (7 slides unless they say). 'Make me a story about…' → format 'story' (3 frames unless they say). 'Post the carousel' / 'post the story' → post (Social Planner drafts). 'Send it here' / 'send me the carousel' / 'let me see it' → send (the slides as images in this chat).",
   "- archie_clear_waiting {} — 'clear waiting' / 'clear my waiting list' / 'none of those are relevant' → empties Waiting on you (drafts binned, spotted tasks dropped, reels taken off the list but kept).",
   "- archie_move_task {title, to} — 'move the offer task to tomorrow' / 'push the Elise one to Friday' → to = 'tomorrow', a weekday name, or YYYY-MM-DD. It pins the task to that day in Forge.",
+  "- archie_projects {action: list|add|update|status, name, client, deadline (YYYY-MM-DD), status (inbox|scheduled|in_progress|waiting|complete), major, waiting_on} — client projects. 'What projects have I got on?' / 'what do I owe each client?' → list. 'New project: funnel for Sarah, due 30 Nov, it's a big build' → add with deadline as YYYY-MM-DD (major true for big builds). 'Mark the MTN build as waiting on David' → update status waiting, waiting_on. If adding a third major build returns a warning, read it to them and only add it if they say yes (then call again with override true).",
   "- archie_when_can_i {title, hours, by, client} — capacity and realistic deadlines from their REAL Forge plan and calendar. 'When could I realistically deliver a 10 hour build for Sarah?' → hours 10. 'Can I take on X by Friday?' → title X, by = that date (YYYY-MM-DD). 'What deadline should I give them for the funnel?' → title. Never guess dates or capacity yourself; use what this returns, and say the promise date with the reason.",
   "- archie_voice {verdict, kind, text, reason} — they're teaching you how they write. 'This caption is spot on, write like this: …' → verdict good. 'That's too generic / I'd never say that / no emojis like this' → verdict bad, with reason in their words; text = the draft they rejected (or the line they quoted). kind: script, caption, email, post or message. Use this whenever they paste writing they love or hate.",
   "- archie_set_hours {work_start, work_end, lunch_start, lunch_end, work_days, caps} — 'change my hours to 8 till 4' → work_start 08:00, work_end 16:00. 'Lunch 12 till 1'. 'I don't work Fridays' → work_days '1,2,3,4'. '2 musts a day is enough' / 'make it 2 3 3' → caps '2,3,3' (Must,To-do,Bonus; keep the others as they are, default 2,3,2). Only pass what they changed.",
@@ -3283,7 +3301,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_when_can_i", "archie_voice", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep", "archie_data", "archie_reel", "archie_ideas", "archie_instagram", "archie_plan", "archie_carousel", "archie_month", "archie_winback", "archie_style", "archie_plan_usage", "archie_broll", "archie_use_style", "archie_hooks", "archie_brand", "archie_learn", "archie_streak", "archie_script", "archie_write_script", "archie_make_reel", "archie_waiting", "archie_full_brief", "archie_set_hours", "archie_move_task", "archie_clear_waiting"];
+      const NO_HANDLE = ["archie_projects", "archie_when_can_i", "archie_voice", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep", "archie_data", "archie_reel", "archie_ideas", "archie_instagram", "archie_plan", "archie_carousel", "archie_month", "archie_winback", "archie_style", "archie_plan_usage", "archie_broll", "archie_use_style", "archie_hooks", "archie_brand", "archie_learn", "archie_streak", "archie_script", "archie_write_script", "archie_make_reel", "archie_waiting", "archie_full_brief", "archie_set_hours", "archie_move_task", "archie_clear_waiting"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
       const OWNER_ONLY = ["archie_data", "archie_call_prep", "archie_council", "archie_set_trial", "archie_groups", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
@@ -3312,6 +3330,20 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
         ? await (String(args.verdict ?? "good") === "bad"
             ? voiceFeedback(tid, { kind: args.kind, text: args.text, reason: args.reason })
             : voiceAdd(tid, { kind: args.kind, verdict: "good", body: args.text, note: args.reason, source: "chat" }))
+        : act.tool === "archie_projects"
+        ? await (async () => {
+            const a2 = String(args.action ?? "list");
+            if (a2 === "list") { const x: any = await projectsList(tid); return { ok: !!x.ok, text: x.text }; }
+            let clientId: string | null = null;
+            if (args.client) { const { data: cl } = await supabase.from("clients").select("id, name").eq("tenant_id", tid).eq("status", "active").ilike("name", `%${String(args.client).trim()}%`).limit(2); if ((cl ?? []).length === 1) clientId = cl![0].id; }
+            let id: string | null = null;
+            if (a2 !== "add" && args.name) { const { data: pr } = await supabase.from("projects").select("id").eq("tenant_id", tid).eq("archived", false).ilike("name", `%${String(args.name).trim()}%`).limit(2); if ((pr ?? []).length === 1) id = pr![0].id; else return { ok: false, text: (pr ?? []).length ? "Which project? More than one matches." : `I can't find a project like "${args.name}".` }; }
+            let st = String(args.status ?? "").toLowerCase().trim().replace(/\s+/g, "_");
+            st = ({ done: "complete", completed: "complete", finished: "complete", started: "in_progress", active: "in_progress", on_hold: "waiting", paused: "waiting", blocked: "waiting", planned: "scheduled" } as Record<string, string>)[st] ?? st;
+            const dl = /^\d{4}-\d{2}-\d{2}$/.test(String(args.deadline ?? "")) ? String(args.deadline) : undefined;
+            const x: any = await projectSave(tid, member.handle, { id, name: a2 === "add" ? args.name : undefined, client_id: clientId ?? undefined, deadline: dl, status: PROJECT_STATUSES.includes(st) ? st : (a2 === "add" ? "scheduled" : undefined), major: args.major, waiting_on: args.waiting_on, override: args.override });
+            return { ok: !!x.ok, text: x.text };
+          })()
         : act.tool === "archie_when_can_i"
         ? await (async () => {
             const x: any = await capacityCheck(tid, member.handle, { title: args.title, hours: args.hours, minutes: args.minutes, by: args.by, notes: args.client ? `For ${args.client}` : "" });
@@ -6816,8 +6848,15 @@ async function forgePlan(tid: string, opt: { force?: boolean; from_now?: boolean
 
 // v9.13: a select that still works if the new task columns haven't been added yet
 async function selNewCols(run: (cols: string) => PromiseLike<{ data: any; error: any }>, cols: string) {
-  const r = await run(cols);
-  if (r.error && /critical|move_count|block_start|block_end/.test(String(r.error.message ?? ""))) return await run(cols.replace(/,\s*(critical|block_start|block_end)/g, ""));
+  const optional = ["critical", "block_start", "block_end", "project_id", "checklist", "waiting_on"];
+  let r = await run(cols);
+  for (let i = 0; i < optional.length && r.error; i++) {
+    const msg = String(r.error.message ?? "");
+    const missing = optional.find((c) => new RegExp(`\\b${c}\\b`).test(msg) && new RegExp(`,\\s*${c}\\b`).test(cols));
+    if (!missing) break;
+    cols = cols.replace(new RegExp(`,\\s*${missing}\\b`), "");
+    r = await run(cols);
+  }
   return r;
 }
 
@@ -6927,14 +6966,18 @@ async function forgePlanRun(tid: string, opt: { force?: boolean; from_now?: bool
     }
     // Tasks to place: critical first, then pinned, then Must (and urgent), then carried-over, soonest due, oldest
     const { data: tasks } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).limit(200),
-      "id, title, tier, kind, effort_minutes, due_date, scheduled_start, scheduled_end, created_at, move_count, block_event_id, pinned_date, hold, area, critical, block_start, block_end");
+      "id, title, tier, kind, effort_minutes, due_date, scheduled_start, scheduled_end, created_at, move_count, block_event_id, pinned_date, hold, area, critical, block_start, block_end, project_id");
+    // v9.14: a task in a project with no deadline of its own works to the project's deadline
+    const projDeadline: Record<string, string> = {};
+    { const pIds = [...new Set((tasks ?? []).map((t: any) => t.project_id).filter(Boolean))]; if (pIds.length) { const { data: ps } = await supabase.from("projects").select("id, deadline").eq("tenant_id", tid).in("id", pIds).neq("status", "complete").eq("archived", false); for (const x of ps ?? []) if (x.deadline) projDeadline[x.id] = String(x.deadline); } }
     const startOfToday = Date.parse(isoAtTz(today, "00:00", tz));
     const soon = addDays(today, 1);
     // v9.13.1: once today's working hours are used up (or it's after finish time), "today" isn't somewhere a task can go —
     // anything pinned to today or carried over rolls to the first day that still has free time.
     const firstOpen = days.find((dd) => dd.slots.length)?.date ?? days.find((dd) => dd.date > today)?.date ?? days[0]?.date ?? today;
     const todayOver = !days.some((dd) => dd.date === today && dd.slots.length);
-    const list = (tasks ?? []).filter((t: any) => !t.hold).map((t: any) => {
+    const list = (tasks ?? []).filter((t: any) => !t.hold).map((t0: any) => {
+      const t = { ...t0, due_date: t0.due_date ?? (t0.project_id ? projDeadline[t0.project_id] ?? null : null) };
       const tier = ["must", "high", "bonus"].includes(t.tier) ? t.tier : "high";
       const critical = !!t.critical;
       const urgent = !critical && !!t.due_date && String(t.due_date) <= soon && tier !== "must";
@@ -7043,7 +7086,7 @@ async function forgePlanRun(tid: string, opt: { force?: boolean; from_now?: bool
         if (bErr) await supabase.from("tasks").update({ block_event_id: blockId }).eq("id", t.id);
       }
       // Blocks for tasks that were finished or removed come off the calendar
-      const { data: stale1 } = await supabase.from("tasks").select("id, block_event_id").eq("tenant_id", tid).eq("owner", m.handle).in("status", ["done", "dismissed"]).not("block_event_id", "is", null).limit(100);
+      const { data: stale1 } = await supabase.from("tasks").select("id, block_event_id").eq("tenant_id", tid).eq("owner", m.handle).in("status", ["done", "dismissed", "waiting"]).not("block_event_id", "is", null).limit(100);
       const { data: stale2 } = await supabase.from("tasks").select("id, block_event_id").eq("tenant_id", tid).eq("owner", m.handle).eq("hold", true).not("block_event_id", "is", null).limit(100);
       const stale = [...(stale1 ?? []), ...(stale2 ?? [])];
       for (const s of stale) { await ghl(token, `/calendars/events/${s.block_event_id}`, "DELETE", undefined, "2021-04-15").catch(() => null); await supabase.from("tasks").update({ block_event_id: null }).eq("id", s.id); }
@@ -7087,6 +7130,259 @@ async function forgePlanRun(tid: string, opt: { force?: boolean; from_now?: bool
   return { ok: true, text: `Plan updated — ${summary.join(" · ")}.` };
 }
 
+// ===================== v9.14 (Forge Phase 2): projects, the client request inbox, and the Overview =====================
+// [{text, done}] — a task's own subtasks (a checklist; they aren't planned separately)
+function cleanChecklist(v: unknown): { text: string; done: boolean }[] {
+  return (Array.isArray(v) ? v : []).slice(0, 40).map((x: any) => ({ text: String(typeof x === "string" ? x : x?.text ?? "").trim().slice(0, 200), done: typeof x === "object" && (x?.done === true || String(x?.done) === "true") })).filter((x) => x.text);
+}
+
+const PROJECT_STATUSES = ["inbox", "scheduled", "in_progress", "waiting", "complete"];
+const ACTIVE_PROJECT = ["scheduled", "in_progress", "waiting"];
+const PROJECT_WORD: Record<string, string> = { inbox: "Inbox", scheduled: "Scheduled", in_progress: "In progress", waiting: "Waiting", complete: "Complete" };
+
+async function clientNames(tid: string, ids: (string | null | undefined)[]) {
+  const uniq = [...new Set(ids.filter(Boolean) as string[])];
+  const out: Record<string, string> = {};
+  if (!uniq.length) return out;
+  const { data } = await supabase.from("clients").select("id, name").eq("tenant_id", tid).in("id", uniq);
+  for (const c of data ?? []) out[c.id] = c.name;
+  return out;
+}
+
+// Progress (done ÷ all, dismissed left out), hours left (unfinished tasks), next action (the next planned task, else the most important open one)
+function projectStats(tasks: any[], today: string) {
+  const live = tasks.filter((t) => t.status !== "dismissed" && t.status !== "proposed");
+  const done = live.filter((t) => t.status === "done");
+  const open = live.filter((t) => ["open", "doing", "waiting"].includes(t.status));
+  const minutesLeft = open.reduce((a, t) => a + Math.max(15, Number(t.effort_minutes) || 30), 0);
+  const actionable = open.filter((t) => t.status === "open" || t.status === "doing");
+  const next = [...actionable].sort((a, b) =>
+    (a.scheduled_start ? 0 : 1) - (b.scheduled_start ? 0 : 1) ||
+    String(a.scheduled_start ?? "").localeCompare(String(b.scheduled_start ?? "")) ||
+    (TIER_RANK[a.tier] ?? 1) - (TIER_RANK[b.tier] ?? 1) ||
+    String(a.created_at).localeCompare(String(b.created_at)))[0] ?? null;
+  return {
+    total: live.length, done: done.length, open: open.length,
+    progress: live.length ? Math.round((done.length / live.length) * 100) : 0,
+    minutes_left: minutesLeft,
+    waiting: open.filter((t) => t.status === "waiting").length,
+    overdue_tasks: actionable.filter((t) => t.due_date && String(t.due_date) < today).length,
+    next_action: next ? { id: next.id, title: next.title, when: next.scheduled_start ?? null, tier: next.tier } : null,
+  };
+}
+
+async function projectsList(tid: string, p: any = {}) {
+  const { data: cfg } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", tid).maybeSingle();
+  const today = localDate(Date.now(), cfg?.timezone || "Europe/London");
+  let q = supabase.from("projects").select("*").eq("tenant_id", tid).eq("archived", false);
+  if (PROJECT_STATUSES.includes(String(p.status ?? ""))) q = q.eq("status", String(p.status));
+  else if (String(p.status ?? "") !== "all") q = q.neq("status", "complete");
+  const { data: projects, error } = await q.order("deadline", { ascending: true, nullsFirst: false }).limit(200);
+  if (error) return { ok: false, text: /projects/.test(error.message) ? "Projects aren't set up yet — run the Phase 2 SQL." : error.message, projects: [] };
+  const ids = (projects ?? []).map((x: any) => x.id);
+  const { data: tasks } = ids.length ? await supabase.from("tasks").select("id, title, status, tier, effort_minutes, due_date, scheduled_start, created_at, project_id").eq("tenant_id", tid).in("project_id", ids).limit(2000) : { data: [] as any[] };
+  const names = await clientNames(tid, (projects ?? []).map((x: any) => x.client_id));
+  const rank: Record<string, number> = { in_progress: 0, waiting: 1, scheduled: 2, inbox: 3, complete: 4 };
+  const out = (projects ?? []).map((pr: any) => {
+    const st = projectStats((tasks ?? []).filter((t: any) => t.project_id === pr.id), today);
+    const overdue = !!pr.deadline && String(pr.deadline) < today && pr.status !== "complete";
+    return { id: pr.id, name: pr.name, description: pr.description ?? "", client_id: pr.client_id ?? null, client_name: pr.client_id ? names[pr.client_id] ?? null : null,
+      status: pr.status, status_label: PROJECT_WORD[pr.status] ?? pr.status, priority: pr.priority ?? "high", deadline: pr.deadline ?? null, major: !!pr.major,
+      waiting_on: pr.waiting_on ?? null, notes: pr.notes ?? "", overdue, no_next_action: ACTIVE_PROJECT.includes(pr.status) && !st.next_action, ...st, hours_left: Math.round((st.minutes_left / 60) * 10) / 10 };
+  }).sort((a: any, b: any) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9) || String(a.deadline ?? "9999").localeCompare(String(b.deadline ?? "9999")));
+  const active = out.filter((x: any) => ACTIVE_PROJECT.includes(x.status));
+  return { ok: true, projects: out, active_count: active.length, major_active: active.filter((x: any) => x.major).length,
+    text: !active.length ? (out.length ? `No active projects (${out.length} in Inbox).` : "No projects yet.") : out.length ? `${active.length} active project${active.length === 1 ? "" : "s"}:\n${active.slice(0, 10).map((x: any) => `• ${x.name}${x.client_name ? ` (${x.client_name})` : ""}: ${x.status_label}, ${x.progress}% done, ${x.hours_left}h left${x.deadline ? `, due ${dayName(x.deadline)}` : ""}${x.next_action ? `. Next: ${x.next_action.title}` : ". No next action"}`).join("\n")}` : "No projects yet." };
+}
+
+async function projectGet(tid: string, id: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", tid).maybeSingle();
+  const today = localDate(Date.now(), cfg?.timezone || "Europe/London");
+  const { data: pr } = await supabase.from("projects").select("*").eq("tenant_id", tid).eq("id", id).maybeSingle();
+  if (!pr) return { ok: false, text: "I can't find that project." };
+  const { data: tasks } = await supabase.from("tasks").select("id, title, status, tier, effort_minutes, due_date, scheduled_start, scheduled_end, pinned_date, created_at, detail, checklist, area, waiting_on, move_count").eq("tenant_id", tid).eq("project_id", id).neq("status", "dismissed").order("created_at").limit(500);
+  const names = await clientNames(tid, [pr.client_id]);
+  const st = projectStats(tasks ?? [], today);
+  const order: Record<string, number> = { doing: 0, open: 1, waiting: 2, proposed: 3, done: 4 };
+  return { ok: true, project: { ...pr, client_name: pr.client_id ? names[pr.client_id] ?? null : null, status_label: PROJECT_WORD[pr.status] ?? pr.status, overdue: !!pr.deadline && String(pr.deadline) < today && pr.status !== "complete", ...st, hours_left: Math.round((st.minutes_left / 60) * 10) / 10 },
+    tasks: (tasks ?? []).map((t: any) => ({ ...t, notes: t.detail ?? "", checklist: Array.isArray(t.checklist) ? t.checklist : [], minutes: Math.max(15, Number(t.effort_minutes) || 30) }))
+      .sort((a: any, b: any) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || String(a.scheduled_start ?? "9").localeCompare(String(b.scheduled_start ?? "9"))) };
+}
+
+// Create or update. Starting a third major build warns first (limit per business, default 2) unless override: true.
+async function projectSave(tid: string, handle: string, p: any) {
+  const id = p.id ? String(p.id) : null;
+  const row: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if (p.name !== undefined) row.name = String(p.name).trim().slice(0, 120);
+  if (p.description !== undefined) row.description = String(p.description ?? "").trim().slice(0, 2000) || null;
+  if (p.client_id !== undefined) row.client_id = p.client_id ? String(p.client_id) : null;
+  if (p.status !== undefined && PROJECT_STATUSES.includes(String(p.status))) row.status = String(p.status);
+  if (["must", "high", "bonus"].includes(String(p.priority ?? ""))) row.priority = String(p.priority);
+  if (p.deadline !== undefined) { if (p.deadline === null || p.deadline === "") row.deadline = null; else if (/^\d{4}-\d{2}-\d{2}$/.test(String(p.deadline))) row.deadline = String(p.deadline); }
+  if (p.major !== undefined) row.major = p.major === true || String(p.major) === "true";
+  if (p.notes !== undefined) row.notes = String(p.notes ?? "").slice(0, 8000) || null;
+  if (p.waiting_on !== undefined) row.waiting_on = String(p.waiting_on ?? "").trim().slice(0, 200) || null;
+  if (row.status === "complete") row.completed_at = new Date().toISOString();
+  else if (row.status) row.completed_at = null;
+  if (!id && !row.name) return { ok: false, text: "Give the project a name." };
+  // The two-major-builds rule
+  const prev = id ? (await supabase.from("projects").select("status, major, name").eq("tenant_id", tid).eq("id", id).maybeSingle()).data : null;
+  const willBeMajor = row.major !== undefined ? !!row.major : !!prev?.major;
+  const willStatus = String(row.status ?? prev?.status ?? "inbox");
+  const becomingActive = willBeMajor && ACTIVE_PROJECT.includes(willStatus) && !(prev && prev.major && ACTIVE_PROJECT.includes(prev.status));
+  if (becomingActive && !(p.override === true || String(p.override) === "true")) {
+    const { data: lim } = await supabase.from("tenant_config").select("max_major_builds").eq("tenant_id", tid).maybeSingle();
+    const max = Math.max(1, Number(lim?.max_major_builds ?? 2) || 2);
+    let q = supabase.from("projects").select("id, name, deadline").eq("tenant_id", tid).eq("archived", false).eq("major", true).in("status", ACTIVE_PROJECT);
+    if (id) q = q.neq("id", id);
+    const { data: majors } = await q;
+    // When the first of the current major builds is due to finish — the earliest a new one could start properly
+    const ends = (majors ?? []).map((m: any) => m.deadline).filter(Boolean).sort();
+    const earliest_start = ends.length ? addDays(String(ends[0]), 1) : null;
+    if ((majors ?? []).length >= max) return { ok: false, needs_override: true, active_majors: majors, earliest_start, text: `You've already got ${(majors ?? []).length} major build${(majors ?? []).length === 1 ? "" : "s"} on (${(majors ?? []).map((m: any) => m.name).join(" and ")}). Starting another usually means all of them slip. Start it anyway?` };
+  }
+  if (id) {
+    const { error } = await supabase.from("projects").update(row).eq("tenant_id", tid).eq("id", id);
+    if (error) return { ok: false, text: error.message };
+    if (row.status === "complete") await supabase.from("tasks").update({ status: "dismissed", dismissed_reason: "project completed" }).eq("tenant_id", tid).eq("project_id", id).eq("status", "proposed");
+    if (row.deadline !== undefined || row.status !== undefined) startInBackground(forgePlan(tid, { force: true, from_now: true }));
+    return { ok: true, id, text: `Saved "${row.name ?? prev?.name ?? "project"}".` };
+  }
+  const { data: made, error } = await supabase.from("projects").insert({ tenant_id: tid, owner: handle || null, status: "inbox", priority: "high", major: false, archived: false, ...row }).select("id").maybeSingle();
+  if (error) return { ok: false, text: /projects/.test(error.message) ? "Projects aren't set up yet — run the Phase 2 SQL." : error.message };
+  return { ok: true, id: made?.id, text: `Project "${row.name}" created.` };
+}
+
+// ---------- the client request inbox (requests are tasks with status "proposed", so Waiting on you and WhatsApp keep working) ----------
+async function requestsList(tid: string) {
+  const { data: rows, error } = await supabase.from("tasks").select("id, title, detail, client_id, project_id, source, tier, effort_minutes, due_date, created_at, proposal_rank, area, kind").eq("tenant_id", tid).eq("status", "proposed").order("created_at", { ascending: false }).limit(100);
+  if (error) return { ok: false, text: error.message, requests: [] };
+  // Fill in the client and a time estimate for a few new ones each look (Archie's guess, shown as such)
+  let budget = 4;
+  for (const r of rows ?? []) {
+    if (budget <= 0) break;
+    if (Number(r.effort_minutes) > 0) continue;   // estimated once; the client match is best-effort
+    budget--;
+    const est = await taskEstimate(tid, String(r.title ?? ""), String(r.detail ?? ""));
+    const upd: Record<string, unknown> = { effort_minutes: est.minutes, kind: est.kind };
+    r.effort_minutes = est.minutes;
+    if (!r.area) upd.area = est.area;
+    if (!r.client_id && est.client_id) { upd.client_id = est.client_id; r.client_id = est.client_id; }
+    await supabase.from("tasks").update(upd).eq("tenant_id", tid).eq("id", r.id);
+  }
+  const names = await clientNames(tid, (rows ?? []).map((r: any) => r.client_id));
+  const { data: projs } = await supabase.from("projects").select("id, name").eq("tenant_id", tid).eq("archived", false).neq("status", "complete").limit(200);
+  const pName: Record<string, string> = {}; for (const x of projs ?? []) pName[x.id] = x.name;
+  const srcWord = (s: string) => /whatsapp|wa/i.test(s) ? "WhatsApp" : /email|gmail/i.test(s) ? "Email" : /manual|page/i.test(s) ? "Added by you" : /call|fathom/i.test(s) ? "Call notes" : s ? "Messages" : "Messages";
+  const requests = (rows ?? []).map((r: any) => ({ id: r.id, title: r.title, description: r.detail ?? "", client_id: r.client_id ?? null, client_name: r.client_id ? names[r.client_id] ?? null : null,
+    source: srcWord(String(r.source ?? "")), priority: ["must", "high", "bonus"].includes(r.tier) ? r.tier : "high", minutes: Math.max(15, Number(r.effort_minutes) || 30), deadline: r.due_date ?? null,
+    project_id: r.project_id ?? null, project_name: r.project_id ? pName[r.project_id] ?? null : null, received: r.created_at, status: "new" }));
+  return { ok: true, requests, count: requests.length, text: requests.length ? `${requests.length} request${requests.length === 1 ? "" : "s"} to sort:\n${requests.slice(0, 8).map((r: any, i: number) => `${i + 1}. ${r.title}${r.client_name ? ` (${r.client_name})` : ""}`).join("\n")}` : "No client requests waiting." };
+}
+
+async function requestAdd(tid: string, handle: string, p: any) {
+  const title = String(p.title ?? "").trim(); if (!title) return { ok: false, text: "What's the request?" };
+  const { data: row, error } = await supabase.from("tasks").insert({ tenant_id: tid, owner: handle || null, title: title.slice(0, 200), detail: String(p.description ?? p.notes ?? "").trim().slice(0, 2000) || null,
+    client_id: p.client_id ? String(p.client_id) : null, project_id: p.project_id ? String(p.project_id) : null, tier: ["must", "high", "bonus"].includes(String(p.priority ?? "")) ? String(p.priority) : "high",
+    effort_minutes: Number(p.minutes) > 0 ? Math.max(15, Math.min(480, Math.round(Number(p.minutes) / 15) * 15)) : null, due_date: /^\d{4}-\d{2}-\d{2}$/.test(String(p.deadline ?? "")) ? String(p.deadline) : null,
+    status: "proposed", source: String(p.source ?? "manual").slice(0, 40), kind: "shallow" }).select("id").maybeSingle();
+  if (error) return { ok: false, text: error.message };
+  return { ok: true, id: row?.id, text: "Request added to your inbox." };
+}
+
+// Accept → a real task (optionally on a day, in a project, with a priority/length/deadline); decline → dismissed
+async function requestAccept(tid: string, handle: string, p: any) {
+  const id = String(p.id ?? "");
+  const { data: r } = await supabase.from("tasks").select("id, title, detail, effort_minutes, area, kind").eq("tenant_id", tid).eq("id", id).eq("status", "proposed").maybeSingle();
+  if (!r) return { ok: false, text: "That request has already been dealt with." };
+  const upd: Record<string, unknown> = { status: "open", proposal_rank: null, owner: handle || undefined };
+  if (["must", "high", "bonus"].includes(String(p.priority ?? p.tier ?? ""))) upd.tier = String(p.priority ?? p.tier);
+  if (Number(p.minutes) > 0) upd.effort_minutes = Math.max(15, Math.min(480, Math.round(Number(p.minutes) / 15) * 15));
+  if (p.deadline !== undefined || p.due !== undefined) { const d = String(p.deadline ?? p.due ?? ""); upd.due_date = /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null; }
+  if (p.project_id !== undefined) upd.project_id = p.project_id ? String(p.project_id) : null;
+  if (p.client_id !== undefined) upd.client_id = p.client_id ? String(p.client_id) : null;
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(String(p.date ?? "")) ? String(p.date) : null;
+  if (date) { upd.pinned_date = date; upd.hold = false; }
+  if (p.inbox === true || String(p.inbox) === "true") { upd.hold = true; upd.pinned_date = null; }
+  if ((!r.effort_minutes && !upd.effort_minutes) || !r.area) {
+    const est = await taskEstimate(tid, String(r.title), String(r.detail ?? ""));
+    if (!r.effort_minutes && !upd.effort_minutes) upd.effort_minutes = est.minutes;
+    if (!r.area) upd.area = est.area;
+    if (!r.kind || r.kind === "shallow") upd.kind = est.kind;
+  }
+  if (upd.owner === undefined) delete upd.owner;
+  const { error } = await supabase.from("tasks").update(upd).eq("tenant_id", tid).eq("id", id);
+  if (error) return { ok: false, text: error.message };
+  await forgePlan(tid, { force: true, from_now: true });
+  return await taskLanded(tid, handle, id, date, "Accepted");
+}
+
+// ---------- the Overview: workload at a glance ----------
+async function forgeOverview(tid: string, handle: string) {
+  const { data: cfg } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", tid).maybeSingle();
+  const tz = cfg?.timezone || "Europe/London";
+  const today = localDate(Date.now(), tz);
+  const { data: m } = handle ? await supabase.from("team_members").select("*").eq("tenant_id", tid).eq("handle", handle).maybeSingle()
+    : await supabase.from("team_members").select("*").eq("tenant_id", tid).eq("gets_financials", true).maybeSingle();
+  if (!m) return { ok: false, text: "No such person." };
+  const dow = new Date(today + "T12:00:00Z").getUTCDay();
+  const monday = dow === 6 ? addDays(today, 2) : dow === 0 ? addDays(today, 1) : addDays(today, -((dow + 6) % 7));
+  const week = [0, 1, 2, 3, 4].map((i) => addDays(monday, i));
+  const [{ data: open }, { data: doneWeek }, L, projects, requests] = await Promise.all([
+    selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing", "waiting"]).limit(500), "id, title, status, tier, effort_minutes, due_date, scheduled_start, area, move_count, critical, client_id, project_id, waiting_on"),
+    supabase.from("tasks").select("effort_minutes, area, updated_at").eq("tenant_id", tid).eq("owner", m.handle).eq("status", "done").gte("updated_at", isoAtTz(monday, "00:00", tz)).limit(500),
+    dayLoads(tid, m.handle, monday, 5),
+    projectsList(tid),
+    requestsList(tid),
+  ]);
+  const tasks = open ?? [];
+  const actionable = tasks.filter((t: any) => t.status !== "waiting");
+  const dayOf = (t: any) => t.scheduled_start ? localDate(Date.parse(t.scheduled_start), tz) : null;
+  const unplaced: any[] = Array.isArray(m.forge_unplaced) ? m.forge_unplaced : [];
+  // Weekly capacity, Monday to Friday, with the growth / clients / admin split
+  const days = week.map((d) => {
+    const load = L.days.find((x) => x.date === d);
+    const past = d < today;
+    const planned = actionable.filter((t: any) => dayOf(t) === d);
+    const done = (doneWeek ?? []).filter((t: any) => localDate(Date.parse(t.updated_at), tz) === d);
+    const split = { growth: 0, clients: 0, admin: 0 } as Record<string, number>;
+    for (const t of [...planned, ...done]) split[["growth", "clients", "admin"].includes(t.area) ? t.area : "admin"] += Math.max(15, Number(t.effort_minutes) || 30);
+    const allocated = planned.reduce((a: number, t: any) => a + Math.max(15, Number(t.effort_minutes) || 30), 0);
+    const cached = (Array.isArray(m.forge_days_cache) ? m.forge_days_cache : []).find((x: any) => x?.date === d);
+    const available = past ? 0 : (cached ? Math.min(Number(cached.cap ?? 0) + Number(cached.growth_free ?? 0), Number(cached.free ?? 0) || Infinity) : Number(load?.cap ?? 0));
+    return { date: d, past, today: d === today, available, allocated, remaining: Math.max(0, available - allocated), done: done.reduce((a: number, t: any) => a + Math.max(15, Number(t.effort_minutes) || 30), 0), split, over: !past && allocated > available && available > 0 };
+  });
+  const ahead = days.filter((d) => !d.past);
+  const weekAvail = ahead.reduce((a, d) => a + d.available, 0), weekAlloc = ahead.reduce((a, d) => a + d.allocated, 0);
+  const warnings: string[] = [];
+  for (const d of days) if (d.over) warnings.push(`${dayName(d.date)} has ${hrs(d.allocated)} planned but only ${hrs(d.available)} free.`);
+  if (weekAlloc > weekAvail && weekAvail > 0) warnings.push(`This week has ${hrs(weekAlloc)} of work planned and ${hrs(weekAvail)} free. Something needs to move.`);
+  if (m.forge_calendar_ok === false && m.forge_calendar_error) warnings.unshift(m.forge_calendar_error);
+  // Needs attention
+  const attention: { kind: string; id: string; title: string; text: string; project?: boolean }[] = [];
+  for (const t of actionable) if (t.due_date && String(t.due_date) < today) attention.push({ kind: "overdue", id: t.id, title: t.title, text: `Overdue since ${dayName(t.due_date)}` });
+  for (const pr of (projects.projects ?? []) as any[]) {
+    if (pr.overdue) attention.push({ kind: "project_overdue", id: pr.id, title: pr.name, text: `Project deadline was ${dayName(pr.deadline)}`, project: true });
+    if (pr.no_next_action) attention.push({ kind: "no_next_action", id: pr.id, title: pr.name, text: "No next action. What's the next step?", project: true });
+  }
+  for (const t of actionable) if (Number(t.move_count) >= 3) attention.push({ kind: "carried", id: t.id, title: t.title, text: `Moved ${t.move_count} times. Do it, delegate it, or drop it?` });
+  for (const u of unplaced) attention.push({ kind: u.kind === "late" ? "late" : "no_room", id: u.id, title: u.title, text: u.reason });
+  for (const t of tasks.filter((x: any) => x.status === "waiting")) attention.push({ kind: "waiting", id: t.id, title: t.title, text: t.waiting_on ? `Waiting on ${t.waiting_on}` : "Waiting on the client" });
+  const rank: Record<string, number> = { overdue: 0, project_overdue: 1, late: 2, no_room: 3, no_next_action: 4, carried: 5, waiting: 6 };
+  attention.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9));
+  const metrics = {
+    due_today: actionable.filter((t: any) => String(t.due_date ?? "") === today).length,
+    overdue: actionable.filter((t: any) => t.due_date && String(t.due_date) < today).length,
+    active_projects: projects.active_count ?? 0,
+    waiting_on_clients: tasks.filter((t: any) => t.status === "waiting").length,
+    hours_free_this_week: Math.round((days.reduce((a, d) => a + d.remaining, 0) / 60) * 10) / 10,
+    wont_fit: unplaced.length,
+    requests: requests.count ?? 0,
+  };
+  const text = `This week: ${hrs(weekAlloc)} planned of ${hrs(weekAvail)} free. ${metrics.overdue} overdue, ${metrics.due_today} due today, ${metrics.active_projects} active projects, ${metrics.waiting_on_clients} waiting on clients, ${metrics.wont_fit} won't fit.${warnings.length ? `\n⚠️ ${warnings[0]}` : ""}`;
+  return { ok: true, today, metrics, projects: (projects.projects ?? []).filter((x: any) => x.status !== "complete"), week: days, warnings, attention: attention.slice(0, 30), requests: (requests.requests ?? []).slice(0, 5), text };
+}
+
 // v9.13: what needs attention — overdue, carried over 3+ times, landing after its deadline, didn't fit
 async function forgeAttention(tid: string, handle: string, today: string, unplaced: any[]) {
   const { data: open } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", handle).in("status", ["open", "doing"]).limit(300), "id, title, due_date, move_count, critical");
@@ -7110,12 +7406,15 @@ async function forgePlanGet(tid: string, handle: string, days = 5) {
     : await supabase.from("team_members").select("*").eq("tenant_id", tid).eq("gets_financials", true).maybeSingle();
   if (!m) return { ok: false, error: "no such person" };
   const until = Date.parse(isoAtTz(addDays(today, Math.max(1, Math.min(10, days))), "00:00", tz));
-  const { data: tasks } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).not("scheduled_start", "is", null).lt("scheduled_start", new Date(until).toISOString()).order("scheduled_start"), "id, title, tier, plan_slot, kind, effort_minutes, due_date, scheduled_start, scheduled_end, move_count, pinned_date, detail, area, client_id, critical");
+  const { data: tasks } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).not("scheduled_start", "is", null).lt("scheduled_start", new Date(until).toISOString()).order("scheduled_start"), "id, title, tier, plan_slot, kind, effort_minutes, due_date, scheduled_start, scheduled_end, move_count, pinned_date, detail, area, client_id, critical, project_id, checklist");
   // v9.11.3: client names for the task sheet
   const cIds = [...new Set((tasks ?? []).map((t: any) => t.client_id).filter(Boolean))];
   const cName: Record<string, string> = {};
   if (cIds.length) { const { data: cs } = await supabase.from("clients").select("id, name").eq("tenant_id", tid).in("id", cIds); for (const c of cs ?? []) cName[c.id] = c.name; }
-  const sheet = (b: any) => ({ critical: !!b.critical, move_count: Number(b.move_count) || 0, tier: b.tier ?? "high", notes: b.detail ?? "", area: ["growth", "clients", "admin"].includes(b.area) ? b.area : null, client_id: b.client_id ?? null, client_name: b.client_id ? cName[b.client_id] ?? null : null, minutes: Math.max(15, Number(b.effort_minutes) || 30) });
+  const pIds = [...new Set((tasks ?? []).map((t: any) => t.project_id).filter(Boolean))];
+  const pNm: Record<string, string> = {};
+  if (pIds.length) { const { data: ps } = await supabase.from("projects").select("id, name").eq("tenant_id", tid).in("id", pIds); for (const x of ps ?? []) pNm[x.id] = x.name; }
+  const sheet = (b: any) => ({ project_id: b.project_id ?? null, project_name: b.project_id ? pNm[b.project_id] ?? null : null, checklist: Array.isArray(b.checklist) ? b.checklist : [], critical: !!b.critical, move_count: Number(b.move_count) || 0, tier: b.tier ?? "high", notes: b.detail ?? "", area: ["growth", "clients", "admin"].includes(b.area) ? b.area : null, client_id: b.client_id ?? null, client_name: b.client_id ? cName[b.client_id] ?? null : null, minutes: Math.max(15, Number(b.effort_minutes) || 30) });
   // Calendar events for the same days (to show around the blocks)
   let events: any[] = [];
   if (m.ghl_user_id) {
@@ -8669,7 +8968,7 @@ async function taskMove(tid: string, id: string, to: string, handle: string | nu
 async function waitingClear(tid: string) {
   const [a, b, c2] = await Promise.all([
     supabase.from("message_drafts").update({ status: "dismissed" }).eq("tenant_id", tid).eq("status", "pending").select("id"),
-    supabase.from("tasks").update({ status: "dismissed", dismissed_reason: "cleared from Waiting on you", proposal_rank: null }).eq("tenant_id", tid).eq("status", "proposed").select("id"),
+    supabase.from("tasks").update({ status: "dismissed", dismissed_reason: "cleared from Waiting on you", proposal_rank: null }).eq("tenant_id", tid).eq("status", "proposed").gte("created_at", new Date(Date.now() - 5 * 86400000).toISOString()).or("source.is.null,source.neq.manual").select("id"),
     supabase.from("edit_jobs").update({ planner_post_id: "skipped" }).eq("tenant_id", tid).eq("status", "done").is("planner_post_id", null).select("id"),
   ]);
   const n = (a.data?.length ?? 0) + (b.data?.length ?? 0) + (c2.data?.length ?? 0);
