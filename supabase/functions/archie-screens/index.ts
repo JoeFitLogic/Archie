@@ -2716,7 +2716,7 @@ async function statusCheck(tid: string) {
   out.secrets = secrets;
   // 2. Database: each table and the columns later versions added
   const schema: [string, string][] = [
-    ["tasks", "id, hold, plan_slot, pinned_date, proposal_rank, area, client_id, critical, block_start, block_end, project_id, checklist, waiting_on"], ["projects", "id, status, major, deadline, waiting_on, archived"], ["briefs", "id, short_body, read_at"], ["council_sessions", "id"],
+    ["tasks", "id, hold, plan_slot, pinned_date, proposal_rank, area, client_id, critical, block_start, block_end, project_id, checklist, waiting_on"], ["forge_projects", "id, status, major, deadline, waiting_on, archived"], ["briefs", "id, short_body, read_at"], ["council_sessions", "id"],
     ["broll_library", "id"], ["content_stacks", "id, handed_to"], ["custom_styles", "id"], ["style_specs", "id"],
     ["edit_jobs", "id, engine, sources, cover_url, render_retried, scheduled_for"], ["feature_events", "id"], ["feature_feedback", "id"],
     ["client_groups", "conversation_id, client_id"], ["yt_jobs", "id, renders, thumbs, outputs, split"], ["agent_runs", "id"], ["carousels", "id, source"],
@@ -3337,7 +3337,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
             let clientId: string | null = null;
             if (args.client) { const { data: cl } = await supabase.from("clients").select("id, name").eq("tenant_id", tid).eq("status", "active").ilike("name", `%${String(args.client).trim()}%`).limit(2); if ((cl ?? []).length === 1) clientId = cl![0].id; }
             let id: string | null = null;
-            if (a2 !== "add" && args.name) { const { data: pr } = await supabase.from("projects").select("id").eq("tenant_id", tid).eq("archived", false).ilike("name", `%${String(args.name).trim()}%`).limit(2); if ((pr ?? []).length === 1) id = pr![0].id; else return { ok: false, text: (pr ?? []).length ? "Which project? More than one matches." : `I can't find a project like "${args.name}".` }; }
+            if (a2 !== "add" && args.name) { const { data: pr } = await supabase.from("forge_projects").select("id").eq("tenant_id", tid).eq("archived", false).ilike("name", `%${String(args.name).trim()}%`).limit(2); if ((pr ?? []).length === 1) id = pr![0].id; else return { ok: false, text: (pr ?? []).length ? "Which project? More than one matches." : `I can't find a project like "${args.name}".` }; }
             let st = String(args.status ?? "").toLowerCase().trim().replace(/\s+/g, "_");
             st = ({ done: "complete", completed: "complete", finished: "complete", started: "in_progress", active: "in_progress", on_hold: "waiting", paused: "waiting", blocked: "waiting", planned: "scheduled" } as Record<string, string>)[st] ?? st;
             const dl = /^\d{4}-\d{2}-\d{2}$/.test(String(args.deadline ?? "")) ? String(args.deadline) : undefined;
@@ -6969,7 +6969,7 @@ async function forgePlanRun(tid: string, opt: { force?: boolean; from_now?: bool
       "id, title, tier, kind, effort_minutes, due_date, scheduled_start, scheduled_end, created_at, move_count, block_event_id, pinned_date, hold, area, critical, block_start, block_end, project_id");
     // v9.14: a task in a project with no deadline of its own works to the project's deadline
     const projDeadline: Record<string, string> = {};
-    { const pIds = [...new Set((tasks ?? []).map((t: any) => t.project_id).filter(Boolean))]; if (pIds.length) { const { data: ps } = await supabase.from("projects").select("id, deadline").eq("tenant_id", tid).in("id", pIds).neq("status", "complete").eq("archived", false); for (const x of ps ?? []) if (x.deadline) projDeadline[x.id] = String(x.deadline); } }
+    { const pIds = [...new Set((tasks ?? []).map((t: any) => t.project_id).filter(Boolean))]; if (pIds.length) { const { data: ps } = await supabase.from("forge_projects").select("id, deadline").eq("tenant_id", tid).in("id", pIds).neq("status", "complete").eq("archived", false); for (const x of ps ?? []) if (x.deadline) projDeadline[x.id] = String(x.deadline); } }
     const startOfToday = Date.parse(isoAtTz(today, "00:00", tz));
     const soon = addDays(today, 1);
     // v9.13.1: once today's working hours are used up (or it's after finish time), "today" isn't somewhere a task can go —
@@ -7174,11 +7174,11 @@ function projectStats(tasks: any[], today: string) {
 async function projectsList(tid: string, p: any = {}) {
   const { data: cfg } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", tid).maybeSingle();
   const today = localDate(Date.now(), cfg?.timezone || "Europe/London");
-  let q = supabase.from("projects").select("*").eq("tenant_id", tid).eq("archived", false);
+  let q = supabase.from("forge_projects").select("*").eq("tenant_id", tid).eq("archived", false);
   if (PROJECT_STATUSES.includes(String(p.status ?? ""))) q = q.eq("status", String(p.status));
   else if (String(p.status ?? "") !== "all") q = q.neq("status", "complete");
   const { data: projects, error } = await q.order("deadline", { ascending: true, nullsFirst: false }).limit(200);
-  if (error) return { ok: false, text: /projects/.test(error.message) ? "Projects aren't set up yet — run the Phase 2 SQL." : error.message, projects: [] };
+  if (error) return { ok: false, text: /forge_projects/.test(error.message) ? "Projects aren't set up yet — run the Phase 2 SQL." : error.message, projects: [] };
   const ids = (projects ?? []).map((x: any) => x.id);
   const { data: tasks } = ids.length ? await supabase.from("tasks").select("id, title, status, tier, effort_minutes, due_date, scheduled_start, created_at, project_id").eq("tenant_id", tid).in("project_id", ids).limit(2000) : { data: [] as any[] };
   const names = await clientNames(tid, (projects ?? []).map((x: any) => x.client_id));
@@ -7198,7 +7198,7 @@ async function projectsList(tid: string, p: any = {}) {
 async function projectGet(tid: string, id: string) {
   const { data: cfg } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", tid).maybeSingle();
   const today = localDate(Date.now(), cfg?.timezone || "Europe/London");
-  const { data: pr } = await supabase.from("projects").select("*").eq("tenant_id", tid).eq("id", id).maybeSingle();
+  const { data: pr } = await supabase.from("forge_projects").select("*").eq("tenant_id", tid).eq("id", id).maybeSingle();
   if (!pr) return { ok: false, text: "I can't find that project." };
   const { data: tasks } = await supabase.from("tasks").select("id, title, status, tier, effort_minutes, due_date, scheduled_start, scheduled_end, pinned_date, created_at, detail, checklist, area, waiting_on, move_count").eq("tenant_id", tid).eq("project_id", id).neq("status", "dismissed").order("created_at").limit(500);
   const names = await clientNames(tid, [pr.client_id]);
@@ -7226,14 +7226,14 @@ async function projectSave(tid: string, handle: string, p: any) {
   else if (row.status) row.completed_at = null;
   if (!id && !row.name) return { ok: false, text: "Give the project a name." };
   // The two-major-builds rule
-  const prev = id ? (await supabase.from("projects").select("status, major, name").eq("tenant_id", tid).eq("id", id).maybeSingle()).data : null;
+  const prev = id ? (await supabase.from("forge_projects").select("status, major, name").eq("tenant_id", tid).eq("id", id).maybeSingle()).data : null;
   const willBeMajor = row.major !== undefined ? !!row.major : !!prev?.major;
   const willStatus = String(row.status ?? prev?.status ?? "inbox");
   const becomingActive = willBeMajor && ACTIVE_PROJECT.includes(willStatus) && !(prev && prev.major && ACTIVE_PROJECT.includes(prev.status));
   if (becomingActive && !(p.override === true || String(p.override) === "true")) {
     const { data: lim } = await supabase.from("tenant_config").select("max_major_builds").eq("tenant_id", tid).maybeSingle();
     const max = Math.max(1, Number(lim?.max_major_builds ?? 2) || 2);
-    let q = supabase.from("projects").select("id, name, deadline").eq("tenant_id", tid).eq("archived", false).eq("major", true).in("status", ACTIVE_PROJECT);
+    let q = supabase.from("forge_projects").select("id, name, deadline").eq("tenant_id", tid).eq("archived", false).eq("major", true).in("status", ACTIVE_PROJECT);
     if (id) q = q.neq("id", id);
     const { data: majors } = await q;
     // When the first of the current major builds is due to finish — the earliest a new one could start properly
@@ -7242,14 +7242,14 @@ async function projectSave(tid: string, handle: string, p: any) {
     if ((majors ?? []).length >= max) return { ok: false, needs_override: true, active_majors: majors, earliest_start, text: `You've already got ${(majors ?? []).length} major build${(majors ?? []).length === 1 ? "" : "s"} on (${(majors ?? []).map((m: any) => m.name).join(" and ")}). Starting another usually means all of them slip. Start it anyway?` };
   }
   if (id) {
-    const { error } = await supabase.from("projects").update(row).eq("tenant_id", tid).eq("id", id);
+    const { error } = await supabase.from("forge_projects").update(row).eq("tenant_id", tid).eq("id", id);
     if (error) return { ok: false, text: error.message };
     if (row.status === "complete") await supabase.from("tasks").update({ status: "dismissed", dismissed_reason: "project completed" }).eq("tenant_id", tid).eq("project_id", id).eq("status", "proposed");
     if (row.deadline !== undefined || row.status !== undefined) startInBackground(forgePlan(tid, { force: true, from_now: true }));
     return { ok: true, id, text: `Saved "${row.name ?? prev?.name ?? "project"}".` };
   }
-  const { data: made, error } = await supabase.from("projects").insert({ tenant_id: tid, owner: handle || null, status: "inbox", priority: "high", major: false, archived: false, ...row }).select("id").maybeSingle();
-  if (error) return { ok: false, text: /projects/.test(error.message) ? "Projects aren't set up yet — run the Phase 2 SQL." : error.message };
+  const { data: made, error } = await supabase.from("forge_projects").insert({ tenant_id: tid, owner: handle || null, status: "inbox", priority: "high", major: false, archived: false, ...row }).select("id").maybeSingle();
+  if (error) return { ok: false, text: /forge_projects/.test(error.message) ? "Projects aren't set up yet — run the Phase 2 SQL." : error.message };
   return { ok: true, id: made?.id, text: `Project "${row.name}" created.` };
 }
 
@@ -7271,7 +7271,7 @@ async function requestsList(tid: string) {
     await supabase.from("tasks").update(upd).eq("tenant_id", tid).eq("id", r.id);
   }
   const names = await clientNames(tid, (rows ?? []).map((r: any) => r.client_id));
-  const { data: projs } = await supabase.from("projects").select("id, name").eq("tenant_id", tid).eq("archived", false).neq("status", "complete").limit(200);
+  const { data: projs } = await supabase.from("forge_projects").select("id, name").eq("tenant_id", tid).eq("archived", false).neq("status", "complete").limit(200);
   const pName: Record<string, string> = {}; for (const x of projs ?? []) pName[x.id] = x.name;
   const srcWord = (s: string) => /whatsapp|wa/i.test(s) ? "WhatsApp" : /email|gmail/i.test(s) ? "Email" : /manual|page/i.test(s) ? "Added by you" : /call|fathom/i.test(s) ? "Call notes" : s ? "Messages" : "Messages";
   const requests = (rows ?? []).map((r: any) => ({ id: r.id, title: r.title, description: r.detail ?? "", client_id: r.client_id ?? null, client_name: r.client_id ? names[r.client_id] ?? null : null,
@@ -7413,7 +7413,7 @@ async function forgePlanGet(tid: string, handle: string, days = 5) {
   if (cIds.length) { const { data: cs } = await supabase.from("clients").select("id, name").eq("tenant_id", tid).in("id", cIds); for (const c of cs ?? []) cName[c.id] = c.name; }
   const pIds = [...new Set((tasks ?? []).map((t: any) => t.project_id).filter(Boolean))];
   const pNm: Record<string, string> = {};
-  if (pIds.length) { const { data: ps } = await supabase.from("projects").select("id, name").eq("tenant_id", tid).in("id", pIds); for (const x of ps ?? []) pNm[x.id] = x.name; }
+  if (pIds.length) { const { data: ps } = await supabase.from("forge_projects").select("id, name").eq("tenant_id", tid).in("id", pIds); for (const x of ps ?? []) pNm[x.id] = x.name; }
   const sheet = (b: any) => ({ project_id: b.project_id ?? null, project_name: b.project_id ? pNm[b.project_id] ?? null : null, checklist: Array.isArray(b.checklist) ? b.checklist : [], critical: !!b.critical, move_count: Number(b.move_count) || 0, tier: b.tier ?? "high", notes: b.detail ?? "", area: ["growth", "clients", "admin"].includes(b.area) ? b.area : null, client_id: b.client_id ?? null, client_name: b.client_id ? cName[b.client_id] ?? null : null, minutes: Math.max(15, Number(b.effort_minutes) || 30) });
   // Calendar events for the same days (to show around the blocks)
   let events: any[] = [];
