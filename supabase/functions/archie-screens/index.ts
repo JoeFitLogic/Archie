@@ -533,7 +533,7 @@ Deno.serve(async (req) => {
         const { data: cfgT } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", c.tid).maybeSingle();
         const tz = cfgT?.timezone || "Europe/London";
         const today = localDate(Date.now(), tz);
-        const { data } = await supabase.from("tasks").select("id, title, tier, plan_slot, due_date, pinned_date, scheduled_start, scheduled_end, effort_minutes, owner, created_at, hold, detail, kind, block_event_id, area, client_id").eq("tenant_id", c.tid).eq("owner", c.owner?.handle ?? "").in("status", ["open", "doing"]).order("created_at", { ascending: true }).limit(300);
+        const { data } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", c.tid).eq("owner", c.owner?.handle ?? "").in("status", ["open", "doing"]).order("created_at", { ascending: true }).limit(300), "id, title, tier, plan_slot, due_date, pinned_date, scheduled_start, scheduled_end, effort_minutes, owner, created_at, hold, detail, kind, block_event_id, area, client_id, critical, move_count");
         // v9.11.3: client names for the task sheet
         const tlIds = [...new Set((data ?? []).map((t: any) => t.client_id).filter(Boolean))];
         const tlNames: Record<string, string> = {};
@@ -543,7 +543,7 @@ Deno.serve(async (req) => {
           // v9.9.8: anything left on a past day rolls onto today (it used to fall out of every list)
           const carried = !!rawDay && rawDay < today;
           const day = carried ? today : rawDay;
-          return { id: t.id, title: t.title, held: !!t.hold, carried, carried_from: carried ? rawDay : null, priority: t.plan_slot ?? t.tier ?? "high", day: t.hold ? null : day, time: t.scheduled_start ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_start)) : null, pinned: !!t.pinned_date, due: t.due_date ?? null, overdue: !!t.due_date && t.due_date < today, notes: t.detail ?? "", area: ["growth", "clients", "admin"].includes(t.area) ? t.area : null, client_id: t.client_id ?? null, client_name: t.client_id ? tlNames[t.client_id] ?? null : null, tier: t.tier ?? "high", minutes: Math.max(15, Number(t.effort_minutes) || 30), kind: t.kind === "deep" ? "deep" : "shallow", end_time: t.scheduled_end ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_end)) : null, on_calendar: !!t.block_event_id };
+          return { id: t.id, title: t.title, held: !!t.hold, carried, carried_from: carried ? rawDay : null, priority: t.plan_slot ?? t.tier ?? "high", day: t.hold ? null : day, time: t.scheduled_start ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_start)) : null, pinned: !!t.pinned_date, due: t.due_date ?? null, overdue: !!t.due_date && t.due_date < today, notes: t.detail ?? "", area: ["growth", "clients", "admin"].includes(t.area) ? t.area : null, client_id: t.client_id ?? null, client_name: t.client_id ? tlNames[t.client_id] ?? null : null, tier: t.tier ?? "high", critical: !!t.critical, move_count: Number(t.move_count) || 0, minutes: Math.max(15, Number(t.effort_minutes) || 30), kind: t.kind === "deep" ? "deep" : "shallow", end_time: t.scheduled_end ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_end)) : null, on_calendar: !!t.block_event_id };
         });
         const days: string[] = []; for (let i = 0; i < 7; i++) days.push(addDays(today, i));
         // Capacity per day: planned task time vs the hours set for tasks (max_task_hours), only on working days
@@ -569,7 +569,7 @@ Deno.serve(async (req) => {
         // v9.10: no time given → Archie estimates how long it takes and whether it needs focus
         const est: any = Number(p.minutes) > 0 ? { ...(await taskEstimate(c.tid, title, notes, true)), minutes: Number(p.minutes), kind: p.kind === "deep" ? "deep" : (p.kind === "shallow" ? "shallow" : "shallow") } : await taskEstimate(c.tid, title, notes);
         const minutes = Math.max(15, Math.min(480, Math.round(est.minutes / 15) * 15 || 30));
-        const { data: row, error } = await supabase.from("tasks").insert({ tenant_id: c.tid, title: title.slice(0, 200), detail: notes || null, due_date: due, tier, kind: est.kind, area: ["growth", "clients", "admin"].includes(String(p.area)) ? String(p.area) : est.area, client_id: p.client_id ? String(p.client_id) : est.client_id, effort_minutes: minutes, status: "open", owner: c.owner?.handle ?? null, source: "forge", source_ref: `forge:${crypto.randomUUID()}`, pinned_date: date, accepted_by: c.owner?.handle ?? null, accepted_at: new Date().toISOString() }).select("id").single();
+        const { data: row, error } = await supabase.from("tasks").insert({ tenant_id: c.tid, title: title.slice(0, 200), detail: notes || null, due_date: due, tier, kind: est.kind, ...(p.critical === true || String(p.critical) === "true" ? { critical: true } : {}), area: ["growth", "clients", "admin"].includes(String(p.area)) ? String(p.area) : est.area, client_id: p.client_id ? String(p.client_id) : est.client_id, effort_minutes: minutes, status: "open", owner: c.owner?.handle ?? null, source: "forge", source_ref: `forge:${crypto.randomUUID()}`, pinned_date: date, accepted_by: c.owner?.handle ?? null, accepted_at: new Date().toISOString() }).select("id").single();
         if (error) return j({ ok: false, text: `Couldn't add it: ${error.message}` });
         await forgePlan(c.tid, { force: true, from_now: true });
         return j(await taskLanded(c.tid, c.owner?.handle ?? "", row!.id, date));
@@ -582,6 +582,7 @@ Deno.serve(async (req) => {
         if (["growth", "clients", "admin"].includes(String(p.area ?? ""))) upd.area = String(p.area);
         if (p.client_id !== undefined) upd.client_id = p.client_id ? String(p.client_id) : null;
         if (p.minutes !== undefined) upd.effort_minutes = Math.max(15, Math.min(480, Math.round((Number(p.minutes) || 30) / 15) * 15));
+        if (p.critical !== undefined) upd.critical = p.critical === true || String(p.critical) === "true";
         if (p.kind !== undefined) upd.kind = p.kind === "deep" ? "deep" : "shallow";
         if (["must", "high", "bonus"].includes(String(p.tier ?? ""))) upd.tier = String(p.tier);
         if (p.due !== undefined || p.due_date !== undefined) { const d = String(p.due ?? p.due_date ?? ""); upd.due_date = /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null; }
@@ -766,6 +767,10 @@ Deno.serve(async (req) => {
       case "dumps": { const { data } = await supabase.from("dumps").select("id, handle, clean, summary, created_at").eq("tenant_id", c.tid).order("created_at", { ascending: false }).limit(20); return j({ ok: true, dumps: data ?? [] }); }
       case "member_health": return j(await memberHealthList(c.tid, String(p.status ?? "")));
       case "member_touch": return j(await memberTouch(c.tid, p));
+      case "voice_add": return j(await voiceAdd(c.tid, p));
+      case "voice_list": return j(await voiceList(c.tid));
+      case "voice_remove": { const { error } = await supabase.from("voice_examples").update({ active: false }).eq("tenant_id", c.tid).eq("id", String(p.id ?? "")); return j(error ? { ok: false, text: error.message } : { ok: true, text: "Removed." }); }
+      case "voice_feedback": return j(await voiceFeedback(c.tid, p));
       case "member_health_run": { startInBackground(memberHealthRun(c.tid)); return j({ ok: true, text: "Re-scoring your clients — give it a minute, then refresh." }); }
       case "groups_suggest": return j(await groupsSuggest(c.tid));
       case "groups_link": return j(await groupsLink(c.tid, p));
@@ -1249,6 +1254,7 @@ async function businessContext(tid: string) {
     leadLink ? `Booking link for leads / new people: ${leadLink}` : "",
     clientLink ? `Booking link for existing clients: ${clientLink}` : "",
     await memoryText(tid, ["definition", "voice", "worked", "service", "fact"], 1800),
+    await voiceBlock(tid),
   ].filter(Boolean).join("\n");
 }
 
@@ -2684,7 +2690,7 @@ async function ytFinishPending(tid: string) {
 }
 
 // ===================== v9.9.6: status check — what's actually live =====================
-const ARCHIE_VERSION = "9.11.4";
+const ARCHIE_VERSION = "9.13.0";
 async function statusCheck(tid: string) {
   const out: Record<string, unknown> = { version: ARCHIE_VERSION, checked_at: new Date().toISOString() };
   // 1. Secrets: set or not (never the values)
@@ -2693,12 +2699,12 @@ async function statusCheck(tid: string) {
   out.secrets = secrets;
   // 2. Database: each table and the columns later versions added
   const schema: [string, string][] = [
-    ["tasks", "id, hold, plan_slot, pinned_date, proposal_rank, area, client_id"], ["briefs", "id, short_body, read_at"], ["council_sessions", "id"],
+    ["tasks", "id, hold, plan_slot, pinned_date, proposal_rank, area, client_id, critical, block_start, block_end"], ["briefs", "id, short_body, read_at"], ["council_sessions", "id"],
     ["broll_library", "id"], ["content_stacks", "id, handed_to"], ["custom_styles", "id"], ["style_specs", "id"],
     ["edit_jobs", "id, engine, sources, cover_url, render_retried, scheduled_for"], ["feature_events", "id"], ["feature_feedback", "id"],
     ["client_groups", "conversation_id, client_id"], ["yt_jobs", "id, renders, thumbs, outputs, split"], ["agent_runs", "id"], ["carousels", "id, source"],
-    ["team_members", "id, forge_caps, brief_voice, buffer_minutes, block_days, growth_start, growth_end, personal_blocks, personal_block_ids"], ["clients", "id, monthly_value"],
-    ["tenant_config", "tenant_id, thumb_faces, forge_caps, broll_synced_at, evening_wrap, cost_budget_gbp, plan, reel_style, cta_keyword, brief_style, group_suggestions"],
+    ["team_members", "id, forge_caps, brief_voice, buffer_minutes, block_days, growth_start, growth_end, personal_blocks, personal_block_ids, work_hours, growth_windows, forge_unplaced, forge_days_cache, forge_calendar_ok, forge_calendar_error"], ["clients", "id, monthly_value"],
+    ["tenant_config", "tenant_id, thumb_faces, forge_caps, forge_lock_until, broll_synced_at, evening_wrap, cost_budget_gbp, plan, reel_style, cta_keyword, brief_style, group_suggestions"],
   ];
   const db: Record<string, string> = {};
   for (const [t, cols] of schema) {
@@ -3027,10 +3033,12 @@ const TALK_RULES = [
   "- archie_checkup — 'is everything working?'; give the report as it is.",
   "- 'Show my last dump' → the LAST DUMP in the CONTEXT (give the clean note as it is). Dumps themselves are handled before you see them.",
   "- archie_feedback {rating: 1|-1, comment, feature} — when they react to something Archie just made or did ('that caption was rubbish, too salesy', 'love that reel', '👎 that summary was wrong'): rating 1 or -1, their words as the comment; feature only if obvious (e.g. 'caption', 'reel', 'brief', 'carousel'), otherwise leave it out. Then thank them in a few words and, if negative, offer to redo it.",
-  "- archie_carousel {action: make|post, topic, slides, format: carousel|story} — 'make me a carousel about planning your week' → make (7 slides unless they say). 'Make me a story about…' → format 'story' (3 frames unless they say). 'Post the carousel' / 'post the story' → post (Social Planner drafts).",
+  "- archie_carousel {action: make|post, topic, slides, format: carousel|story} — 'make me a carousel about planning your week' → make (7 slides unless they say). 'Make me a story about…' → format 'story' (3 frames unless they say). 'Post the carousel' / 'post the story' → post (Social Planner drafts). 'Send it here' / 'send me the carousel' / 'let me see it' → send (the slides as images in this chat).",
   "- archie_clear_waiting {} — 'clear waiting' / 'clear my waiting list' / 'none of those are relevant' → empties Waiting on you (drafts binned, spotted tasks dropped, reels taken off the list but kept).",
   "- archie_move_task {title, to} — 'move the offer task to tomorrow' / 'push the Elise one to Friday' → to = 'tomorrow', a weekday name, or YYYY-MM-DD. It pins the task to that day in Forge.",
-  "- archie_set_hours {work_start, work_end, lunch_start, lunch_end, work_days, caps} — 'change my hours to 8 till 4' → work_start 08:00, work_end 16:00. 'Lunch 12 till 1'. 'I don't work Fridays' → work_days '1,2,3,4'. '2 musts a day is enough' / 'make it 2 3 3' → caps '2,3,3' (Must,To-do,Bonus; keep the others as they are, default 3). Only pass what they changed.",
+  "- archie_when_can_i {title, hours, by, client} — capacity and realistic deadlines from their REAL Forge plan and calendar. 'When could I realistically deliver a 10 hour build for Sarah?' → hours 10. 'Can I take on X by Friday?' → title X, by = that date (YYYY-MM-DD). 'What deadline should I give them for the funnel?' → title. Never guess dates or capacity yourself; use what this returns, and say the promise date with the reason.",
+  "- archie_voice {verdict, kind, text, reason} — they're teaching you how they write. 'This caption is spot on, write like this: …' → verdict good. 'That's too generic / I'd never say that / no emojis like this' → verdict bad, with reason in their words; text = the draft they rejected (or the line they quoted). kind: script, caption, email, post or message. Use this whenever they paste writing they love or hate.",
+  "- archie_set_hours {work_start, work_end, lunch_start, lunch_end, work_days, caps} — 'change my hours to 8 till 4' → work_start 08:00, work_end 16:00. 'Lunch 12 till 1'. 'I don't work Fridays' → work_days '1,2,3,4'. '2 musts a day is enough' / 'make it 2 3 3' → caps '2,3,3' (Must,To-do,Bonus; keep the others as they are, default 2,3,2). Only pass what they changed.",
   "- archie_waiting {} — 'what's waiting?' / 'what do I need to do?' / 'anything to send?' → the Waiting on you list (drafts, proposals, reels ready). To act on items use archie_send_draft / archie_skip_draft / archie_proposal as before.",
   "- archie_full_brief {} — 'full brief' / 'show me everything' / 'the long version' → today's full brief.",
   "- When they reply just \"go\" to the morning brief: treat it as 'yes to the plan' — confirm in one line (\"👍 Plan's set. I'll nudge you before your first block.\") and, if drafts are waiting, add \"Reply 'send all' to send the N drafted messages.\"",
@@ -3145,7 +3153,16 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
       supabase.from("memories").select("fact").eq("tenant_id", tid).order("created_at", { ascending: false }).limit(20),
     ]);
     const bizMemory = await memoryText(tid, ["definition", "voice", "worked", "service", "fact", "baseline", "finding"], 2200);
+    // v9.12.1: what Archie sent them on its own recently (these never went through the chat, so you won't remember them)
+    const { data: recentSent } = await supabase.from("talk_messages").select("text, created_at").eq("tenant_id", tid).eq("handle", member.handle).eq("channel", "notify").gte("created_at", new Date(Date.now() - 12 * 3600000).toISOString()).order("created_at", { ascending: false }).limit(4);
+    const { data: lastUserBefore } = await supabase.from("talk_messages").select("created_at").eq("tenant_id", tid).eq("handle", member.handle).eq("role", "user").order("created_at", { ascending: false }).range(1, 1).maybeSingle();
+    const hhmm = (iso: string) => new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: tz }).format(new Date(iso));
+    const sentBlock = (recentSent ?? []).length
+      ? `MESSAGES YOU SENT THEM ON YOUR OWN (newest first; these are real, you sent them, even if they're not in your chat memory):\n${(recentSent ?? []).map((x: any) => `- ${hhmm(x.created_at)}: ${String(x.text).slice(0, 400).replace(/\s+/g, " ")}`).join("\n")}\n` +
+        `RULE: if their message is short or vague ("send it here", "this one", "post it", "yes", "looks good", "change the hook") and doesn't name something else, it's about the NEWEST message above${lastUserBefore?.created_at && (recentSent ?? [])[0] && String((recentSent ?? [])[0].created_at) > String(lastUserBefore.created_at) ? " (it arrived after their last message, so it's almost certainly what they mean)" : ""}. Only switch to an older topic if they name it.`
+      : "";
     const ctx = [
+      sentBlock,
       `Today: ${dayName}, ${timeNow} (${today}). Business: ${t?.business_name ?? ""}.`,
       `You're talking to ${member.name ?? member.handle} (handle: ${member.handle}${member.gets_financials ? ", the owner" : ", a team member — no money figures"}).`,
       `Their list today: ${(list ?? []).length ? (list ?? []).map((x: any) => `#${x.today_rank ?? "-"} ${x.title} [${x.tier}, ${x.effort_minutes ?? 30}m]`).join("; ") : "empty"}.`,
@@ -3165,7 +3182,8 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     const reply = async (msg: string) => {
       await supabase.from("talk_messages").insert({ tenant_id: tid, handle: member.handle, role: "archie", text: msg.slice(0, 8000), channel: via });
       if (opts.onReply) { opts.onReply(msg); return { ok: true, status: 200 }; }
-      return ghl(token, "/conversations/messages", "POST", { type: channel, contactId, message: msg.slice(0, 3500) }, "2021-04-15");
+      const rb = { type: channel, contactId, message: msg.slice(0, 3500) }; NO_TALK_LOG.add(rb);
+      return ghl(token, "/conversations/messages", "POST", rb, "2021-04-15");
     };
 
     let sessionId = sess?.session_id ?? "";
@@ -3265,7 +3283,7 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
     for (const act of plan.actions) {
       const args: Record<string, unknown> = { ...(act.args ?? {}) };
       // Default to the person talking; the owner can still give work to someone else by naming them
-      const NO_HANDLE = ["archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep", "archie_data", "archie_reel", "archie_ideas", "archie_instagram", "archie_plan", "archie_carousel", "archie_month", "archie_winback", "archie_style", "archie_plan_usage", "archie_broll", "archie_use_style", "archie_hooks", "archie_brand", "archie_learn", "archie_streak", "archie_script", "archie_write_script", "archie_make_reel", "archie_waiting", "archie_full_brief", "archie_set_hours", "archie_move_task", "archie_clear_waiting"];
+      const NO_HANDLE = ["archie_when_can_i", "archie_voice", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_remember", "archie_run_skill", "archie_drafts", "archie_send_draft", "archie_skip_draft", "archie_proposals", "archie_move_deal", "archie_calendars", "archie_free_slots", "archie_book_call", "archie_recurring", "archie_pause_recurring", "archie_save_sequence", "archie_checkup", "archie_memory", "archie_member_health", "archie_groups", "archie_set_trial", "archie_council", "archie_call_prep", "archie_data", "archie_reel", "archie_ideas", "archie_instagram", "archie_plan", "archie_carousel", "archie_month", "archie_winback", "archie_style", "archie_plan_usage", "archie_broll", "archie_use_style", "archie_hooks", "archie_brand", "archie_learn", "archie_streak", "archie_script", "archie_write_script", "archie_make_reel", "archie_waiting", "archie_full_brief", "archie_set_hours", "archie_move_task", "archie_clear_waiting"];
       if (!args.handle && !NO_HANDLE.includes(act.tool)) args.handle = member.handle;
       if (!member.gets_financials && args.handle && String(args.handle).toLowerCase() !== String(member.handle).toLowerCase()) args.handle = member.handle;
       const OWNER_ONLY = ["archie_data", "archie_call_prep", "archie_council", "archie_set_trial", "archie_groups", "archie_numbers", "archie_week", "archie_set_goals", "archie_draft_followups", "archie_save_sequence", "archie_send_draft", "archie_skip_draft", "archie_drafts", "archie_proposals", "archie_proposal"];
@@ -3288,6 +3306,15 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
             if (!opts?.length) return { ok: false, text: `I can't find a task like "${args.title}".` };
             if (opts.length > 1 && !opts.some((o: any) => o.title.toLowerCase() === q)) return { ok: false, text: `Which one?\n${opts.map((o: any, i: number) => `${i + 1}. ${o.title}`).join("\n")}` };
             const x: any = await taskMove(tid, opts[0].id, String(args.to ?? "tomorrow"), member.handle);
+            return { ok: !!x.ok, text: x.text };
+          })()
+        : act.tool === "archie_voice"
+        ? await (String(args.verdict ?? "good") === "bad"
+            ? voiceFeedback(tid, { kind: args.kind, text: args.text, reason: args.reason })
+            : voiceAdd(tid, { kind: args.kind, verdict: "good", body: args.text, note: args.reason, source: "chat" }))
+        : act.tool === "archie_when_can_i"
+        ? await (async () => {
+            const x: any = await capacityCheck(tid, member.handle, { title: args.title, hours: args.hours, minutes: args.minutes, by: args.by, notes: args.client ? `For ${args.client}` : "" });
             return { ok: !!x.ok, text: x.text };
           })()
         : act.tool === "archie_set_hours"
@@ -3348,6 +3375,20 @@ async function talk(tid: string, p: any, opts: { handle?: string; onReply?: (m: 
         ? await (async () => {
             const a2 = String(args.action ?? "make");
             const fmt = String(args.format ?? "carousel") === "story" ? "story" : "carousel";
+            if (a2 === "send") {
+              const { data: last } = await supabase.from("carousels").select("id, topic, slides, format").eq("tenant_id", tid).eq("status", "done").eq("format", fmt).order("created_at", { ascending: false }).limit(1).maybeSingle();
+              if (!last) return { ok: false, text: `I don't have a finished ${fmt} yet.` };
+              const urls = (last.slides ?? []).filter((x: any) => x.status === "done").sort((a: any, b: any) => a.n - b.n).map((x: any) => x.media_url || x.image_url).filter(Boolean).slice(0, 10);
+              if (!urls.length || !member.ghl_contact_id) return { ok: false, text: "I couldn't send the slides here. Open Content → Carousels to see them." };
+              let sentN = 0;
+              for (let i = 0; i < urls.length; i++) {
+                const sb = { type: channel, contactId: member.ghl_contact_id, message: i === 0 ? `${fmt === "story" ? "Story" : "Carousel"}: ${last.topic ?? ""} (${urls.length} ${fmt === "story" ? "frames" : "slides"})` : `${i + 1}/${urls.length}`, attachments: [urls[i]] };
+                NO_TALK_LOG.add(sb);
+                const rs = await ghl(token, "/conversations/messages", "POST", sb, "2021-04-15"); if (rs.ok) sentN++;
+                await new Promise((ok) => setTimeout(ok, 600));
+              }
+              return { ok: sentN > 0, text: sentN ? `That's all ${sentN} above. Reply "post the ${fmt}" to put it in Social Planner as a draft, or tell me what to change.` : "WhatsApp wouldn't take the images. Open Content → Carousels to see them." };
+            }
             if (a2 === "post") { const { data: last } = await supabase.from("carousels").select("id").eq("tenant_id", tid).eq("status", "done").eq("format", fmt).order("created_at", { ascending: false }).limit(1).maybeSingle(); if (!last) return { ok: false, text: `No finished ${fmt} yet.` }; const x: any = await carouselPost(tid, last.id); return { ok: !!x.ok, text: x.text }; }
             const x: any = await carouselStart(tid, member.handle, { topic: args.topic ?? text, slides_count: args.slides ?? (fmt === "story" ? 3 : 7), format: fmt });
             return { ok: !!x.ok, text: x.text ?? x.error };
@@ -4461,6 +4502,72 @@ async function memberTouch(tid: string, p: any) {
   }).eq("tenant_id", tid).eq("client_id", clientId);
   const who = row?.name ?? "them";
   return { ok: true, status: keep.length ? "red" : "green", text: keep.length ? `Noted you've spoken to ${who}, so the clock's reset. Still flagged: ${keep.join("; ")}.` : `Noted you've spoken to ${who}. They're back to all good and the clock's reset.` };
+}
+
+// ===================== v9.12: voice library — learn from writing they love and hate =====================
+const VOICE_KINDS = ["script", "caption", "email", "post", "message"];
+const vKind = (k: unknown) => VOICE_KINDS.includes(String(k ?? "").toLowerCase()) ? String(k).toLowerCase() : "post";
+
+async function voiceAdd(tid: string, p: any) {
+  const list: any[] = Array.isArray(p.items) ? p.items : [p];
+  const rows = list.map((x) => ({
+    tenant_id: tid, kind: vKind(x.kind), verdict: String(x.verdict ?? "good") === "bad" ? "bad" : "good",
+    body: String(x.body ?? x.text ?? "").trim().slice(0, 4000), note: x.note ? String(x.note).trim().slice(0, 300) : null,
+    source: String(x.source ?? p.source ?? "page").slice(0, 20), active: true,
+  })).filter((r) => r.body.length >= 20);
+  if (!rows.length) return { ok: false, text: "Paste the full piece (at least a sentence or two) so I can learn from it." };
+  const { error } = await supabase.from("voice_examples").insert(rows.slice(0, 30));
+  if (error) return { ok: false, text: error.message };
+  // Keep the library tidy: newest 40 good, 30 bad
+  for (const [v, cap] of [["good", 40], ["bad", 30]] as const) {
+    const { data: old } = await supabase.from("voice_examples").select("id").eq("tenant_id", tid).eq("verdict", v).eq("active", true).order("created_at", { ascending: false }).range(cap, cap + 200);
+    if (old?.length) await supabase.from("voice_examples").update({ active: false }).in("id", old.map((o: any) => o.id));
+  }
+  const g = rows.filter((r) => r.verdict === "good").length, b = rows.length - g;
+  return { ok: true, text: `Got it. ${g ? `${g} example${g === 1 ? "" : "s"} of how you write` : ""}${g && b ? " and " : ""}${b ? `${b} example${b === 1 ? "" : "s"} of what you don't want` : ""} saved. Everything I write from now on uses ${g && !b ? "them" : "it"}.` };
+}
+
+async function voiceList(tid: string) {
+  const { data } = await supabase.from("voice_examples").select("id, kind, verdict, body, note, source, created_at").eq("tenant_id", tid).eq("active", true).order("created_at", { ascending: false }).limit(80);
+  const { data: rules } = await supabase.from("business_memory").select("id, value").eq("tenant_id", tid).eq("kind", "voice").eq("key", "avoid").eq("status", "active").order("updated_at", { ascending: false }).limit(30);
+  const items = data ?? [];
+  return { ok: true, good: items.filter((x: any) => x.verdict === "good"), bad: items.filter((x: any) => x.verdict === "bad"), rules: (rules ?? []).map((r: any) => ({ id: r.id, text: r.value })), text: `${items.filter((x: any) => x.verdict === "good").length} good examples, ${items.filter((x: any) => x.verdict === "bad").length} to avoid, ${(rules ?? []).length} rules learned.` };
+}
+
+// They rejected a draft: keep it as a "don't", and turn their reason into a short rule every writer sees
+async function voiceFeedback(tid: string, p: any) {
+  const text = String(p.text ?? p.body ?? "").trim(), reason = String(p.reason ?? p.note ?? "").trim();
+  if (!text && !reason) return { ok: false, text: "Tell me what you didn't like about it." };
+  if (text.length >= 20) await supabase.from("voice_examples").insert({ tenant_id: tid, kind: vKind(p.kind), verdict: "bad", body: text.slice(0, 4000), note: reason.slice(0, 300) || null, source: String(p.source ?? "feedback").slice(0, 20), active: true });
+  let rule = "";
+  try {
+    const r = await openai("chat/completions", { model: "gpt-4.1-mini", temperature: 0.2, max_tokens: 60, messages: [
+      { role: "system", content: "Turn a business owner's feedback on a draft into ONE short writing rule (max 18 words) for future drafts. Start with 'Never' or 'Always'. British English. No quotes. If the feedback is too vague, describe the pattern in the draft that most likely caused it." },
+      { role: "user", content: `Kind: ${vKind(p.kind)}\nTheir feedback: ${reason || "(none, they just rejected it)"}\nThe draft they rejected:\n${text.slice(0, 1500)}` },
+    ] });
+    const jr = await r.json(); rule = String(jr?.choices?.[0]?.message?.content ?? "").trim().replace(/^["']|["']$/g, "").slice(0, 160);
+  } catch { /* fall back below */ }
+  if (!rule && reason) rule = `Avoid: ${reason.slice(0, 140)}`;
+  if (rule) {
+    const { data: dup } = await supabase.from("business_memory").select("id, weeks_seen").eq("tenant_id", tid).eq("kind", "voice").eq("key", "avoid").eq("status", "active").ilike("value", rule.slice(0, 60) + "%").maybeSingle();
+    if (dup) await supabase.from("business_memory").update({ weeks_seen: (Number(dup.weeks_seen) || 1) + 1, updated_at: new Date().toISOString() }).eq("id", dup.id);
+    else await supabase.from("business_memory").insert({ tenant_id: tid, kind: "voice", key: "avoid", value: rule, source: "feedback", status: "active", weeks_seen: 1, updated_at: new Date().toISOString() });
+  }
+  return { ok: true, rule, text: rule ? `Noted. From now on: ${rule.replace(/^Avoid: /, "avoid ")}` : "Noted. I'll steer away from that." };
+}
+
+// What every writer sees: their real writing to match, and what they've rejected
+async function voiceBlock(tid: string): Promise<string> {
+  const { data } = await supabase.from("voice_examples").select("kind, verdict, body, note").eq("tenant_id", tid).eq("active", true).order("created_at", { ascending: false }).limit(60);
+  if (!data?.length) return "";
+  const good = data.filter((x: any) => x.verdict === "good"), bad = data.filter((x: any) => x.verdict === "bad");
+  // A mix of kinds, newest first, inside a budget
+  const picked: any[] = []; let used = 0;
+  for (const k of VOICE_KINDS) for (const x of good.filter((g: any) => g.kind === k).slice(0, 2)) { const b = String(x.body).slice(0, 700); if (used + b.length > 3200) break; picked.push({ ...x, body: b }); used += b.length; }
+  const out: string[] = [];
+  if (picked.length) out.push(`HOW THEY ACTUALLY WRITE (real examples they approved; match the rhythm, sentence length, word choice and directness, never copy lines):\n${picked.map((x) => `[${x.kind}${x.note ? `, ${x.note}` : ""}]\n${x.body}`).join("\n---\n")}`);
+  if (bad.length) out.push(`WRITING THEY REJECTED (don't write like this):\n${bad.slice(0, 5).map((x: any) => `- [${x.kind}] "${String(x.body).slice(0, 220).replace(/\s+/g, " ")}"${x.note ? ` — why: ${x.note}` : ""}`).join("\n")}`);
+  return out.join("\n\n");
 }
 
 async function memberHealthList(tid: string, status: string) {
@@ -5645,6 +5752,15 @@ async function editPipeline(tid: string, id: string, replan = false, presetPlan:
         focus = focusTimeline![1] ?? { x: 0.5, y: 0.38 };
       }
       const audioUrl = multi ? "" : (job.clean_audio_url ?? await cleanAudio(tid, id, job.source_url));
+      // v9.12.2: which clips are screen recordings (cached on the job so re-renders don't re-check)
+      const looks: ClipLook[] = Array.isArray(job.focus?.screens) ? job.focus.screens
+        : multi ? await Promise.all(sources.map((u: string, n: number) => clipLook(u, durations[n] || 4)))
+        : [await clipLook(job.source_url, duration)];
+      const screens = looks.map((l, n) => l?.kind === "screen" ? { src: n, aspect: l.aspect, bubble: l.bubble } : null).filter(Boolean) as { src: number; aspect: number; bubble: ClipLook["bubble"] }[];
+      const screenSrc = new Set(screens.map((x) => x.src));
+      const screenRanges: { start: number; end: number }[] = [];
+      { let tt = 0; for (const c of cuts as any[]) { const len = Math.max(0, c.end - c.start); if (screenSrc.has(Number(c.src ?? 0))) { const last = screenRanges[screenRanges.length - 1]; if (last && Math.abs(last.end - tt) < 0.01) last.end = tt + len; else screenRanges.push({ start: tt, end: tt + len }); } tt += len; } }
+      const onScreen = (a: number, b: number) => screenRanges.some((r) => a < r.end && b > r.start);
       const cards = (Array.isArray(plan?.cards) ? plan.cards : []).map((c: any) => {
         const st0 = sentStart.get(Number(c.at)); if (st0 === undefined) return null;
         // Land on the word it shows (the cue word), and stay up for the sentence — at least 2 seconds
@@ -5737,6 +5853,13 @@ async function editPipeline(tid: string, id: string, replan = false, presetPlan:
       // cards don't sit on top of B-roll
       for (let ci = cards.length - 1; ci >= 0; ci--) { const c: any = cards[ci]; if (brollPicks.some((x) => c.start < x.end && c.end > x.start)) cards.splice(ci, 1); }
       for (let gi = graphicsOut.length - 1; gi >= 0; gi--) { const g = graphicsOut[gi]; if (g.type !== "underline" && g.type !== "circle" && (cards as any[]).some((c: any) => g.start < c.end && g.end > c.start)) graphicsOut.splice(gi, 1); }
+      // v9.12.2: nothing covers a screen demo — no cards, B-roll, graphics or zooms on screen sections
+      if (screenRanges.length) {
+        for (let ci = cards.length - 1; ci >= 0; ci--) { const c: any = cards[ci]; if (onScreen(c.start, c.end)) cards.splice(ci, 1); }
+        for (let bi = brollPicks.length - 1; bi >= 0; bi--) if (onScreen(brollPicks[bi].start, brollPicks[bi].end)) brollPicks.splice(bi, 1);
+        for (let gi = graphicsOut.length - 1; gi >= 0; gi--) if (onScreen(graphicsOut[gi].start, graphicsOut[gi].end)) graphicsOut.splice(gi, 1);
+        for (let zi = zooms.length - 1; zi >= 0; zi--) { const z: any = zooms[zi]; if (onScreen(z.start, z.end)) zooms.splice(zi, 1); }
+      }
 
       const style = ["karaoke", "bold", "single"].includes(String(cfg?.caption_style2)) ? String(cfg?.caption_style2) : "karaoke";
       // The sound pack (pop / whoosh / tick) and a music bed that suits the style — their own track wins; "none" = no music
@@ -5757,9 +5880,10 @@ async function editPipeline(tid: string, id: string, replan = false, presetPlan:
         sentenceStarts: keep.map((k: number) => sentStart.get(k)).filter((x: any) => typeof x === "number").map((x: number) => Number(x.toFixed(2))),
         points: (Array.isArray(plan?.points) ? plan.points : []).map((k: any) => sentStart.get(Number(k))).filter((x: any) => typeof x === "number").map((x: number) => Number(x.toFixed(2))),
         broll: brollPicks,
+        ...(screens.length ? { screens } : {}),
         brand: props.brand, progressBar: true, ...(props as any).outro ? { outro: (props as any).outro } : {} };
       composition = "ArchieReel2";
-      await supabase.from("edit_jobs").update({ focus: multi ? { ...focus, list: focusList } : { ...focus, timeline: focusTimeline }, clean_audio_url: audioUrl || null, clean_audio_urls: audioUrls ?? null, engine: "v2" }).eq("id", id);
+      await supabase.from("edit_jobs").update({ focus: multi ? { ...focus, list: focusList, screens: looks } : { ...focus, timeline: focusTimeline, screens: looks }, clean_audio_url: audioUrl || null, clean_audio_urls: audioUrls ?? null, engine: "v2" }).eq("id", id);
     }
 
     // 5. Render on Remotion Lambda (few chunks — new AWS accounts allow ~10 at once)
@@ -6550,8 +6674,10 @@ async function mrrPace(tid: string) {
 async function dayLoads(tid: string, handle: string, fromDate: string, n = 10) {
   const { data: cfg } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", tid).maybeSingle();
   const tz = cfg?.timezone || "Europe/London";
-  const { data: m } = handle ? await supabase.from("team_members").select("handle, max_task_hours, work_days").eq("tenant_id", tid).eq("handle", handle).maybeSingle()
-    : await supabase.from("team_members").select("handle, max_task_hours, work_days").eq("tenant_id", tid).eq("gets_financials", true).maybeSingle();
+  const { data: m } = handle ? await supabase.from("team_members").select("*").eq("tenant_id", tid).eq("handle", handle).maybeSingle()
+    : await supabase.from("team_members").select("*").eq("tenant_id", tid).eq("gets_financials", true).maybeSingle();
+  // v9.13: the planner's real free time per day (after meetings, lunch and personal blocks) beats the flat task-hours limit
+  const cache: Record<string, any> = {}; for (const c of Array.isArray(m?.forge_days_cache) ? m.forge_days_cache : []) if (c?.date) cache[c.date] = c;
   const capMin = Math.round((Number(m?.max_task_hours ?? 6) || 6) * 60);
   const workDays = String(m?.work_days ?? "1,2,3,4,5").split(",").map(Number);
   const { data: off } = await supabase.from("days_off").select("day").eq("tenant_id", tid).eq("handle", m?.handle ?? handle).gte("day", fromDate).limit(30);
@@ -6562,8 +6688,10 @@ async function dayLoads(tid: string, handle: string, fromDate: string, n = 10) {
     const d = addDays(fromDate, i);
     const working = workDays.includes(new Date(d + "T12:00:00Z").getUTCDay()) && !offSet.has(d);
     const planned = (tasks ?? []).filter((t: any) => !t.hold && (t.scheduled_start ? localDate(Date.parse(t.scheduled_start), tz) : t.pinned_date) === d).reduce((a: number, t: any) => a + Math.max(15, Number(t.effort_minutes) || 30), 0);
-    const cap = working ? capMin : 0;
-    out.push({ date: d, planned, cap, free: Math.max(0, cap - planned), working });
+    const wh = dayWindows(m?.work_hours)[new Date(d + "T12:00:00Z").getUTCDay()];
+    const dayLen = wh ? (Number(wh[1].slice(0, 2)) * 60 + Number(wh[1].slice(3))) - (Number(wh[0].slice(0, 2)) * 60 + Number(wh[0].slice(3))) : capMin;
+    const cap = cache[d] ? Number(cache[d].cap) || 0 : (working ? Math.min(capMin, dayLen) : 0);
+    out.push({ date: d, planned, cap, free: Math.max(0, cap - planned), working: working || !!cache[d] });
   }
   return { tz, capMin, days: out };
 }
@@ -6598,29 +6726,42 @@ async function taskLanded(tid: string, handle: string, id: string, pinned: strin
 
 // "Can I take this on by Friday?" — free task hours between now and a date vs what it needs
 async function capacityCheck(tid: string, handle: string, p: any) {
+  // v9.13: answers from the real plan — free time after meetings, personal blocks and work already planned —
+  // and gives a date to PROMISE (with breathing room), not just the earliest possible finish.
   const { data: cfg } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", tid).maybeSingle();
   const today = localDate(Date.now(), cfg?.timezone || "Europe/London");
-  const need = Math.max(15, Math.round((Number(p.hours) || 0) * 60) || Number(p.minutes) || 0) || (p.title ? (await taskEstimate(tid, String(p.title), String(p.notes ?? ""))).minutes : 60);
-  const by = /^\d{4}-\d{2}-\d{2}$/.test(String(p.by ?? "")) ? String(p.by) : addDays(today, 7);
-  const L = await dayLoads(tid, handle, today, 30);
-  const win = L.days.filter((d) => d.date <= by);
-  const free = win.reduce((a, d) => a + d.free, 0);
-  let run = 0, finish: string | null = null;
-  for (const d of L.days) { run += d.free; if (run >= need) { finish = d.date; break; } }
-  const fits = free >= need;
-  const text = fits
-    ? `Yes — you've ${hrs(free)} free before ${dayName(by)} and this needs about ${hrs(need)}. Earliest it could be done: ${finish ? dayName(finish) : dayName(by)}.`
-    : `Not without overloading you — you've only ${hrs(free)} free before ${dayName(by)} and this needs about ${hrs(need)}.${finish ? ` Realistic date to promise: ${dayName(finish)}.` : " Your next 30 days are full."}`;
-  return { ok: true, fits, need_minutes: need, free_minutes: free, by, earliest: finish, text, days: win.map((d) => ({ date: d.date, free: d.free, planned: d.planned, cap: d.cap })) };
+  const est = (!Number(p.hours) && !Number(p.minutes) && p.title) ? await taskEstimate(tid, String(p.title), String(p.notes ?? "")) : null;
+  const raw = Math.round((Number(p.hours) || 0) * 60) || Number(p.minutes) || 0;
+  const need = raw ? Math.max(15, raw) : (est?.minutes ?? 60);
+  const askedBy = /^\d{4}-\d{2}-\d{2}$/.test(String(p.by ?? "")) ? String(p.by) : null;
+  const by = askedBy;
+  const L = await dayLoads(tid, handle, today, 45);
+  const until = (n: number) => { let run = 0; for (const d of L.days) { run += d.free; if (run >= n) return d.date; } return null; };
+  const finish = until(need);
+  // Breathing room: +20% on anything half a day or more, then one more working day before promising
+  const padded = until(Math.round(need * (need >= 240 ? 1.2 : 1.1)));
+  const promise = padded ? (L.days.find((d) => d.date > padded && d.working)?.date ?? padded) : null;
+  const weekOut = addDays(today, 7);
+  const freeBy = L.days.filter((d) => d.date <= (by ?? weekOut)).reduce((a, d) => a + d.free, 0);
+  const fits = by ? (freeBy ?? 0) >= need : !!finish;
+  const nextWeek = L.days.slice(0, 7).reduce((a, d) => a + d.free, 0);
+  const sized = est ? ` (Archie's estimate: ${hrs(need)}${est.why ? `, ${est.why}` : ""})` : "";
+  let text: string;
+  if (!finish) text = `Not in the next 6 weeks without moving other work. It needs about ${hrs(need)}${sized} and your plan is full. Something has to move or come off.`;
+  else if (by && fits) text = `Yes. You've ${hrs(freeBy!)} free before ${dayName(by)} and it needs about ${hrs(need)}${sized}. Earliest finish: ${dayName(finish)}. Safe date to promise: ${dayName(promise ?? finish)}.`;
+  else if (by) text = `Not by ${dayName(by)} without moving other work. You've only ${hrs(freeBy ?? 0)} free before then and it needs about ${hrs(need)}${sized}. Earliest finish: ${dayName(finish)}. Safe date to promise: ${dayName(promise ?? finish)}.`;
+  else text = `It needs about ${hrs(need)}${sized}. With what's already planned, the earliest you'd finish is ${dayName(finish)}. Safe date to promise the client: ${dayName(promise ?? finish)} (includes breathing room). You've ${hrs(nextWeek)} free in the next 7 days.`;
+  return { ok: true, fits, need_minutes: need, free_minutes: freeBy, by: by ?? weekOut, earliest: finish, promise, text, days: L.days.filter((d) => d.date <= (by ?? weekOut)).slice(0, 14).map((d) => ({ date: d.date, free: d.free, planned: d.planned, cap: d.cap })) };
 }
 
 // [{label:"Gym", start:"07:00", end:"08:30", days:"1,3,5"}] → clean list (max 8)
-function cleanBlocks(v: unknown): { label: string; start: string; end: string; days: number[] }[] {
+function cleanBlocks(v: unknown): { label: string; start: string; end: string; days: number[]; active: boolean }[] {
   const arr = Array.isArray(v) ? v : [];
   return arr.slice(0, 8).map((b: any) => ({
     label: String(b?.label ?? "Personal").trim().slice(0, 40) || "Personal",
     start: hm(b?.start, "07:00"), end: hm(b?.end, "08:00"),
     days: String(b?.days ?? "1,2,3,4,5").split(",").map((x) => Number(x.trim())).filter((x) => x >= 0 && x <= 6),
+    active: b?.active !== false && String(b?.active) !== "false",   // v9.13: a block can be saved but switched off (e.g. boxing, not started yet)
   })).filter((b) => b.end > b.start && b.days.length);
 }
 
@@ -6637,6 +6778,10 @@ async function forgeHoursSave(tid: string, p: any) {
   if (p.growth_end !== undefined) patch.growth_end = p.growth_end ? hm(p.growth_end, "11:00") : null;
   if (p.growth_days !== undefined) patch.growth_days = p.growth_days ? String(p.growth_days) : null;
   if (p.personal_blocks !== undefined) patch.personal_blocks = cleanBlocks(p.personal_blocks).map((b) => ({ ...b, days: b.days.join(",") }));
+  // v9.13: different hours per weekday, and growth windows per weekday — {"1":["09:30","17:00"], ...}; null clears
+  if (p.work_hours !== undefined) patch.work_hours = p.work_hours ? Object.fromEntries(Object.entries(dayWindows(p.work_hours)).map(([k, v]) => [k, v])) : null;
+  if (p.growth_windows !== undefined) patch.growth_windows = p.growth_windows ? Object.fromEntries(Object.entries(dayWindows(p.growth_windows)).map(([k, v]) => [k, v])) : null;
+  if (p.forge_caps !== undefined && /^\d+,\d+,\d+$/.test(String(p.forge_caps).replace(/\s/g, ""))) patch.forge_caps = String(p.forge_caps).replace(/\s/g, "");
   const q = supabase.from("team_members").update(patch).eq("tenant_id", tid);
   const { error } = handle ? await q.eq("handle", handle) : await q.eq("gets_financials", true);
   if (!error) await forgePlan(tid, { force: true });
@@ -6652,7 +6797,49 @@ async function forgePlanIfNeeded(tid: string) {
   if ((count ?? 0) > 0 || stale) await forgePlan(tid, { from_now: true });
 }
 
+// v9.13 (Forge Phase 1): one plan at a time per business. Callers wait their turn (up to ~30s), so a task added
+// while a plan is running still lands in the next plan and its reply shows where it went.
 async function forgePlan(tid: string, opt: { force?: boolean; from_now?: boolean; delay_minutes?: number } = {}) {
+  for (let i = 0; i < 20; i++) {
+    const nowIso = new Date().toISOString(), until = new Date(Date.now() + 180000).toISOString();
+    const { data: got, error } = await supabase.from("tenant_config").update({ forge_lock_until: until }).eq("tenant_id", tid).or(`forge_lock_until.is.null,forge_lock_until.lt."${nowIso}"`).select("tenant_id");
+    if (error && /forge_lock_until/.test(error.message)) return await forgePlanRun(tid, opt); // column not added yet — plan without the lock
+    if (got?.length) {
+      try { return await forgePlanRun(tid, opt); }
+      finally { await supabase.from("tenant_config").update({ forge_lock_until: null }).eq("tenant_id", tid).eq("forge_lock_until", until); }
+    }
+    if (i === 0) { const { data: row } = await supabase.from("tenant_config").select("tenant_id").eq("tenant_id", tid).maybeSingle(); if (!row) return await forgePlanRun(tid, opt); }
+    await new Promise((ok) => setTimeout(ok, 1500));
+  }
+  return { ok: false, text: "Forge is busy re-planning — try again in a minute." };
+}
+
+// v9.13: a select that still works if the new task columns haven't been added yet
+async function selNewCols(run: (cols: string) => PromiseLike<{ data: any; error: any }>, cols: string) {
+  const r = await run(cols);
+  if (r.error && /critical|move_count|block_start|block_end/.test(String(r.error.message ?? ""))) return await run(cols.replace(/,\s*(critical|block_start|block_end)/g, ""));
+  return r;
+}
+
+// "09:30"-style pairs per weekday: {"1":["09:30","17:00"], ...} or {"1":{"start":"09:30","end":"17:00"}}
+function dayWindows(v: unknown): Record<number, [string, string]> {
+  const o = typeof v === "string" ? (() => { try { return JSON.parse(v); } catch { return null; } })() : v;
+  const out: Record<number, [string, string]> = {};
+  if (!o || typeof o !== "object") return out;
+  for (const [k, raw] of Object.entries(o as Record<string, any>)) {
+    const d = Number(k); if (!(d >= 0 && d <= 6) || !raw) continue;
+    const s = Array.isArray(raw) ? raw[0] : raw.start, e = Array.isArray(raw) ? raw[1] : raw.end;
+    if (!s || !e) continue;
+    const a = hm(s, ""), b = hm(e, "");
+    if (a && b && b > a) out[d] = [a, b];
+  }
+  return out;
+}
+
+const TIER_WORD: Record<string, string> = { must: "Must", high: "To-do", bonus: "Bonus" };
+const hrsTxt = (min: number) => min >= 60 ? `${Math.round((min / 60) * 10) / 10}h` : `${Math.round(min)}m`;
+
+async function forgePlanRun(tid: string, opt: { force?: boolean; from_now?: boolean; delay_minutes?: number } = {}) {
   const { data: cfg } = await supabase.from("tenant_config").select("ghl_token, ghl_location_id, timezone, forge_days, forge_caps").eq("tenant_id", tid).single();
   const fcfg = cfg;
   const token = cfg?.ghl_token || FALLBACK_TOKEN, loc = cfg?.ghl_location_id;
@@ -6660,31 +6847,39 @@ async function forgePlan(tid: string, opt: { force?: boolean; from_now?: boolean
   const horizon = Math.max(1, Math.min(10, Number(cfg?.forge_days ?? 5)));
   const today = localDate(Date.now(), tz);
   const now = Date.now() + (opt.delay_minutes ?? 0) * 60000;
+  const dayLabel = (d: string) => new Date(d + "T12:00:00Z").toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
   const { data: team } = await supabase.from("team_members").select("*").eq("tenant_id", tid).neq("active", false);
   const summary: string[] = [];
   for (const m of team ?? []) {
     const workDays = String(m.work_days ?? "1,2,3,4,5").split(",").map((x: string) => Number(x.trim())).filter((x: number) => !isNaN(x));
-    const ws = hm(m.work_start, "09:00"), we = hm(m.work_end, "17:30");
+    const ws0 = hm(m.work_start, "09:00"), we0 = hm(m.work_end, "17:30");
+    const perDay = dayWindows(m.work_hours);                       // v9.13: different hours per weekday
     const ls = m.lunch_start ? hm(m.lunch_start, "12:30") : null, le = m.lunch_end ? hm(m.lunch_end, "13:15") : null;
     const maxMin = Math.round((Number(m.max_task_hours ?? 6) || 6) * 60);
     const buf = Math.max(0, Math.min(30, Number(m.buffer_minutes ?? 10))) * 60000;
-    // v9.11: protected growth time — only growth tasks may use it; unused, it stays free
+    // Protected growth time — per weekday (growth_windows) or one window on chosen days (growth_start/end/days)
+    const growthPerDay = dayWindows(m.growth_windows);
     const gs = m.growth_start ? hm(m.growth_start, "09:00") : null, ge = m.growth_end ? hm(m.growth_end, "11:00") : null;
     const growthDays = m.growth_days ? String(m.growth_days).split(",").map((x: string) => Number(x.trim())) : null;
-    const personalBlocks = cleanBlocks(m.personal_blocks);
-    // 3:3:3 — how many Must / To-do / Bonus a day can hold
-    const capsRaw = String(m.forge_caps ?? fcfg?.forge_caps ?? "3,3,3").split(",").map((x: string) => Math.max(0, Number(x.trim()) || 0));
-    const caps: Record<string, number> = { must: capsRaw[0] ?? 3, high: capsRaw[1] ?? 3, bonus: capsRaw[2] ?? 3 };
-    // Days off (from Archie's days-off records) are skipped
+    const growthFor = (dow: number): [string, string] | null => Object.keys(growthPerDay).length ? (growthPerDay[dow] ?? null) : (gs && ge && (!growthDays || growthDays.includes(dow)) ? [gs, ge] : null);
+    const personalBlocks = cleanBlocks(m.personal_blocks).filter((b) => b.active);   // inactive blocks (e.g. boxing, not started yet) are ignored
+    // 2:3:2 by default — how many Must / To-do / Bonus a day can hold
+    const capsRaw = String(m.forge_caps ?? fcfg?.forge_caps ?? "2,3,2").split(",").map((x: string) => Math.max(0, Number(x.trim()) || 0));
+    const caps: Record<string, number> = { must: capsRaw[0] ?? 2, high: capsRaw[1] ?? 3, bonus: capsRaw[2] ?? 2 };
     const { data: off } = await supabase.from("days_off").select("day").eq("tenant_id", tid).eq("handle", m.handle).gte("day", today).limit(30);
     const offSet = new Set((off ?? []).map((o: any) => String(o.day)));
-    // Calendar busy times (their GHL calendars incl. the personal one that syncs Google) — minus Archie's own task blocks
+    // Calendar busy times (their GHL calendars incl. the personal one that syncs Google) — minus Archie's own blocks.
+    // v9.13: if the calendar can't be read, say so loudly instead of quietly planning as if the day were empty.
     const busy: Slot[] = [];
+    let calOk = true, calErr: string | null = null, calFetchFailed = false;
     const { data: myBlocks } = await supabase.from("tasks").select("block_event_id").eq("tenant_id", tid).eq("owner", m.handle).not("block_event_id", "is", null);
     const ownBlockIds = new Set((myBlocks ?? []).map((b: any) => b.block_event_id));
-    if (m.ghl_user_id) {
-      const from = Date.parse(isoAtTz(today, "00:00", tz)), to = from + (horizon + 3) * 86400000;
+    for (const pbId of Array.isArray(m.personal_block_ids) ? m.personal_block_ids : []) ownBlockIds.add(typeof pbId === "string" ? pbId : pbId?.id);
+    if (!m.ghl_user_id) { calOk = false; calErr = "No CRM user is set for this person, so Forge can't see their calendar. Pick one in Settings → Team."; }
+    else {
+      const from = Date.parse(isoAtTz(today, "00:00", tz)), to = from + (horizon + 9) * 86400000;
       const ev = await ghl(token, `/calendars/events?locationId=${loc}&userId=${m.ghl_user_id}&startTime=${from}&endTime=${to}`, "GET", undefined, "2021-04-15");
+      if (!ev.ok || !Array.isArray(ev.json?.events)) { calOk = false; calFetchFailed = true; calErr = `Forge couldn't read the calendar (${ev.status || "no response"}), so the plan may clash with appointments.`; }
       for (const e of ev.json?.events ?? []) {
         if (ownBlockIds.has(e.id) || String(e.title ?? "").startsWith("🔨") || String(e.title ?? "").startsWith("🔒")) continue;
         if (["cancelled", "invalid"].includes(String(e.appointmentStatus ?? "").toLowerCase())) continue;
@@ -6692,17 +6887,18 @@ async function forgePlan(tid: string, opt: { force?: boolean; from_now?: boolean
       }
     }
     // Free slots per working day
-    const days: { date: string; slots: Slot[]; used: number; count: Record<string, number> }[] = [];
+    const days: { date: string; slots: Slot[]; used: number; free: number; growthFree: number; count: Record<string, number> }[] = [];
     let d = today, guard = 0;
     while (days.length < horizon && guard++ < 21) {
       const dow = new Date(`${d}T12:00:00Z`).getUTCDay();
       if (workDays.includes(dow) && !offSet.has(d)) {
+        const [ws, we] = perDay[dow] ?? [ws0, we0];
         let slots: Slot[] = [{ start: Date.parse(isoAtTz(d, ws, tz)), end: Date.parse(isoAtTz(d, we, tz)) }];
-        if (ls && le) busy.push({ start: Date.parse(isoAtTz(d, ls, tz)), end: Date.parse(isoAtTz(d, le, tz)) });
-        // v9.11: personal blocks — gym, training, health, family — never get work planned over them
-        for (const pb of personalBlocks) if (pb.days.includes(dow)) busy.push({ start: Date.parse(isoAtTz(d, pb.start, tz)), end: Date.parse(isoAtTz(d, pb.end, tz)) });
+        const dayBusy: Slot[] = [...busy];
+        if (ls && le) dayBusy.push({ start: Date.parse(isoAtTz(d, ls, tz)), end: Date.parse(isoAtTz(d, le, tz)) });
+        for (const pb of personalBlocks) if (pb.days.includes(dow)) dayBusy.push({ start: Date.parse(isoAtTz(d, pb.start, tz)), end: Date.parse(isoAtTz(d, pb.end, tz)) });
         if (d === today) slots = slots.map((sl) => ({ start: Math.max(sl.start, Math.ceil(now / 900000) * 900000), end: sl.end })).filter((sl) => sl.end - sl.start >= 15 * 60000);
-        for (const b of busy) {
+        for (const b of dayBusy) {
           const next: Slot[] = [];
           for (const sl of slots) {
             if (b.end <= sl.start || b.start >= sl.end) { next.push(sl); continue; }
@@ -6711,8 +6907,9 @@ async function forgePlan(tid: string, opt: { force?: boolean; from_now?: boolean
           }
           slots = next.filter((sl) => sl.end - sl.start >= 15 * 60000);
         }
-        if (gs && ge && (!growthDays || growthDays.includes(dow))) {
-          const g0 = Date.parse(isoAtTz(d, gs, tz)), g1 = Date.parse(isoAtTz(d, ge, tz));
+        const gw = growthFor(dow);
+        if (gw) {
+          const g0 = Date.parse(isoAtTz(d, gw[0], tz)), g1 = Date.parse(isoAtTz(d, gw[1], tz));
           const split: Slot[] = [];
           for (const sl of slots) {
             if (sl.end <= g0 || sl.start >= g1) { split.push(sl); continue; }
@@ -6722,26 +6919,29 @@ async function forgePlan(tid: string, opt: { force?: boolean; from_now?: boolean
           }
           slots = split.filter((sl) => sl.end - sl.start >= 15 * 60000);
         }
-        days.push({ date: d, slots, used: 0, count: { must: 0, high: 0, bonus: 0 } });
+        const free = slots.reduce((a, sl) => a + (sl.end - sl.start) / 60000, 0);
+        const growthFree = slots.filter((sl) => sl.g).reduce((a, sl) => a + (sl.end - sl.start) / 60000, 0);
+        days.push({ date: d, slots, used: 0, free: Math.round(free), growthFree: Math.round(growthFree), count: { must: 0, high: 0, bonus: 0 } });
       }
       d = addDays(d, 1);
     }
-    // Tasks to place: carried-over first, then overdue/due soonest, then tier, then oldest
-    const { data: tasks } = await supabase.from("tasks").select("id, title, tier, kind, effort_minutes, due_date, scheduled_start, scheduled_end, created_at, move_count, block_event_id, pinned_date, hold, area")
-      .eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).limit(200);
+    // Tasks to place: critical first, then pinned, then Must (and urgent), then carried-over, soonest due, oldest
+    const { data: tasks } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).limit(200),
+      "id, title, tier, kind, effort_minutes, due_date, scheduled_start, scheduled_end, created_at, move_count, block_event_id, pinned_date, hold, area, critical, block_start, block_end");
     const startOfToday = Date.parse(isoAtTz(today, "00:00", tz));
     const soon = addDays(today, 1);
     const list = (tasks ?? []).filter((t: any) => !t.hold).map((t: any) => {
       const tier = ["must", "high", "bonus"].includes(t.tier) ? t.tier : "high";
-      // Due today/tomorrow (or overdue) → lifted to Must if there's room that day
-      const urgent = !!t.due_date && String(t.due_date) <= soon && tier !== "must";
-      // v9.9.9: anything not done on its day (past pin, or planned on a past day) rolls to the NEXT working day — never further
+      const critical = !!t.critical;
+      const urgent = !critical && !!t.due_date && String(t.due_date) <= soon && tier !== "must";
+      // Anything not done on its day (past pin, or planned on a past day) rolls to the NEXT working day — never further
       const carried = !!t.scheduled_start && Date.parse(t.scheduled_start) < startOfToday;
       const rolled = (!!t.pinned_date && String(t.pinned_date) < today) || (carried && !t.pinned_date);
       const pin = rolled ? (days[0]?.date ?? today) : (t.pinned_date ?? null);
-      return { ...t, tier, urgent, carried, rolled, pin };
+      return { ...t, tier, critical, urgent, carried, rolled, pin };
     })
       .sort((a: any, b: any) =>
+        (a.critical ? 0 : 1) - (b.critical ? 0 : 1) ||
         (a.pin ? 0 : 1) - (b.pin ? 0 : 1) ||
         (TIER_RANK[a.urgent ? "must" : a.tier] ?? 1) - (TIER_RANK[b.urgent ? "must" : b.tier] ?? 1) ||
         (b.carried ? 1 : 0) - (a.carried ? 1 : 0) ||
@@ -6749,25 +6949,26 @@ async function forgePlan(tid: string, opt: { force?: boolean; from_now?: boolean
         String(a.created_at).localeCompare(String(b.created_at)));
     const placed: { id: string; start: number; end: number; date: string; slot: string }[] = [];
     const wontFit: string[] = [];
+    const unplaced: { id: string; title: string; minutes: number; due: string | null; tier: string; reason: string; earliest: string | null; kind: "no_room" | "late" | "pinned_full" }[] = [];
+    const failed: { t: any; need: number; why: string[] }[] = [];
     for (const t of list) {
       const need = Math.max(15, Number(t.effort_minutes) || 30) * 60000;
       const deadline = t.due_date ? String(t.due_date) : null;
+      const why: string[] = [];
       let done = false;
       for (const day of days) {
-        // Pinned to a day → only that day (and it can go over the 3:3:3 there — they chose it)
+        // Pinned to a day → only that day (it can go over the caps there — they chose it). Critical tasks ignore the caps.
         if (t.pin && day.date !== t.pin) continue;
-        // 3:3:3 — which tier space does it take today? (urgent ones take a Must space if one's free)
-        const slotTier = t.urgent && day.count.must < caps.must ? "must" : t.tier;
-        if (day.count[slotTier] >= caps[slotTier] && !(t.pin && day.date === t.pin)) continue;
-        if (day.used + need / 60000 > maxMin && slotTier !== "must" && !t.pin) continue; // don't overfill a day (musts can stretch it)
-        // Deep work prefers the earliest slot; shallow work prefers later in the day
+        const slotTier = t.critical ? "must" : (t.urgent && day.count.must < caps.must ? "must" : t.tier);
+        const free = t.critical || (t.pin && day.date === t.pin);
+        if (day.count[slotTier] >= caps[slotTier] && !free) { why.push("cap"); continue; }
+        if (day.used + need / 60000 > maxMin && slotTier !== "must" && !free) { why.push("daycap"); continue; }
         const isGrowth = t.area === "growth";
         const order = day.slots.filter((x) => isGrowth || !x.g).sort((a, b) => (isGrowth ? (a.g ? 0 : 1) - (b.g ? 0 : 1) : 0) || (t.kind === "deep" ? a.start - b.start : b.start - a.start));
         const sl = order.find((x) => x.end - x.start >= need);
-        if (!sl) continue;
+        if (!sl) { why.push("noslot"); continue; }
         const start = t.kind === "deep" ? sl.start : sl.end - need;
         const end = start + need;
-        // carve it out of the slot
         const i = day.slots.indexOf(sl);
         const rest: Slot[] = [];
         if (start - buf - sl.start >= 15 * 60000) rest.push({ start: sl.start, end: start - buf, g: sl.g });
@@ -6777,12 +6978,31 @@ async function forgePlan(tid: string, opt: { force?: boolean; from_now?: boolean
         day.used += need / 60000;
         day.count[slotTier]++;
         placed.push({ id: t.id, start, end, date: day.date, slot: slotTier });
-        if (deadline && day.date > deadline) wontFit.push(`"${t.title}" (due ${deadline})`);
+        if (deadline && day.date > deadline) {
+          wontFit.push(`"${t.title}" (due ${deadline})`);
+          unplaced.push({ id: t.id, title: t.title, minutes: need / 60000, due: deadline, tier: t.tier, reason: `Planned for ${dayLabel(day.date)}, after its deadline (${dayLabel(deadline)}). Move something off an earlier day or change the deadline.`, earliest: day.date, kind: "late" });
+        }
         done = true; break;
       }
-      if (!done) wontFit.push(`"${t.title}"${deadline ? ` (due ${deadline})` : ""}`);
+      if (!done) failed.push({ t, need, why });
     }
-    // v9.10: a day you've pinned past your hours gets flagged, so you see it before you promise more
+    // Why each one didn't fit, and the earliest day it realistically could (after everything else is placed)
+    for (const f of failed) {
+      if (f.t.pin && !days.some((dd) => dd.date === f.t.pin)) continue;   // pinned past the plan window — it's planned when that day comes into view
+      const t = f.t, needMin = f.need / 60000, deadline = t.due_date ? String(t.due_date) : null;
+      const longest = Math.max(0, ...days.flatMap((dd) => dd.slots.filter((x) => t.area === "growth" || !x.g).map((x) => (x.end - x.start) / 60000)));
+      const roomDay = days.find((dd) => dd.slots.some((x) => (t.area === "growth" || !x.g) && x.end - x.start >= f.need));
+      let reason: string, kind: "no_room" | "pinned_full" = "no_room";
+      if (t.pin) { kind = "pinned_full"; reason = `Pinned to ${dayLabel(t.pin)}, but there's no ${hrsTxt(needMin)} gap left that day.`; }
+      else if (f.why.length && f.why.every((w) => w === "cap")) reason = `Every day's ${TIER_WORD[t.tier]} spaces are full (${caps[t.tier]} a day) for the next ${days.length} working days.`;
+      else if (f.why.length && f.why.every((w) => w === "daycap")) reason = `Your task hours (${hrsTxt(maxMin)} a day) are full for the next ${days.length} working days.`;
+      else if (longest < needMin) reason = `It needs ${hrsTxt(needMin)} in one go, and your longest free gap in the next ${days.length} working days is ${hrsTxt(longest)}.`;
+      else reason = `No day in the next ${days.length} working days has both a free ${TIER_WORD[t.tier]} space and a ${hrsTxt(needMin)} gap.`;
+      if (!calOk) reason += " (Calendar not readable — check Settings.)";
+      wontFit.push(`"${t.title}"${deadline ? ` (due ${deadline})` : ""}`);
+      unplaced.push({ id: t.id, title: t.title, minutes: needMin, due: deadline, tier: t.tier, reason, earliest: roomDay?.date ?? null, kind });
+    }
+    // A day pinned past your hours gets flagged, so you see it before you promise more
     for (const day of days) if (day.used > maxMin + 1) wontFit.unshift(`${new Date(day.date + "T12:00:00Z").toLocaleDateString("en-GB", { weekday: "long" })} is over your ${Math.round(maxMin / 6) / 10}h by ${Math.round((day.used - maxMin) / 6) / 10}h`);
     // Save: scheduled times; today's list = today's blocks; carried-over tasks count as a move
     const carriedIds = new Set(list.filter((t: any) => t.carried).map((t: any) => t.id));
@@ -6792,30 +7012,40 @@ async function forgePlan(tid: string, opt: { force?: boolean; from_now?: boolean
       if (carriedIds.has(pl.id)) { const t = list.find((x: any) => x.id === pl.id); upd.move_count = (Number(t?.move_count) || 0) + 1; }
       await supabase.from("tasks").update(upd).eq("id", pl.id);
     }
-    // Rolled tasks stay pinned to their new day, so tomorrow they roll one more day (not to next week)
     for (const t of list.filter((x: any) => x.rolled)) {
       await supabase.from("tasks").update({ pinned_date: t.pin, hold: false, move_count: (Number(t.move_count) || 0) + (carriedIds.has(t.id) ? 0 : 1) }).eq("id", t.id);
     }
     const placedIds = new Set(placed.map((p) => p.id));
-    const unplaced = list.filter((t: any) => !placedIds.has(t.id)).map((t: any) => t.id);
-    if (unplaced.length) await supabase.from("tasks").update({ scheduled_start: null, scheduled_end: null }).in("id", unplaced);
-    // Optional: task blocks on their personal calendar for today and tomorrow (syncs to Google)
-    if (m.calendar_blocks && m.personal_calendar_id) {
+    const unplacedIds = list.filter((t: any) => !placedIds.has(t.id)).map((t: any) => t.id);
+    if (unplacedIds.length) await supabase.from("tasks").update({ scheduled_start: null, scheduled_end: null }).in("id", unplacedIds);
+    // v9.13: calendar blocks — only touch what changed (new → create, moved → update, gone → delete). Skipped if the calendar can't be read.
+    if (!calFetchFailed && m.calendar_blocks && m.personal_calendar_id) {
       const horizonEnd = Date.parse(isoAtTz(addDays(today, Math.max(1, Math.min(7, Number(m.block_days ?? 2)))), "00:00", tz));
       for (const t of list) {
         const pl = placed.find((x) => x.id === t.id);
-        if (t.block_event_id) await ghl(token, `/calendars/events/${t.block_event_id}`, "DELETE", undefined, "2021-04-15").catch(() => null);
-        let blockId: string | null = null;
-        if (pl && pl.start < horizonEnd) {
-          const r = await ghl(token, "/calendars/events/block-slots", "POST", { locationId: loc, calendarId: m.personal_calendar_id, title: `🔨 ${String(t.title).slice(0, 80)}`, startTime: new Date(pl.start).toISOString(), endTime: new Date(pl.end).toISOString(), assignedUserId: m.ghl_user_id }, "2021-04-15");
-          blockId = r.json?.id ?? r.json?.event?.id ?? null;
-        }
-        if (blockId !== t.block_event_id) await supabase.from("tasks").update({ block_event_id: blockId }).eq("id", t.id);
+        const want = pl && pl.start < horizonEnd ? pl : null;
+        const bs = t.block_start !== undefined ? t.block_start : t.scheduled_start, be = t.block_end !== undefined ? t.block_end : t.scheduled_end;
+        const same = !!want && !!t.block_event_id && !!bs && Date.parse(bs) === want.start && Date.parse(be ?? "") === want.end;
+        if (same || (!want && !t.block_event_id)) continue;
+        let blockId: string | null = t.block_event_id ?? null;
+        const body = want ? { locationId: loc, calendarId: m.personal_calendar_id, title: `🔨 ${String(t.title).slice(0, 80)}`, startTime: new Date(want.start).toISOString(), endTime: new Date(want.end).toISOString(), assignedUserId: m.ghl_user_id } : null;
+        if (!want) { await ghl(token, `/calendars/events/${blockId}`, "DELETE", undefined, "2021-04-15").catch(() => null); blockId = null; }
+        else if (blockId) {
+          const r = await ghl(token, `/calendars/events/block-slots/${blockId}`, "PUT", body, "2021-04-15");
+          if (!r.ok) { await ghl(token, `/calendars/events/${blockId}`, "DELETE", undefined, "2021-04-15").catch(() => null); const c2 = await ghl(token, "/calendars/events/block-slots", "POST", body, "2021-04-15"); blockId = c2.json?.id ?? c2.json?.event?.id ?? null; }
+        } else { const c2 = await ghl(token, "/calendars/events/block-slots", "POST", body, "2021-04-15"); blockId = c2.json?.id ?? c2.json?.event?.id ?? null; }
+        const bUpd = { block_event_id: blockId, block_start: blockId && want ? new Date(want.start).toISOString() : null, block_end: blockId && want ? new Date(want.end).toISOString() : null };
+        const { error: bErr } = await supabase.from("tasks").update(bUpd).eq("id", t.id);
+        if (bErr) await supabase.from("tasks").update({ block_event_id: blockId }).eq("id", t.id);
       }
-    }
-    if (m.calendar_blocks && m.personal_calendar_id) {
-      for (const id of Array.isArray(m.personal_block_ids) ? m.personal_block_ids : []) await ghl(token, `/calendars/events/${id}`, "DELETE", undefined, "2021-04-15").catch(() => null);
-      const ids: string[] = [];
+      // Blocks for tasks that were finished or removed come off the calendar
+      const { data: stale1 } = await supabase.from("tasks").select("id, block_event_id").eq("tenant_id", tid).eq("owner", m.handle).in("status", ["done", "dismissed"]).not("block_event_id", "is", null).limit(100);
+      const { data: stale2 } = await supabase.from("tasks").select("id, block_event_id").eq("tenant_id", tid).eq("owner", m.handle).eq("hold", true).not("block_event_id", "is", null).limit(100);
+      const stale = [...(stale1 ?? []), ...(stale2 ?? [])];
+      for (const s of stale) { await ghl(token, `/calendars/events/${s.block_event_id}`, "DELETE", undefined, "2021-04-15").catch(() => null); await supabase.from("tasks").update({ block_event_id: null }).eq("id", s.id); }
+      // Personal blocks (gym etc.): keep the ones still wanted, add new, remove old — stable ids
+      const prev: any[] = Array.isArray(m.personal_block_ids) ? m.personal_block_ids : [];
+      const wantPb: { key: string; label: string; st: number; en: number }[] = [];
       const ahead = Math.max(1, Math.min(7, Number(m.block_days ?? 2)));
       for (let i = 0; i < ahead && personalBlocks.length; i++) {
         const dd = addDays(today, i), dw = new Date(`${dd}T12:00:00Z`).getUTCDay();
@@ -6824,21 +7054,51 @@ async function forgePlan(tid: string, opt: { force?: boolean; from_now?: boolean
           if (!pb.days.includes(dw)) continue;
           const st = Date.parse(isoAtTz(dd, pb.start, tz)), en = Date.parse(isoAtTz(dd, pb.end, tz));
           if (en < Date.now()) continue;
-          const r = await ghl(token, "/calendars/events/block-slots", "POST", { locationId: loc, calendarId: m.personal_calendar_id, title: `🔒 ${pb.label}`, startTime: new Date(st).toISOString(), endTime: new Date(en).toISOString() }, "2021-04-15").catch(() => null) as any;
-          const bid = r?.json?.id ?? r?.json?.event?.id; if (bid) ids.push(bid);
+          wantPb.push({ key: `${pb.label}|${dd}|${pb.start}|${pb.end}`, label: pb.label, st, en });
         }
       }
-      await supabase.from("team_members").update({ personal_block_ids: ids }).eq("tenant_id", tid).eq("handle", m.handle);
+      const keep: { id: string; key: string }[] = [];
+      for (const p of prev) {
+        const pid = typeof p === "string" ? p : p?.id, pkey = typeof p === "string" ? "" : String(p?.key ?? "");
+        if (pid && pkey && wantPb.some((w) => w.key === pkey) && !keep.some((k) => k.key === pkey)) keep.push({ id: pid, key: pkey });
+        else if (pid) await ghl(token, `/calendars/events/${pid}`, "DELETE", undefined, "2021-04-15").catch(() => null);
+      }
+      for (const w of wantPb) {
+        if (keep.some((k) => k.key === w.key)) continue;
+        const r = await ghl(token, "/calendars/events/block-slots", "POST", { locationId: loc, calendarId: m.personal_calendar_id, title: `🔒 ${w.label}`, startTime: new Date(w.st).toISOString(), endTime: new Date(w.en).toISOString() }, "2021-04-15").catch(() => null) as any;
+        const bid = r?.json?.id ?? r?.json?.event?.id; if (bid) keep.push({ id: bid, key: w.key });
+      }
+      const { error: pbErr } = await supabase.from("team_members").update({ personal_block_ids: keep }).eq("tenant_id", tid).eq("handle", m.handle);
+      if (pbErr) await supabase.from("team_members").update({ personal_block_ids: keep.map((k) => k.id) }).eq("tenant_id", tid).eq("handle", m.handle);
     }
-    await supabase.from("team_members").update({ forge_wont_fit: wontFit.slice(0, 10) }).eq("tenant_id", tid).eq("handle", m.handle);
-    summary.push(`${m.handle}: ${placed.length} placed${wontFit.length ? `, ${wontFit.length} won't fit` : ""}`);
+    // v9.13: real capacity per day (free calendar time after meetings, lunch, personal blocks, growth window), for every capacity answer
+    // (growth-window time only counts for growth work, so it's left out of the general capacity; no cache when the calendar couldn't be read)
+    const daysCache = calOk ? days.map((dd) => ({ date: dd.date, free: dd.free, cap: Math.min(maxMin, Math.max(0, dd.free - dd.growthFree)), planned: Math.round(dd.used), growth_free: dd.growthFree })) : [];
+    const memberUpd: Record<string, unknown> = { forge_wont_fit: wontFit.slice(0, 10), forge_unplaced: unplaced.slice(0, 30), forge_days_cache: daysCache, forge_calendar_ok: calOk, forge_calendar_error: calErr };
+    const { error: mErr } = await supabase.from("team_members").update(memberUpd).eq("tenant_id", tid).eq("handle", m.handle);
+    if (mErr) await supabase.from("team_members").update({ forge_wont_fit: wontFit.slice(0, 10) }).eq("tenant_id", tid).eq("handle", m.handle); // new columns not added yet
+    summary.push(`${m.handle}: ${placed.length} placed${unplaced.length ? `, ${unplaced.length} need attention` : ""}${calOk ? "" : " (calendar not readable)"}`);
   }
   await supabase.from("tenant_config").update({ forge_planned_at: new Date().toISOString() }).eq("tenant_id", tid);
   return { ok: true, text: `Plan updated — ${summary.join(" · ")}.` };
 }
 
+// v9.13: what needs attention — overdue, carried over 3+ times, landing after its deadline, didn't fit
+async function forgeAttention(tid: string, handle: string, today: string, unplaced: any[]) {
+  const { data: open } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", handle).in("status", ["open", "doing"]).limit(300), "id, title, due_date, move_count, critical");
+  const out: { id: string; title: string; kind: string; text: string }[] = [];
+  for (const t of open ?? []) {
+    if (t.critical) out.push({ id: t.id, title: t.title, kind: "critical", text: "Critical" });
+    if (t.due_date && String(t.due_date) < today) out.push({ id: t.id, title: t.title, kind: "overdue", text: `Overdue since ${new Date(t.due_date + "T12:00:00Z").toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}` });
+    if (Number(t.move_count) >= 3) out.push({ id: t.id, title: t.title, kind: "carried", text: `Moved ${t.move_count} times. Do it, delegate it, or drop it?` });
+  }
+  for (const u of unplaced) out.push({ id: u.id, title: u.title, kind: u.kind === "late" ? "late" : "no_room", text: u.reason });
+  const rank: Record<string, number> = { critical: 0, overdue: 1, late: 2, no_room: 3, carried: 4 };
+  return out.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9)).slice(0, 25);
+}
+
 async function forgePlanGet(tid: string, handle: string, days = 5) {
-  const { data: cfg } = await supabase.from("tenant_config").select("timezone, ghl_token, ghl_location_id").eq("tenant_id", tid).single();
+  const { data: cfg } = await supabase.from("tenant_config").select("timezone, ghl_token, ghl_location_id, forge_caps").eq("tenant_id", tid).single();
   const tz = cfg?.timezone || "Europe/London";
   const today = localDate(Date.now(), tz);
   const { data: m } = handle
@@ -6846,12 +7106,12 @@ async function forgePlanGet(tid: string, handle: string, days = 5) {
     : await supabase.from("team_members").select("*").eq("tenant_id", tid).eq("gets_financials", true).maybeSingle();
   if (!m) return { ok: false, error: "no such person" };
   const until = Date.parse(isoAtTz(addDays(today, Math.max(1, Math.min(10, days))), "00:00", tz));
-  const { data: tasks } = await supabase.from("tasks").select("id, title, tier, plan_slot, kind, effort_minutes, due_date, scheduled_start, scheduled_end, move_count, pinned_date, detail, area, client_id").eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).not("scheduled_start", "is", null).lt("scheduled_start", new Date(until).toISOString()).order("scheduled_start");
+  const { data: tasks } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).not("scheduled_start", "is", null).lt("scheduled_start", new Date(until).toISOString()).order("scheduled_start"), "id, title, tier, plan_slot, kind, effort_minutes, due_date, scheduled_start, scheduled_end, move_count, pinned_date, detail, area, client_id, critical");
   // v9.11.3: client names for the task sheet
   const cIds = [...new Set((tasks ?? []).map((t: any) => t.client_id).filter(Boolean))];
   const cName: Record<string, string> = {};
   if (cIds.length) { const { data: cs } = await supabase.from("clients").select("id, name").eq("tenant_id", tid).in("id", cIds); for (const c of cs ?? []) cName[c.id] = c.name; }
-  const sheet = (b: any) => ({ tier: b.tier ?? "high", notes: b.detail ?? "", area: ["growth", "clients", "admin"].includes(b.area) ? b.area : null, client_id: b.client_id ?? null, client_name: b.client_id ? cName[b.client_id] ?? null : null, minutes: Math.max(15, Number(b.effort_minutes) || 30) });
+  const sheet = (b: any) => ({ critical: !!b.critical, move_count: Number(b.move_count) || 0, tier: b.tier ?? "high", notes: b.detail ?? "", area: ["growth", "clients", "admin"].includes(b.area) ? b.area : null, client_id: b.client_id ?? null, client_name: b.client_id ? cName[b.client_id] ?? null : null, minutes: Math.max(15, Number(b.effort_minutes) || 30) });
   // Calendar events for the same days (to show around the blocks)
   let events: any[] = [];
   if (m.ghl_user_id) {
@@ -6884,7 +7144,13 @@ async function forgePlanGet(tid: string, handle: string, days = 5) {
       return { ...d, board: bd };
     }),
     wont_fit: wont, today_text,
-    hours: { work_start: hm(m.work_start, "09:00"), work_end: hm(m.work_end, "17:30"), lunch_start: m.lunch_start ?? null, lunch_end: m.lunch_end ?? null, work_days: m.work_days ?? "1,2,3,4,5", calendar_blocks: !!m.calendar_blocks, max_task_hours: Number(m.max_task_hours ?? 6), buffer_minutes: Number(m.buffer_minutes ?? 10), block_days: Number(m.block_days ?? 2), personal_calendar_set: !!m.personal_calendar_id, growth_start: m.growth_start ?? null, growth_end: m.growth_end ?? null, growth_days: m.growth_days ?? null, personal_blocks: cleanBlocks(m.personal_blocks).map((b) => ({ ...b, days: b.days.join(",") })) },
+    // v9.13: what didn't fit (with why + earliest day), calendar health, real capacity per day, and what needs attention
+    unplaced: Array.isArray(m.forge_unplaced) ? m.forge_unplaced : [],
+    calendar: { ok: m.forge_calendar_ok !== false, error: m.forge_calendar_error ?? null },
+    capacity: Array.isArray(m.forge_days_cache) ? m.forge_days_cache : [],
+    caps: (() => { const c = String(m.forge_caps ?? cfg?.forge_caps ?? "2,3,2").split(",").map((x: string) => Number(x) || 0); return { must: c[0] ?? 2, high: c[1] ?? 3, bonus: c[2] ?? 2 }; })(),
+    attention: await forgeAttention(tid, m.handle, today, Array.isArray(m.forge_unplaced) ? m.forge_unplaced : []),
+    hours: { work_start: hm(m.work_start, "09:00"), work_end: hm(m.work_end, "17:30"), lunch_start: m.lunch_start ?? null, lunch_end: m.lunch_end ?? null, work_days: m.work_days ?? "1,2,3,4,5", calendar_blocks: !!m.calendar_blocks, max_task_hours: Number(m.max_task_hours ?? 6), buffer_minutes: Number(m.buffer_minutes ?? 10), block_days: Number(m.block_days ?? 2), personal_calendar_set: !!m.personal_calendar_id, growth_start: m.growth_start ?? null, growth_end: m.growth_end ?? null, growth_days: m.growth_days ?? null, personal_blocks: cleanBlocks(m.personal_blocks).map((b) => ({ ...b, days: b.days.join(",") })), work_hours: dayWindows(m.work_hours), growth_windows: dayWindows(m.growth_windows) },
   };
 }
 
@@ -7398,6 +7664,32 @@ function looseJson(raw: string): any {
 
 // ===================== v7.7: Archie Edit v2 checks =====================
 // Where is the face? Render one frame of the raw clip, ask Gemini for the face centre (0..1).
+// v9.12.2: is this clip a screen recording? If so, its shape and where the camera bubble sits (fractions of the screen image)
+type ClipLook = { kind: "screen" | "face"; aspect: number; bubble: { x: number; y: number; r: number } | null };
+async function clipLook(videoUrl: string, duration: number): Promise<ClipLook> {
+  const fallback: ClipLook = { kind: "face", aspect: 16 / 9, bubble: null };
+  try {
+    const still: any = await renderStillOnLambda({ region: (Deno.env.get("REMOTION_REGION") ?? "eu-west-2") as any, functionName: Deno.env.get("REMOTION_FUNCTION")!, serveUrl: Deno.env.get("REMOTION_SERVE_URL")!, composition: "ArchieFrameWide", imageFormat: "jpeg", privacy: "no-acl", inputProps: { videoUrl, at: Math.max(0.3, Math.min((duration || 10) - 0.3, (duration || 10) * 0.4)) } } as any);
+    const img = await fetch(String(still?.url ?? "")); if (!img.ok) return fallback;
+    const buf = new Uint8Array(await img.arrayBuffer()); let bin = ""; for (let i = 0; i < buf.length; i += 8192) bin += String.fromCharCode(...buf.subarray(i, i + 8192));
+    const key = Deno.env.get("GEMINI_API_KEY") ?? "";
+    const ask = 'This is one frame from a video clip, shown uncropped (black bars may be padding). Is it mainly a SCREEN RECORDING (a computer or phone screen, an app, a website, slides) or a TALKING HEAD (a person filmed by a camera)? If it is a screen recording, give its shape (width divided by height, ignoring black bars) and, if there is a small circular or rounded camera bubble of a person overlaid on it, where that bubble is, measured inside the screen image itself (ignore black bars). Return ONLY JSON: {"kind":"screen","aspect":1.78,"bubble":{"x":0.1,"y":0.85,"r":0.08}} or {"kind":"face"}. x and y are the bubble centre as fractions of the screen image width and height; r is its radius as a fraction of the screen image width; use "bubble":null if there is no camera bubble.';
+    for (const model of [...new Set([Deno.env.get("GEMINI_MODEL"), "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-2.5-flash"].filter(Boolean) as string[])]) {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ inline_data: { mime_type: "image/jpeg", data: btoa(bin) } }, { text: ask }] }], generationConfig: { temperature: 0 } }) });
+      if (!r.ok) continue;
+      const js: any = await r.json().catch(() => null);
+      const o = looseJson(String(js?.candidates?.[0]?.content?.parts?.map((x: any) => x.text ?? "").join("") ?? "{}"));
+      if (!o || (o.kind !== "screen" && o.kind !== "face")) continue;
+      if (o.kind === "face") return fallback;
+      const a = Number(o.aspect); const aspect = a >= 1.2 && a <= 2.4 ? Math.round(a * 1000) / 1000 : 16 / 9;
+      const b = o.bubble; let bubble: ClipLook["bubble"] = null;
+      if (b && Number(b.x) >= 0 && Number(b.x) <= 1 && Number(b.y) >= 0 && Number(b.y) <= 1 && Number(b.r) > 0) bubble = { x: Math.round(Number(b.x) * 1000) / 1000, y: Math.round(Number(b.y) * 1000) / 1000, r: Math.min(0.3, Math.max(0.02, Math.round(Number(b.r) * 1000) / 1000)) };
+      return { kind: "screen", aspect, bubble };
+    }
+  } catch { /* fallback */ }
+  return fallback;
+}
+
 async function faceFocus(videoUrl: string, duration: number, frac = 0.3): Promise<{ x: number; y: number }> {
   const fallback = { x: 0.5, y: 0.38 };
   try {
@@ -8264,7 +8556,7 @@ async function winbackOffer(tid: string) {
 
 // ===================== v9.7: button parity =====================
 const WHATS_NEW = [
-  { date: "2026-10-05", title: "Forge 3:3:3", text: "Every day holds 3 Musts, 3 To-dos and 3 Bonuses. Anything not done slots into the next free space." },
+  { date: "2026-10-05", title: "Forge 3:3:3", text: "Every day holds 2 Musts, 3 To-dos and 2 Bonuses. Anything not done slots into the next free space." },
   { date: "2026-10-05", title: "Make a reel, start to finish", text: "Tap 🎬 Make a reel: Archie writes the script, you film with the teleprompter, Archie edits and posts at your best time." },
   { date: "2026-10-05", title: "Waiting on you", text: "Every message Archie drafted, every task it spotted and every reel ready to post — in one place, with Undo." },
 ];
@@ -8620,9 +8912,24 @@ async function retag(c: any, kind: string) {
   return r.ok ? { ok: true } : { ok: false, error: `couldn't tag contact (${r.status})` };
 }
 
+// v9.12.1: anything Archie sends a team member on its own (carousel ready, reel done, brief, nudges) goes into
+// their chat thread too, so when they reply "send it here" / "post it" Archie knows what "it" is.
+const NO_TALK_LOG = new WeakSet<object>();
+async function logNotify(body: any) {
+  try {
+    const cid = String(body?.contactId ?? ""), msg = String(body?.message ?? "").trim();
+    if (!cid || !msg) return;
+    const { data: m } = await supabase.from("team_members").select("tenant_id, handle").eq("ghl_contact_id", cid).limit(1).maybeSingle();
+    if (m?.handle) await supabase.from("talk_messages").insert({ tenant_id: m.tenant_id, handle: m.handle, role: "archie", text: msg.slice(0, 4000), channel: "notify" });
+  } catch { /* never block a send */ }
+}
+
 async function ghl(token: string, path: string, method = "GET", body?: unknown, version = "2021-07-28") {
   const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 15000);
   try {
+    if (method === "POST" && path === "/conversations/messages" && body && typeof body === "object" && !NO_TALK_LOG.has(body as object)) {
+      const b = body as object; queueMicrotask(() => { void (async () => { await new Promise((ok) => setTimeout(ok, 50)); await logNotify(b); })(); });
+    }
     const r = await fetch(BASE + path, { method, signal: ctrl.signal, headers: { "Authorization": `Bearer ${token}`, "Version": version, "Accept": "application/json", "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
     const text = await r.text(); let json: any = null; try { json = JSON.parse(text); } catch { json = null; }
     return { ok: r.ok, status: r.status, json, text };
