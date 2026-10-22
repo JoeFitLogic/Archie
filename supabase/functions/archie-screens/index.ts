@@ -2709,7 +2709,7 @@ async function ytFinishPending(tid: string) {
 }
 
 // ===================== v9.9.6: status check — what's actually live =====================
-const ARCHIE_VERSION = "9.14.1";
+const ARCHIE_VERSION = "9.14.2";
 async function statusCheck(tid: string) {
   const out: Record<string, unknown> = { version: ARCHIE_VERSION, checked_at: new Date().toISOString() };
   // 1. Secrets: set or not (never the values)
@@ -7353,13 +7353,16 @@ async function forgeOverview(tid: string, handle: string) {
   const days = week.map((d) => {
     const load = L.days.find((x) => x.date === d);
     const past = d < today;
-    const planned = actionable.filter((t: any) => dayOf(t) === d);
+    // Past days show what got done; today and later show what's planned (plus anything already done today)
+    const planned = past ? [] : actionable.filter((t: any) => dayOf(t) === d);
     const done = (doneWeek ?? []).filter((t: any) => localDate(Date.parse(t.updated_at), tz) === d);
     const split = { growth: 0, clients: 0, admin: 0 } as Record<string, number>;
     for (const t of [...planned, ...done]) split[["growth", "clients", "admin"].includes(t.area) ? t.area : "admin"] += Math.max(15, Number(t.effort_minutes) || 30);
     const allocated = planned.reduce((a: number, t: any) => a + Math.max(15, Number(t.effort_minutes) || 30), 0);
     const cached = (Array.isArray(m.forge_days_cache) ? m.forge_days_cache : []).find((x: any) => x?.date === d);
-    const available = past ? 0 : (cached ? Math.min(Number(cached.cap ?? 0) + Number(cached.growth_free ?? 0), Number(cached.free ?? 0) || Infinity) : Number(load?.cap ?? 0));
+    // The day's task-hours limit applies to growth work too (the planner never goes past it), so available = min(limit, free time)
+    const maxMin = Math.round((Number(m.max_task_hours ?? 6) || 6) * 60);
+    const available = past ? 0 : (cached ? Math.min(maxMin, Number(cached.free ?? 0)) : Number(load?.cap ?? 0));
     return { date: d, past, today: d === today, available, allocated, remaining: Math.max(0, available - allocated), done: done.reduce((a: number, t: any) => a + Math.max(15, Number(t.effort_minutes) || 30), 0), split, over: !past && allocated > available && available > 0 };
   });
   const ahead = days.filter((d) => !d.past);
