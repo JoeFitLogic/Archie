@@ -533,7 +533,7 @@ Deno.serve(async (req) => {
         const { data: cfgT } = await supabase.from("tenant_config").select("timezone").eq("tenant_id", c.tid).maybeSingle();
         const tz = cfgT?.timezone || "Europe/London";
         const today = localDate(Date.now(), tz);
-        const { data } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", c.tid).eq("owner", c.owner?.handle ?? "").in("status", ["open", "doing"]).order("created_at", { ascending: true }).limit(300), "id, title, tier, plan_slot, due_date, pinned_date, scheduled_start, scheduled_end, effort_minutes, owner, created_at, hold, detail, kind, block_event_id, area, client_id, critical, move_count, project_id, checklist, waiting_on");
+        const { data } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", c.tid).eq("owner", c.owner?.handle ?? "").in("status", ["open", "doing"]).order("created_at", { ascending: true }).limit(300), "id, title, tier, plan_slot, due_date, pinned_date, scheduled_start, scheduled_end, effort_minutes, owner, created_at, hold, detail, kind, block_event_id, area, client_id, critical, move_count, project_id, checklist, waiting_on, moves_acked");
         // v9.11.3: client names for the task sheet
         const tlIds = [...new Set((data ?? []).map((t: any) => t.client_id).filter(Boolean))];
         const tlNames: Record<string, string> = {};
@@ -543,7 +543,7 @@ Deno.serve(async (req) => {
           // v9.9.8: anything left on a past day rolls onto today (it used to fall out of every list)
           const carried = !!rawDay && rawDay < today;
           const day = carried ? today : rawDay;
-          return { id: t.id, title: t.title, held: !!t.hold, carried, carried_from: carried ? rawDay : null, priority: t.plan_slot ?? t.tier ?? "high", day: t.hold ? null : day, time: t.scheduled_start ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_start)) : null, pinned: !!t.pinned_date, due: t.due_date ?? null, overdue: !!t.due_date && t.due_date < today, notes: t.detail ?? "", area: ["growth", "clients", "admin"].includes(t.area) ? t.area : null, client_id: t.client_id ?? null, client_name: t.client_id ? tlNames[t.client_id] ?? null : null, tier: t.tier ?? "high", critical: !!t.critical, move_count: Number(t.move_count) || 0, project_id: t.project_id ?? null, checklist: Array.isArray(t.checklist) ? t.checklist : [], waiting_on: t.waiting_on ?? null, minutes: Math.max(15, Number(t.effort_minutes) || 30), kind: t.kind === "deep" ? "deep" : "shallow", end_time: t.scheduled_end ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_end)) : null, on_calendar: !!t.block_event_id };
+          return { id: t.id, title: t.title, held: !!t.hold, carried, carried_from: carried ? rawDay : null, priority: t.plan_slot ?? t.tier ?? "high", day: t.hold ? null : day, time: t.scheduled_start ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_start)) : null, pinned: !!t.pinned_date, due: t.due_date ?? null, overdue: !!t.due_date && t.due_date < today, notes: t.detail ?? "", area: ["growth", "clients", "admin"].includes(t.area) ? t.area : null, client_id: t.client_id ?? null, client_name: t.client_id ? tlNames[t.client_id] ?? null : null, tier: t.tier ?? "high", critical: !!t.critical, move_count: Number(t.move_count) || 0, moves_since: (Number(t.move_count) || 0) - (Number(t.moves_acked) || 0), project_id: t.project_id ?? null, checklist: Array.isArray(t.checklist) ? t.checklist : [], waiting_on: t.waiting_on ?? null, minutes: Math.max(15, Number(t.effort_minutes) || 30), kind: t.kind === "deep" ? "deep" : "shallow", end_time: t.scheduled_end ? new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t.scheduled_end)) : null, on_calendar: !!t.block_event_id };
         });
         const days: string[] = []; for (let i = 0; i < 7; i++) days.push(addDays(today, i));
         // Capacity per day: planned task time vs the hours set for tasks (max_task_hours), only on working days
@@ -598,6 +598,7 @@ Deno.serve(async (req) => {
         if (!Object.keys(upd).length) return j({ ok: false, text: "Nothing to change." });
         const { error } = await supabase.from("tasks").update(upd).eq("tenant_id", c.tid).eq("id", String(p.id ?? ""));
         if (error) return j({ ok: false, text: error.message });
+        if (upd.tier !== undefined || upd.pinned_date !== undefined || upd.status !== undefined) await ackMoves(c.tid, String(p.id ?? ""));
         await forgePlan(c.tid, { force: true, from_now: true });
         return j(await taskLanded(c.tid, c.owner?.handle ?? "", String(p.id ?? ""), typeof upd.pinned_date === "string" ? upd.pinned_date : null, "Saved"));
       }
@@ -638,6 +639,7 @@ Deno.serve(async (req) => {
         if (["must", "high", "bonus"].includes(String(p.tier ?? ""))) upd.tier = String(p.tier);
         const { error } = await supabase.from("tasks").update(upd).eq("tenant_id", c.tid).eq("id", String(p.id ?? ""));
         if (error) return j({ ok: false, text: error.message });
+        await ackMoves(c.tid, String(p.id ?? ""));
         await forgePlan(c.tid, { force: true, from_now: true });
         if (toInbox) return j({ ok: true, text: "Back in your Inbox." });
         return j({ ok: true, text: date ? `Pinned to ${new Date(date + "T12:00:00Z").toLocaleDateString("en-GB", { weekday: "long" })}. Forge has planned around it.` : "Unpinned — Forge will place it." });
@@ -2707,7 +2709,7 @@ async function ytFinishPending(tid: string) {
 }
 
 // ===================== v9.9.6: status check — what's actually live =====================
-const ARCHIE_VERSION = "9.14.0";
+const ARCHIE_VERSION = "9.14.1";
 async function statusCheck(tid: string) {
   const out: Record<string, unknown> = { version: ARCHIE_VERSION, checked_at: new Date().toISOString() };
   // 1. Secrets: set or not (never the values)
@@ -2716,7 +2718,7 @@ async function statusCheck(tid: string) {
   out.secrets = secrets;
   // 2. Database: each table and the columns later versions added
   const schema: [string, string][] = [
-    ["tasks", "id, hold, plan_slot, pinned_date, proposal_rank, area, client_id, critical, block_start, block_end, project_id, checklist, waiting_on"], ["forge_projects", "id, status, major, deadline, waiting_on, archived"], ["briefs", "id, short_body, read_at"], ["council_sessions", "id"],
+    ["tasks", "id, hold, plan_slot, pinned_date, proposal_rank, area, client_id, critical, block_start, block_end, project_id, checklist, waiting_on, moves_acked"], ["forge_projects", "id, status, major, deadline, waiting_on, archived"], ["briefs", "id, short_body, read_at"], ["council_sessions", "id"],
     ["broll_library", "id"], ["content_stacks", "id, handed_to"], ["custom_styles", "id"], ["style_specs", "id"],
     ["edit_jobs", "id, engine, sources, cover_url, render_retried, scheduled_for"], ["feature_events", "id"], ["feature_feedback", "id"],
     ["client_groups", "conversation_id, client_id"], ["yt_jobs", "id, renders, thumbs, outputs, split"], ["agent_runs", "id"], ["carousels", "id, source"],
@@ -6846,9 +6848,17 @@ async function forgePlan(tid: string, opt: { force?: boolean; from_now?: boolean
   return { ok: false, text: "Forge is busy re-planning — try again in a minute." };
 }
 
+// v9.14.1: you made a call on this task (moved it, parked it, re-prioritised it) — "keeps moving" resets from here
+async function ackMoves(tid: string, id: string) {
+  try {
+    const { data: t } = await supabase.from("tasks").select("move_count").eq("tenant_id", tid).eq("id", id).maybeSingle();
+    if (t) await supabase.from("tasks").update({ moves_acked: Number(t.move_count) || 0 }).eq("tenant_id", tid).eq("id", id);
+  } catch { /* column not added yet — harmless */ }
+}
+
 // v9.13: a select that still works if the new task columns haven't been added yet
 async function selNewCols(run: (cols: string) => PromiseLike<{ data: any; error: any }>, cols: string) {
-  const optional = ["critical", "block_start", "block_end", "project_id", "checklist", "waiting_on"];
+  const optional = ["critical", "block_start", "block_end", "project_id", "checklist", "waiting_on", "moves_acked"];
   let r = await run(cols);
   for (let i = 0; i < optional.length && r.error; i++) {
     const msg = String(r.error.message ?? "");
@@ -7329,7 +7339,7 @@ async function forgeOverview(tid: string, handle: string) {
   const monday = dow === 6 ? addDays(today, 2) : dow === 0 ? addDays(today, 1) : addDays(today, -((dow + 6) % 7));
   const week = [0, 1, 2, 3, 4].map((i) => addDays(monday, i));
   const [{ data: open }, { data: doneWeek }, L, projects, requests] = await Promise.all([
-    selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing", "waiting"]).limit(500), "id, title, status, tier, effort_minutes, due_date, scheduled_start, area, move_count, critical, client_id, project_id, waiting_on"),
+    selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing", "waiting"]).limit(500), "id, title, status, tier, effort_minutes, due_date, scheduled_start, area, move_count, hold, critical, client_id, project_id, waiting_on, moves_acked"),
     supabase.from("tasks").select("effort_minutes, area, updated_at").eq("tenant_id", tid).eq("owner", m.handle).eq("status", "done").gte("updated_at", isoAtTz(monday, "00:00", tz)).limit(500),
     dayLoads(tid, m.handle, monday, 5),
     projectsList(tid),
@@ -7365,7 +7375,7 @@ async function forgeOverview(tid: string, handle: string) {
     if (pr.overdue) attention.push({ kind: "project_overdue", id: pr.id, title: pr.name, text: `Project deadline was ${dayName(pr.deadline)}`, project: true });
     if (pr.no_next_action) attention.push({ kind: "no_next_action", id: pr.id, title: pr.name, text: "No next action. What's the next step?", project: true });
   }
-  for (const t of actionable) if (Number(t.move_count) >= 3) attention.push({ kind: "carried", id: t.id, title: t.title, text: `Moved ${t.move_count} times. Do it, delegate it, or drop it?` });
+  for (const t of actionable) { const since = (Number(t.move_count) || 0) - (Number(t.moves_acked) || 0); if (!t.hold && since >= 3) attention.push({ kind: "carried", id: t.id, title: t.title, text: `Moved ${since} times${Number(t.moves_acked) ? " since you last decided" : ""}. Do it, delegate it, or drop it?` }); }
   for (const u of unplaced) attention.push({ kind: u.kind === "late" ? "late" : "no_room", id: u.id, title: u.title, text: u.reason });
   for (const t of tasks.filter((x: any) => x.status === "waiting")) attention.push({ kind: "waiting", id: t.id, title: t.title, text: t.waiting_on ? `Waiting on ${t.waiting_on}` : "Waiting on the client" });
   const rank: Record<string, number> = { overdue: 0, project_overdue: 1, late: 2, no_room: 3, no_next_action: 4, carried: 5, waiting: 6 };
@@ -7385,12 +7395,13 @@ async function forgeOverview(tid: string, handle: string) {
 
 // v9.13: what needs attention — overdue, carried over 3+ times, landing after its deadline, didn't fit
 async function forgeAttention(tid: string, handle: string, today: string, unplaced: any[]) {
-  const { data: open } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", handle).in("status", ["open", "doing"]).limit(300), "id, title, due_date, move_count, critical");
+  const { data: open } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", handle).in("status", ["open", "doing"]).limit(300), "id, title, due_date, move_count, hold, critical, moves_acked");
   const out: { id: string; title: string; kind: string; text: string }[] = [];
   for (const t of open ?? []) {
     if (t.critical) out.push({ id: t.id, title: t.title, kind: "critical", text: "Critical" });
     if (t.due_date && String(t.due_date) < today) out.push({ id: t.id, title: t.title, kind: "overdue", text: `Overdue since ${new Date(t.due_date + "T12:00:00Z").toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}` });
-    if (Number(t.move_count) >= 3) out.push({ id: t.id, title: t.title, kind: "carried", text: `Moved ${t.move_count} times. Do it, delegate it, or drop it?` });
+    const since = (Number(t.move_count) || 0) - (Number(t.moves_acked) || 0);
+    if (!t.hold && since >= 3) out.push({ id: t.id, title: t.title, kind: "carried", text: `Moved ${since} times${Number(t.moves_acked) ? " since you last decided" : ""}. Do it, delegate it, or drop it?` });
   }
   for (const u of unplaced) out.push({ id: u.id, title: u.title, kind: u.kind === "late" ? "late" : "no_room", text: u.reason });
   const rank: Record<string, number> = { critical: 0, overdue: 1, late: 2, no_room: 3, carried: 4 };
@@ -7406,7 +7417,7 @@ async function forgePlanGet(tid: string, handle: string, days = 5) {
     : await supabase.from("team_members").select("*").eq("tenant_id", tid).eq("gets_financials", true).maybeSingle();
   if (!m) return { ok: false, error: "no such person" };
   const until = Date.parse(isoAtTz(addDays(today, Math.max(1, Math.min(10, days))), "00:00", tz));
-  const { data: tasks } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).not("scheduled_start", "is", null).lt("scheduled_start", new Date(until).toISOString()).order("scheduled_start"), "id, title, tier, plan_slot, kind, effort_minutes, due_date, scheduled_start, scheduled_end, move_count, pinned_date, detail, area, client_id, critical, project_id, checklist");
+  const { data: tasks } = await selNewCols((cols) => supabase.from("tasks").select(cols).eq("tenant_id", tid).eq("owner", m.handle).in("status", ["open", "doing"]).not("scheduled_start", "is", null).lt("scheduled_start", new Date(until).toISOString()).order("scheduled_start"), "id, title, tier, plan_slot, kind, effort_minutes, due_date, scheduled_start, scheduled_end, move_count, pinned_date, detail, area, client_id, critical, project_id, checklist, moves_acked");
   // v9.11.3: client names for the task sheet
   const cIds = [...new Set((tasks ?? []).map((t: any) => t.client_id).filter(Boolean))];
   const cName: Record<string, string> = {};
@@ -7414,7 +7425,7 @@ async function forgePlanGet(tid: string, handle: string, days = 5) {
   const pIds = [...new Set((tasks ?? []).map((t: any) => t.project_id).filter(Boolean))];
   const pNm: Record<string, string> = {};
   if (pIds.length) { const { data: ps } = await supabase.from("forge_projects").select("id, name").eq("tenant_id", tid).in("id", pIds); for (const x of ps ?? []) pNm[x.id] = x.name; }
-  const sheet = (b: any) => ({ project_id: b.project_id ?? null, project_name: b.project_id ? pNm[b.project_id] ?? null : null, checklist: Array.isArray(b.checklist) ? b.checklist : [], critical: !!b.critical, move_count: Number(b.move_count) || 0, tier: b.tier ?? "high", notes: b.detail ?? "", area: ["growth", "clients", "admin"].includes(b.area) ? b.area : null, client_id: b.client_id ?? null, client_name: b.client_id ? cName[b.client_id] ?? null : null, minutes: Math.max(15, Number(b.effort_minutes) || 30) });
+  const sheet = (b: any) => ({ project_id: b.project_id ?? null, project_name: b.project_id ? pNm[b.project_id] ?? null : null, checklist: Array.isArray(b.checklist) ? b.checklist : [], critical: !!b.critical, move_count: Number(b.move_count) || 0, moves_since: (Number(b.move_count) || 0) - (Number(b.moves_acked) || 0), tier: b.tier ?? "high", notes: b.detail ?? "", area: ["growth", "clients", "admin"].includes(b.area) ? b.area : null, client_id: b.client_id ?? null, client_name: b.client_id ? cName[b.client_id] ?? null : null, minutes: Math.max(15, Number(b.effort_minutes) || 30) });
   // Calendar events for the same days (to show around the blocks)
   let events: any[] = [];
   if (m.ghl_user_id) {
@@ -8960,6 +8971,7 @@ async function taskMove(tid: string, id: string, to: string, handle: string | nu
   const upd: Record<string, unknown> = { pinned_date: date, hold: false, move_count: (Number(task.move_count) || 0) + 1, scheduled_start: null, scheduled_end: null };
   if (task.due_date && task.due_date < date) upd.due_date = date;
   await supabase.from("tasks").update(upd).eq("tenant_id", tid).eq("id", id);
+  await ackMoves(tid, id);
   await forgePlan(tid, { force: true, from_now: true });
   const label = new Date(date + "T12:00:00Z").toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "short" });
   return { ok: true, date, text: `Moved "${task.title}" to ${label}.` };
